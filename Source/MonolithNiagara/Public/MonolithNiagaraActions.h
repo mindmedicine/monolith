@@ -227,6 +227,7 @@ public:
 	static FMonolithActionResult HandleSetGraphPinDefault(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetGraphNodePosition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListGraphNodePins(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddMapParameterPin(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);

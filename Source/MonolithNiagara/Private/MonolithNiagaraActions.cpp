@@ -85,6 +85,15 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 // the complete definition -- a forward declaration is insufficient.
 #include "NiagaraNodeParameterMapGet.h"
 #include "NiagaraNodeParameterMapSet.h"
+// Tier 2 graph authoring: the remaining engine-private node classes. If/Select/StaticSwitch/
+// Reroute are UCLASS(MinimalAPI) so StaticClass is exported; ParameterMapGet/Set and Convert
+// are plain UCLASS() and link only in this private-include configuration (empirically verified
+// for the ParameterMap pair, which the HLSL bridge has always constructed).
+#include "NiagaraNodeIf.h"
+#include "NiagaraNodeSelect.h"
+#include "NiagaraNodeStaticSwitch.h"
+#include "NiagaraNodeReroute.h"
+#include "NiagaraNodeConvert.h"
 
 // Forward-declarations for engine-PRIVATE NiagaraEditor symbols. These are defined only in
 // NiagaraEditor/Private/Widgets/DataChannel/NiagaraDataChannelWizard.cpp — there is NO public
@@ -2825,11 +2834,13 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleAddGraphNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
-			.Required(TEXT("node_type"), TEXT("string"), TEXT("op | function | input"))
+			.Required(TEXT("node_type"), TEXT("string"), TEXT("Tier 1 (public classes): op | function | input. Tier 2 (engine-private, dev builds only): map_get | map_set | if | select | static_switch | reroute | convert"))
 			.Optional(TEXT("op_name"), TEXT("string"), TEXT("Operation name for node_type=op, e.g. 'Numeric::Add', 'Numeric::Multiply'"))
 			.Optional(TEXT("function_script"), TEXT("string"), TEXT("Function/module script asset path for node_type=function"))
-			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input"))
+			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
 			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum"))
+			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("UEnum asset path when switch_type=enum"))
 			.Optional(TEXT("position"), TEXT("array"), TEXT("Node position as [x, y] (default [0,0])"))
 			.Optional(TEXT("comment"), TEXT("string"), TEXT("Comment bubble text"))
 			.Build());
@@ -2882,6 +2893,15 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_map_parameter_pin"), TEXT("Add a typed parameter pin to a ParameterMapGet (read) or ParameterMapSet (write) node — the pins that actually carry named parameters like 'Module.X' or 'Emitter.Y'. Requires the engine-private wizard utilities (dev builds only)."),
+		FMonolithActionHandler::CreateStatic(&HandleAddMapParameterPin),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Full parameter name, e.g. 'Module.MyInput', 'Emitter.MyOutput', 'Engine.DeltaTime'"))
+			.Required(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, ...)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("clean_stack_orphans"), TEXT("Delete orphaned nodes from a system's stage graphs: fully disconnected nodes and dangling feeder MapGets (no consumed outputs). Leftover junk from module removal/rebinding makes later engine stack surgery unpredictable — run this before add/remove on churned systems. Use audit_stack_wiring first to inspect; dry_run previews."),
@@ -17405,6 +17425,30 @@ namespace MonolithNiagaraGraphAuthoring
 		return nullptr;
 	}
 
+	// Spawn a graph node without FGraphNodeCreator.
+	//
+	// FGraphNodeCreator<T>::Finalize() calls T::AllocateDefaultPins() through the CONCRETE type,
+	// which fails to compile when a node class declares that override private (UNiagaraNodeSelect
+	// does). Access is checked against the static type, so dispatching the same virtual through a
+	// UEdGraphNode* is both legal and identical at runtime. Returns the node with its guid set but
+	// pins NOT yet allocated — callers configure type-defining properties first (e.g. a static
+	// switch's SwitchTypeData) and then call FinalizeSpawnedNode.
+	template <typename TNode>
+	static TNode* SpawnGraphNode(UNiagaraGraph* Graph)
+	{
+		TNode* Node = NewObject<TNode>(Graph, NAME_None, RF_Transactional);
+		UEdGraphNode* Base = Node;
+		Graph->AddNode(Base, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		Base->CreateNewGuid();
+		return Node;
+	}
+
+	static void FinalizeSpawnedNode(UEdGraphNode* Node)
+	{
+		Node->PostPlacedNewNode();
+		Node->AllocateDefaultPins();
+	}
+
 	static void SavePackageFor(UNiagaraScript* Script)
 	{
 		Script->MarkPackageDirty();
@@ -17538,12 +17582,93 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		Creator.Finalize();
 		NewNode = InNode;
 	}
+#if WITH_NIAGARA_WIZARD_PRIVATE
+	// --- Tier 2: engine-private node classes (gated; unavailable in release builds) ---
+	else if (NodeType == TEXT("map_get"))
+	{
+		UNiagaraNodeParameterMapGet* N = SpawnGraphNode<UNiagaraNodeParameterMapGet>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("map_set"))
+	{
+		UNiagaraNodeParameterMapSet* N = SpawnGraphNode<UNiagaraNodeParameterMapSet>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("if"))
+	{
+		UNiagaraNodeIf* N = SpawnGraphNode<UNiagaraNodeIf>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("select"))
+	{
+		UNiagaraNodeSelect* N = SpawnGraphNode<UNiagaraNodeSelect>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("static_switch"))
+	{
+		const FString SwitchName = Params->HasField(TEXT("input_name")) ? Params->GetStringField(TEXT("input_name")) : FString();
+		if (SwitchName.IsEmpty())
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("node_type=static_switch requires 'input_name' (the switch parameter name)"));
+		}
+		const FString SwitchType = Params->HasField(TEXT("switch_type")) ? Params->GetStringField(TEXT("switch_type")).ToLower() : TEXT("bool");
+
+		UNiagaraNodeStaticSwitch* N = SpawnGraphNode<UNiagaraNodeStaticSwitch>(Graph);
+		N->InputParameterName = FName(*SwitchName);
+		if (SwitchType == TEXT("bool"))         N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Bool;
+		else if (SwitchType == TEXT("integer") || SwitchType == TEXT("int")) N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Integer;
+		else if (SwitchType == TEXT("enum"))
+		{
+			const FString EnumPath = Params->HasField(TEXT("enum_path")) ? Params->GetStringField(TEXT("enum_path")) : FString();
+			UEnum* SwitchEnum = EnumPath.IsEmpty() ? nullptr : LoadObject<UEnum>(nullptr, *EnumPath);
+			if (!SwitchEnum)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT("switch_type=enum requires a loadable 'enum_path'"));
+			}
+			N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
+			N->SwitchTypeData.Enum = SwitchEnum;
+		}
+		else
+		{
+			Graph->RemoveNode(N);
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown switch_type '%s' (bool | integer | enum)"), *SwitchType));
+		}
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("reroute"))
+	{
+		UNiagaraNodeReroute* N = SpawnGraphNode<UNiagaraNodeReroute>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+	else if (NodeType == TEXT("convert"))
+	{
+		UNiagaraNodeConvert* N = SpawnGraphNode<UNiagaraNodeConvert>(Graph);
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
+#endif // WITH_NIAGARA_WIZARD_PRIVATE
 	else
 	{
 		GEditor->EndTransaction();
+		// Note: the supported-type list is built outside the Printf call — a #if inside a
+		// function-like macro's argument list is undefined behavior (MSVC C5101).
+#if WITH_NIAGARA_WIZARD_PRIVATE
+		const TCHAR* SupportedTypes = TEXT("op, function, input, map_get, map_set, if, select, static_switch, reroute, convert");
+#else
+		const TCHAR* SupportedTypes = TEXT("op, function, input (Tier 2 node types need WITH_NIAGARA_WIZARD_PRIVATE=1; this is a release build)");
+#endif
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Unknown node_type '%s'. Tier 1 supports: op, function, input. "
-				 "(ParameterMapGet/Set, If, Select, StaticSwitch are engine-private — Tier 2.)"), *NodeType));
+			TEXT("Unknown node_type '%s'. Supported: %s"), *NodeType, SupportedTypes));
 	}
 
 	NewNode->NodePosX = PosX;
@@ -17844,6 +17969,70 @@ FMonolithActionResult FMonolithNiagaraActions::HandleListGraphNodePins(const TSh
 	R->SetArrayField(TEXT("input_pins"), InputsArr);
 	R->SetArrayField(TEXT("output_pins"), OutputsArr);
 	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TSharedPtr<FJsonObject>& Params)
+{
+#if !WITH_NIAGARA_WIZARD_PRIVATE
+	return FMonolithActionResult::Error(TEXT("add_map_parameter_pin requires WITH_NIAGARA_WIZARD_PRIVATE=1 (engine-private wizard utilities); unavailable in release builds."));
+#else
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, Params->GetStringField(TEXT("node_guid")));
+	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
+
+	const FString ParamName = Params->GetStringField(TEXT("parameter"));
+	const FString TypeStr = Params->GetStringField(TEXT("type"));
+	bool bFellBack = false;
+	FNiagaraTypeDefinition TypeDef = ResolveNiagaraType(TypeStr, &bFellBack);
+	if (bFellBack) return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown Niagara type '%s'"), *TypeStr));
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddMapPin", "Add Map Parameter Pin"));
+	Graph->Modify();
+	Node->Modify();
+
+	UEdGraphPin* NewPin = nullptr;
+	FString Kind;
+	if (UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node))
+	{
+		NewPin = UE::Niagara::Wizard::Utilities::AddReadParameterPin(TypeDef, FName(*ParamName), GetNode);
+		Kind = TEXT("read");
+	}
+	else if (UNiagaraNodeParameterMapSet* SetNode = Cast<UNiagaraNodeParameterMapSet>(Node))
+	{
+		NewPin = UE::Niagara::Wizard::Utilities::AddWriteParameterPin(TypeDef, FName(*ParamName), SetNode);
+		Kind = TEXT("write");
+	}
+	else
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node is a %s — add_map_parameter_pin only applies to ParameterMapGet / ParameterMapSet nodes"),
+			*Node->GetClass()->GetName()));
+	}
+
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithAddMapPin"), true);
+	GEditor->EndTransaction();
+
+	if (!NewPin)
+	{
+		return FMonolithActionResult::Error(TEXT("The wizard utility returned no pin — the parameter name or type was rejected."));
+	}
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+	R->SetStringField(TEXT("kind"), Kind);
+	R->SetStringField(TEXT("pin"), NewPin->PinName.ToString());
+	R->SetStringField(TEXT("direction"), NewPin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+	R->SetStringField(TEXT("type"), TypeDef.GetName());
+	return NA_SuccessObj(R);
+#endif
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleCleanStackOrphans(const TSharedPtr<FJsonObject>& Params)
