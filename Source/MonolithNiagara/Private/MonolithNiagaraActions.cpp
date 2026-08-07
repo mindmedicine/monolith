@@ -2624,7 +2624,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("save_path"), TEXT("Path to save the new system"))
 			.Optional(TEXT("template"), TEXT("string"), TEXT("Template system to base on"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("create_stateless_emitter"), TEXT("**Phase 0 stub.** Create a standalone UNiagaraStatelessEmitter (Lightweight Emitter) asset. Not yet implemented."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_stateless_emitter"), TEXT("Create a standalone UNiagaraStatelessEmitter (Lightweight Emitter) asset."),
 		FMonolithActionHandler::CreateStatic(&HandleCreateStatelessEmitter),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("save_path"), TEXT("Path where the new Lightweight Emitter asset will be saved"))
@@ -2673,7 +2673,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("usage"), TEXT("string"), TEXT("Script usage (particle_spawn, particle_update, particle_event, emitter_update, particle_simulation_stage)"))
+			.Required(TEXT("usage"), TEXT("string"), TEXT("Script usage (particle_spawn, particle_update, particle_event, particle_simulation_stage, emitter_spawn, emitter_update, system_spawn, system_update)"))
 			.Required(TEXT("module_script"), TEXT("string"), TEXT("Module script asset path"))
 			.Optional(TEXT("stage_name"), TEXT("string"), TEXT("Simulation stage name when usage is particle_simulation_stage"))
 			.Optional(TEXT("usage_id"), TEXT("string"), TEXT("Simulation stage or event-handler usage ID when usage is particle_simulation_stage or particle_event"))
@@ -2777,6 +2777,35 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
 			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Limit audit to one emitter's stages (system stages always included)"))
 			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("list_stack_writers"), TEXT("List every name-addressable parameter written anywhere in a system's stacks, with writer attribution (module MapSet writes alias-resolved per call, assignment targets, user params, engine intrinsics). Complements get_available_parameters, which cannot see mid-stack module writes."),
+		FMonolithActionHandler::CreateStatic(&HandleListStackWriters),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Limit to one emitter's stages (system stages always included)"))
+			.Optional(TEXT("filter"), TEXT("string"), TEXT("Case-insensitive substring filter on parameter names"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("list_script_versions"), TEXT("List all versions of a Niagara script asset (major.minor, guid, exposed flag, versioning enabled)"),
+		FMonolithActionHandler::CreateStatic(&HandleListScriptVersions),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_script_version"), TEXT("Add a new version to a Niagara script (enables versioning if needed; copies previous minor version's data). Version must be > 1.0 and unique."),
+		FMonolithActionHandler::CreateStatic(&HandleAddScriptVersion),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("major"), TEXT("integer"), TEXT("Major version number"))
+			.Required(TEXT("minor"), TEXT("integer"), TEXT("Minor version number"))
+			.Optional(TEXT("change_description"), TEXT("string"), TEXT("What changed in this version (shown to users on upgrade)"))
+			.Optional(TEXT("expose"), TEXT("bool"), TEXT("Also make this the exposed version (default false)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_exposed_script_version"), TEXT("Change which script version is exposed (used when the module is added to a stack). Identify by guid or major+minor."),
+		FMonolithActionHandler::CreateStatic(&HandleSetExposedScriptVersion),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Optional(TEXT("guid"), TEXT("string"), TEXT("Version guid (from list_script_versions)"))
+			.Optional(TEXT("major"), TEXT("integer"), TEXT("Major version number (with minor, alternative to guid)"))
+			.Optional(TEXT("minor"), TEXT("integer"), TEXT("Minor version number"))
+			.Build());
 
 	// Parameter (9)
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_all_parameters"), TEXT("Get all parameters in a system"),
@@ -2802,11 +2831,11 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.Required(TEXT("type"), TEXT("string"), TEXT("Niagara type name"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("trace_parameter_binding"), TEXT("Trace where a parameter is used"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("trace_parameter_binding"), TEXT("Trace a parameter across the whole system: writers (module stack writes with attribution, user params, engine intrinsics), stack-level linked readers, and user-store value. Works for ALL namespaces (System./Emitter./Particles./User./...), not just User.*"),
 		FMonolithActionHandler::CreateStatic(&HandleTraceParameterBinding),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
-			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name to trace"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Full parameter name to trace (e.g. System.ExecuteGroup1, User.Xlive)"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("add_user_parameter"), TEXT("Add a user parameter"),
 		FMonolithActionHandler::CreateStatic(&HandleAddUserParameter),
@@ -5642,6 +5671,151 @@ static TArray<TSharedPtr<FJsonValue>> UsageBitmaskToStages(int32 Bitmask)
 	return Stages;
 }
 
+// Shared: index of every name-addressable parameter written anywhere in a system's
+// stacks, with writer attribution ("Owner/Usage/Module", "User", "engine_intrinsic").
+// Sources: module-script ParameterMapSet pins (alias-resolved per call), assignment
+// node targets, user parameters, engine intrinsics. Used by audit_stack_wiring,
+// list_stack_writers and trace_parameter_binding.
+struct FMonolithStackWriterIndex
+{
+	TMap<FString, TArray<FString>> Writers;
+	bool Contains(const FString& Name) const { return Writers.Contains(Name); }
+};
+
+static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& EmitterFilter, FMonolithStackWriterIndex& Out)
+{
+	auto AddWriter = [&Out](const FString& Param, const FString& Source)
+	{
+		Out.Writers.FindOrAdd(Param).AddUnique(Source);
+	};
+
+	// User parameters
+	{
+		FNiagaraUserRedirectionParameterStore& US = System->GetExposedParameters();
+		for (const FNiagaraVariableWithOffset& V : US.ReadParameterVariables())
+		{
+			FString N = V.GetName().ToString();
+			AddWriter(N.StartsWith(TEXT("User.")) ? N : FString::Printf(TEXT("User.%s"), *N), TEXT("User"));
+		}
+	}
+
+	// Engine-provided intrinsics that no MapSet writes (small backstop whitelist)
+	static const TCHAR* Intrinsics[] = {
+		TEXT("System.Age"), TEXT("System.ExecutionState"), TEXT("System.ExecutionStateSource"),
+		TEXT("Emitter.Age"), TEXT("Emitter.LoopedAge"), TEXT("Emitter.NormalizedLoopAge"),
+		TEXT("Emitter.CurrentLoopDuration"), TEXT("Emitter.ExecutionState"), TEXT("Emitter.ExecutionStateSource"),
+		TEXT("Emitter.NumParticles"), TEXT("Emitter.TotalSpawnedParticles"), TEXT("Emitter.RandomSeed"),
+		TEXT("Particles.UniqueID"), TEXT("Particles.ID"),
+	};
+	for (const TCHAR* I : Intrinsics) AddWriter(I, TEXT("engine_intrinsic"));
+
+	// Collect graphs: system + (filtered) emitters
+	struct FGraphEntry { UNiagaraGraph* Graph; FString OwnerName; };
+	TArray<FGraphEntry> Graphs;
+	if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+	{
+		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
+		{
+			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
+		}
+	}
+	for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+	{
+		FString EName = H.GetName().ToString();
+		if (!EmitterFilter.IsEmpty() && EName != EmitterFilter && H.GetId().ToString() != EmitterFilter) continue;
+		FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
+		if (!ED) continue;
+		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
+		{
+			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, EName });
+		}
+	}
+
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+	auto IsSkippablePin = [&MapDef](const UEdGraphPin* P)
+	{
+		return P->PinName.IsNone() || P->PinName == TEXT("Add") || UEdGraphSchema_Niagara::PinToTypeDefinition(P) == MapDef;
+	};
+
+	for (const FGraphEntry& GE : Graphs)
+	{
+		for (UEdGraphNode* Node : GE.Graph->Nodes)
+		{
+			UNiagaraNodeOutput* OutNode = Cast<UNiagaraNodeOutput>(Node);
+			if (!OutNode) continue;
+			const ENiagaraScriptUsage StageUsage = OutNode->GetUsage();
+			const FString UsageStr = StaticEnum<ENiagaraScriptUsage>()->GetNameStringByValue(static_cast<int64>(StageUsage));
+			const bool bSystemStage = StageUsage == ENiagaraScriptUsage::SystemSpawnScript || StageUsage == ENiagaraScriptUsage::SystemUpdateScript;
+			const bool bEmitterStage = StageUsage == ENiagaraScriptUsage::EmitterSpawnScript || StageUsage == ENiagaraScriptUsage::EmitterUpdateScript;
+
+			TArray<UNiagaraNodeFunctionCall*> Modules;
+			MonolithNiagaraHelpers::GetOrderedModuleNodes(*OutNode, Modules);
+			for (UNiagaraNodeFunctionCall* MNode : Modules)
+			{
+				if (!MNode) continue;
+				const FString CallName = MNode->GetFunctionName();
+				const FString Source = FString::Printf(TEXT("%s/%s/%s"), *GE.OwnerName, *UsageStr, *CallName);
+
+				// Assignment nodes (Set Parameter): targets are full parameter names
+				if (MNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeAssignment")))
+				{
+					if (FArrayProperty* AP = CastField<FArrayProperty>(MNode->GetClass()->FindPropertyByName(TEXT("AssignmentTargets"))))
+					{
+						if (FStructProperty* SP = CastField<FStructProperty>(AP->Inner))
+						{
+							if (SP->Struct && SP->Struct->IsChildOf(FNiagaraVariableBase::StaticStruct()))
+							{
+								FScriptArrayHelper AH(AP, AP->ContainerPtrToValuePtr<void>(MNode));
+								for (int32 i = 0; i < AH.Num(); ++i)
+								{
+									const FNiagaraVariableBase* Var = reinterpret_cast<const FNiagaraVariableBase*>(AH.GetRawPtr(i));
+									if (Var) AddWriter(Var->GetName().ToString(), Source);
+								}
+							}
+						}
+					}
+					continue;
+				}
+
+				// Regular modules: walk the called script's graph for ParameterMapSet writes
+				UNiagaraScript* FnScript = MNode->FunctionScript;
+				if (!FnScript) continue;
+				UNiagaraScriptSource* FnSrc = Cast<UNiagaraScriptSource>(FnScript->GetLatestSource());
+				if (!FnSrc || !FnSrc->NodeGraph) continue;
+
+				for (UEdGraphNode* SNode : FnSrc->NodeGraph->Nodes)
+				{
+					if (!SNode || !SNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapSet"))) continue;
+					for (UEdGraphPin* P : SNode->Pins)
+					{
+						if (P->Direction != EGPD_Input || IsSkippablePin(P)) continue;
+						FString N = P->PinName.ToString();
+
+						if (N.StartsWith(TEXT("Output.Module.")))
+						{
+							AddWriter(FString::Printf(TEXT("Output.%s.%s"), *CallName, *N.Mid(14)), Source);
+						}
+						else if (N.StartsWith(TEXT("Module.")))
+						{
+							// module-local — not addressable from outside
+						}
+						else if (N.StartsWith(TEXT("StackContext.")))
+						{
+							AddWriter(N, Source);
+							const TCHAR* Ctx = bSystemStage ? TEXT("System") : (bEmitterStage ? TEXT("Emitter") : TEXT("Particles"));
+							AddWriter(FString::Printf(TEXT("%s.%s"), Ctx, *N.Mid(13)), Source);
+						}
+						else
+						{
+							AddWriter(N, Source);
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TSharedPtr<FJsonObject>& Params, ENiagaraScriptUsage Usage)
 {
 	// === Parse and validate params ===
@@ -6353,74 +6527,96 @@ FMonolithActionResult FMonolithNiagaraActions::HandleTraceParameterBinding(const
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
-	FString Search = ParamName;
-	if (Search.StartsWith(TEXT("User."))) Search = Search.Mid(5); // Strip "User." prefix — store names are unprefixed
-	FString PrefixedSearch = TEXT("User.") + Search; // Keep prefixed form for graph pin matching
-
 	TSharedRef<FJsonObject> Trace = MakeShared<FJsonObject>();
-	Trace->SetStringField(TEXT("parameter"), PrefixedSearch);
+	Trace->SetStringField(TEXT("parameter"), ParamName);
 
-	FNiagaraUserRedirectionParameterStore& US = System->GetExposedParameters();
-	TArray<FNiagaraVariable> UP;
-	US.GetUserParameters(UP);
-
-	bool bFound = false;
-	for (const FNiagaraVariable& P : UP)
+	// User-store lookup (accepts both "User.X" and bare "X")
+	FString Search = ParamName;
+	if (Search.StartsWith(TEXT("User."))) Search = Search.Mid(5); // store names are unprefixed
+	bool bIsUserParam = false;
 	{
-		if (P.GetName().ToString() == Search)
+		FNiagaraUserRedirectionParameterStore& US = System->GetExposedParameters();
+		TArray<FNiagaraVariable> UP;
+		US.GetUserParameters(UP);
+		for (const FNiagaraVariable& P : UP)
 		{
-			bFound = true;
-			Trace->SetStringField(TEXT("type"), P.GetType().GetName());
-			Trace->SetStringField(TEXT("source"), TEXT("ExposedParameters"));
-			Trace->SetStringField(TEXT("value"), SerializeParameterValue(P, US));
-			break;
+			if (P.GetName().ToString().Equals(Search, ESearchCase::IgnoreCase))
+			{
+				bIsUserParam = true;
+				Trace->SetStringField(TEXT("type"), P.GetType().GetName());
+				Trace->SetStringField(TEXT("user_value"), SerializeParameterValue(P, US));
+				break;
+			}
 		}
 	}
-	if (!bFound)
-	{
-		Trace->SetStringField(TEXT("error"), TEXT("Parameter not found"));
-		return NA_SuccessObj(Trace);
-	}
 
-	TArray<TSharedPtr<FJsonValue>> Bindings;
-	const TArray<FNiagaraEmitterHandle>& Handles = System->GetEmitterHandles();
-	static const ENiagaraScriptUsage AllUsages[] = {
-		ENiagaraScriptUsage::EmitterSpawnScript, ENiagaraScriptUsage::EmitterUpdateScript,
-		ENiagaraScriptUsage::ParticleSpawnScript, ENiagaraScriptUsage::ParticleUpdateScript,
-	};
-	for (const FNiagaraEmitterHandle& H : Handles)
+	// Writers — from the system-wide stack writer index (all namespaces)
+	FMonolithStackWriterIndex WriterIndex;
+	BuildStackWriterIndex(System, TEXT(""), WriterIndex);
+	TArray<TSharedPtr<FJsonValue>> WritersArr;
 	{
-		FString EN = H.GetName().ToString();
-		for (ENiagaraScriptUsage U : AllUsages)
+		const TArray<FString>* W = WriterIndex.Writers.Find(ParamName);
+		if (!W && bIsUserParam) W = WriterIndex.Writers.Find(FString::Printf(TEXT("User.%s"), *Search));
+		if (W)
 		{
-			UNiagaraNodeOutput* Out = FindOutputNode(System, H.GetId().ToString(), U);
-			if (!Out) continue;
-			TArray<UNiagaraNodeFunctionCall*> Mods;
-			MonolithNiagaraHelpers::GetOrderedModuleNodes(*Out, Mods);
-			for (UNiagaraNodeFunctionCall* MN : Mods)
+			for (const FString& S : *W) WritersArr.Add(MakeShared<FJsonValueString>(S));
+		}
+	}
+	Trace->SetArrayField(TEXT("writers"), WritersArr);
+
+	// Readers — stack-level linked-input feeds: override MapGet output pins matching the name
+	TArray<TSharedPtr<FJsonValue>> Readers;
+	{
+		struct FGraphEntry { UNiagaraGraph* Graph; FString OwnerName; };
+		TArray<FGraphEntry> Graphs;
+		if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+		{
+			if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
 			{
-				if (!MN) continue;
-				for (UEdGraphPin* Pin : MN->Pins)
+				if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
+			}
+		}
+		for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+		{
+			FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
+			if (!ED) continue;
+			if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
+			{
+				if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, H.GetName().ToString() });
+			}
+		}
+
+		for (const FGraphEntry& GE : Graphs)
+		{
+			for (UEdGraphNode* Node : GE.Graph->Nodes)
+			{
+				if (!Node || !Node->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapGet"))) continue;
+				for (UEdGraphPin* P : Node->Pins)
 				{
-					if (Pin->Direction != EGPD_Input) continue;
-					for (UEdGraphPin* LP : Pin->LinkedTo)
+					if (P->Direction != EGPD_Output || P->LinkedTo.Num() == 0) continue;
+					if (!P->PinName.ToString().Equals(ParamName, ESearchCase::IgnoreCase)) continue;
+					for (UEdGraphPin* LP : P->LinkedTo)
 					{
-						FString LN = LP->PinName.ToString();
-						if (LN.Contains(PrefixedSearch) || LN.Contains(Search))
-						{
-							TSharedRef<FJsonObject> BO = MakeShared<FJsonObject>();
-							BO->SetStringField(TEXT("emitter"), EN);
-							BO->SetStringField(TEXT("module"), MN->GetFunctionName());
-							BO->SetStringField(TEXT("input_pin"), Pin->PinName.ToString());
-							BO->SetStringField(TEXT("usage"), StaticEnum<ENiagaraScriptUsage>()->GetNameStringByValue(static_cast<int64>(U)));
-							Bindings.Add(MakeShared<FJsonValueObject>(BO));
-						}
+						if (!LP) continue;
+						TSharedRef<FJsonObject> BO = MakeShared<FJsonObject>();
+						BO->SetStringField(TEXT("owner"), GE.OwnerName);
+						BO->SetStringField(TEXT("feeds"), LP->PinName.ToString());
+						if (UEdGraphNode* Consumer = LP->GetOwningNode())
+							BO->SetStringField(TEXT("consumer_node"), Consumer->GetName());
+						Readers.Add(MakeShared<FJsonValueObject>(BO));
 					}
 				}
 			}
 		}
 	}
-	Trace->SetArrayField(TEXT("bindings"), Bindings);
+	Trace->SetArrayField(TEXT("readers"), Readers);
+
+	const bool bKnown = bIsUserParam || WritersArr.Num() > 0 || Readers.Num() > 0;
+	Trace->SetBoolField(TEXT("found"), bKnown);
+	if (!bKnown)
+	{
+		Trace->SetStringField(TEXT("note"), TEXT("No user param, writer, or stack-level reader with this exact name. Check namespace spelling (System./Emitter./Particles./User./Engine.)."));
+	}
 	return NA_SuccessObj(Trace);
 }
 
@@ -16556,31 +16752,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 		return P->PinName.IsNone() || P->PinName == TEXT("Add") || IsMapPin(P);
 	};
 
-	// --- Build the writer set (system-wide, order-insensitive v1) ---
-	TSet<FString> Writers;
+	// --- Writer index (shared with list_stack_writers / trace_parameter_binding) ---
+	FMonolithStackWriterIndex WriterIndex;
+	BuildStackWriterIndex(System, EmitterFilter, WriterIndex);
 
-	// User parameters
-	{
-		FNiagaraUserRedirectionParameterStore& US = System->GetExposedParameters();
-		for (const FNiagaraVariableWithOffset& V : US.ReadParameterVariables())
-		{
-			FString N = V.GetName().ToString();
-			Writers.Add(N.StartsWith(TEXT("User.")) ? N : FString::Printf(TEXT("User.%s"), *N));
-		}
-	}
-
-	// Engine-provided intrinsics that no MapSet writes (small backstop whitelist)
-	static const TCHAR* Intrinsics[] = {
-		TEXT("System.Age"), TEXT("System.ExecutionState"), TEXT("System.ExecutionStateSource"),
-		TEXT("Emitter.Age"), TEXT("Emitter.LoopedAge"), TEXT("Emitter.NormalizedLoopAge"),
-		TEXT("Emitter.CurrentLoopDuration"), TEXT("Emitter.ExecutionState"), TEXT("Emitter.ExecutionStateSource"),
-		TEXT("Emitter.NumParticles"), TEXT("Emitter.TotalSpawnedParticles"), TEXT("Emitter.RandomSeed"),
-		TEXT("Particles.UniqueID"), TEXT("Particles.ID"),
-	};
-	for (const TCHAR* I : Intrinsics) Writers.Add(I);
-
-	// Per stage: module writes (from each module script's internal ParameterMapSet pins,
-	// alias-resolved per call), plus assignment-node targets.
 	struct FStageInfo
 	{
 		FString Owner;
@@ -16602,75 +16777,6 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 			SI.OutputNode = Out;
 			MonolithNiagaraHelpers::GetOrderedModuleNodes(*Out, SI.Modules);
 			Stages.Add(MoveTemp(SI));
-		}
-	}
-
-	for (const FStageInfo& SI : Stages)
-	{
-		const ENiagaraScriptUsage StageUsage = SI.OutputNode->GetUsage();
-		const bool bSystemStage = StageUsage == ENiagaraScriptUsage::SystemSpawnScript || StageUsage == ENiagaraScriptUsage::SystemUpdateScript;
-		const bool bEmitterStage = StageUsage == ENiagaraScriptUsage::EmitterSpawnScript || StageUsage == ENiagaraScriptUsage::EmitterUpdateScript;
-
-		for (UNiagaraNodeFunctionCall* MNode : SI.Modules)
-		{
-			if (!MNode) continue;
-			const FString CallName = MNode->GetFunctionName();
-
-			// Assignment nodes (Set Parameter): targets are full parameter names
-			if (MNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeAssignment")))
-			{
-				if (FArrayProperty* AP = CastField<FArrayProperty>(MNode->GetClass()->FindPropertyByName(TEXT("AssignmentTargets"))))
-				{
-					if (FStructProperty* SP = CastField<FStructProperty>(AP->Inner))
-					{
-						if (SP->Struct && SP->Struct->IsChildOf(FNiagaraVariableBase::StaticStruct()))
-						{
-							FScriptArrayHelper AH(AP, AP->ContainerPtrToValuePtr<void>(MNode));
-							for (int32 i = 0; i < AH.Num(); ++i)
-							{
-								const FNiagaraVariableBase* Var = reinterpret_cast<const FNiagaraVariableBase*>(AH.GetRawPtr(i));
-								if (Var) Writers.Add(Var->GetName().ToString());
-							}
-						}
-					}
-				}
-				continue;
-			}
-
-			// Regular modules: walk the called script's graph for ParameterMapSet writes
-			UNiagaraScript* FnScript = MNode->FunctionScript;
-			if (!FnScript) continue;
-			UNiagaraScriptSource* FnSrc = Cast<UNiagaraScriptSource>(FnScript->GetLatestSource());
-			if (!FnSrc || !FnSrc->NodeGraph) continue;
-
-			for (UEdGraphNode* SNode : FnSrc->NodeGraph->Nodes)
-			{
-				if (!SNode || !SNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapSet"))) continue;
-				for (UEdGraphPin* P : SNode->Pins)
-				{
-					if (P->Direction != EGPD_Input || IsSkippablePin(P)) continue;
-					FString N = P->PinName.ToString();
-
-					if (N.StartsWith(TEXT("Output.Module.")))
-					{
-						Writers.Add(FString::Printf(TEXT("Output.%s.%s"), *CallName, *N.Mid(14)));
-					}
-					else if (N.StartsWith(TEXT("Module.")))
-					{
-						// module-local — not addressable from outside
-					}
-					else if (N.StartsWith(TEXT("StackContext.")))
-					{
-						Writers.Add(N);
-						const TCHAR* Ctx = bSystemStage ? TEXT("System") : (bEmitterStage ? TEXT("Emitter") : TEXT("Particles"));
-						Writers.Add(FString::Printf(TEXT("%s.%s"), Ctx, *N.Mid(13)));
-					}
-					else
-					{
-						Writers.Add(N);
-					}
-				}
-			}
 		}
 	}
 
@@ -16741,7 +16847,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 					Status = TEXT("suspicious");
 					Reason = TEXT("module-local self-read (INPUT pill) — reads this module's own unwired input; almost certainly a dead link");
 				}
-				else if (Writers.Contains(ReadParam))
+				else if (WriterIndex.Contains(ReadParam))
 				{
 					Status = TEXT("ok");
 				}
@@ -16829,8 +16935,196 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	R->SetArrayField(TEXT("problem_links"), DeadLinks);
 	R->SetNumberField(TEXT("orphan_count"), Orphans.Num());
 	R->SetArrayField(TEXT("orphan_nodes"), Orphans);
-	R->SetNumberField(TEXT("writer_count"), Writers.Num());
+	R->SetNumberField(TEXT("writer_count"), WriterIndex.Writers.Num());
 	R->SetBoolField(TEXT("has_issues"), DeadLinks.Num() > 0 || Orphans.Num() > 0);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleListStackWriters(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath = NA_GetAssetPath(Params);
+	FString EmitterFilter = Params->HasField(TEXT("emitter")) ? Params->GetStringField(TEXT("emitter")) : TEXT("");
+	FString Filter = Params->HasField(TEXT("filter")) ? Params->GetStringField(TEXT("filter")) : TEXT("");
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	FMonolithStackWriterIndex Idx;
+	BuildStackWriterIndex(System, EmitterFilter, Idx);
+
+	TArray<FString> Names;
+	Idx.Writers.GetKeys(Names);
+	Names.Sort();
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const FString& N : Names)
+	{
+		if (!Filter.IsEmpty() && !N.Contains(Filter, ESearchCase::IgnoreCase)) continue;
+		TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+		E->SetStringField(TEXT("parameter"), N);
+		TArray<TSharedPtr<FJsonValue>> Srcs;
+		for (const FString& S : Idx.Writers[N]) Srcs.Add(MakeShared<FJsonValueString>(S));
+		E->SetArrayField(TEXT("written_by"), Srcs);
+		Arr.Add(MakeShared<FJsonValueObject>(E));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("asset_path"), SystemPath);
+	R->SetNumberField(TEXT("count"), Arr.Num());
+	R->SetArrayField(TEXT("writers"), Arr);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleListScriptVersions(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ScriptPath = Params->GetStringField(TEXT("script_path"));
+	if (ScriptPath.IsEmpty()) ScriptPath = NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: script_path"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
+
+	Script->CheckVersionDataAvailable();
+	const FNiagaraAssetVersion Exposed = Script->GetExposedVersion();
+
+	TArray<TSharedPtr<FJsonValue>> Versions;
+	for (const FNiagaraAssetVersion& V : Script->GetAllAvailableVersions())
+	{
+		TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+		E->SetNumberField(TEXT("major"), V.MajorVersion);
+		E->SetNumberField(TEXT("minor"), V.MinorVersion);
+		E->SetStringField(TEXT("guid"), V.VersionGuid.ToString());
+		E->SetBoolField(TEXT("is_exposed"), V.VersionGuid == Exposed.VersionGuid);
+		Versions.Add(MakeShared<FJsonValueObject>(E));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetBoolField(TEXT("versioning_enabled"), Script->IsVersioningEnabled());
+	R->SetStringField(TEXT("exposed_version"), FString::Printf(TEXT("%d.%d"), Exposed.MajorVersion, Exposed.MinorVersion));
+	R->SetNumberField(TEXT("count"), Versions.Num());
+	R->SetArrayField(TEXT("versions"), Versions);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptVersion(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ScriptPath = Params->GetStringField(TEXT("script_path"));
+	if (ScriptPath.IsEmpty()) ScriptPath = NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: script_path"));
+	const int32 Major = static_cast<int32>(Params->GetNumberField(TEXT("major")));
+	const int32 Minor = static_cast<int32>(Params->GetNumberField(TEXT("minor")));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
+
+	Script->CheckVersionDataAvailable();
+	Script->Modify();
+	if (!Script->IsVersioningEnabled())
+	{
+		Script->EnableVersioning();
+	}
+
+	const FGuid NewGuid = Script->AddNewVersion(Major, Minor);
+	if (!NewGuid.IsValid())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("AddNewVersion(%d.%d) failed — the version must be > 1.0 and must not collide with an existing version (see list_script_versions)."),
+			Major, Minor));
+	}
+
+	if (Params->HasField(TEXT("change_description")))
+	{
+		if (FVersionedNiagaraScriptData* SD = Script->GetScriptData(NewGuid))
+		{
+			SD->VersionChangeDescription = FText::FromString(Params->GetStringField(TEXT("change_description")));
+		}
+	}
+
+	const bool bExpose = Params->HasField(TEXT("expose")) && Params->GetBoolField(TEXT("expose"));
+	if (bExpose)
+	{
+		Script->ExposeVersion(NewGuid);
+	}
+
+	Script->MarkPackageDirty();
+	FString PackageFilename;
+	UPackage* Pkg = Script->GetOutermost();
+	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("guid"), NewGuid.ToString());
+	R->SetNumberField(TEXT("major"), Major);
+	R->SetNumberField(TEXT("minor"), Minor);
+	R->SetBoolField(TEXT("exposed"), bExpose);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetExposedScriptVersion(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ScriptPath = Params->GetStringField(TEXT("script_path"));
+	if (ScriptPath.IsEmpty()) ScriptPath = NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: script_path"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
+
+	Script->CheckVersionDataAvailable();
+
+	// Resolve target guid: explicit guid, or major+minor lookup
+	FGuid TargetGuid;
+	if (Params->HasField(TEXT("guid")))
+	{
+		if (!FGuid::Parse(Params->GetStringField(TEXT("guid")), TargetGuid))
+			return FMonolithActionResult::Error(TEXT("Invalid guid format"));
+	}
+	else if (Params->HasField(TEXT("major")) && Params->HasField(TEXT("minor")))
+	{
+		const int32 Major = static_cast<int32>(Params->GetNumberField(TEXT("major")));
+		const int32 Minor = static_cast<int32>(Params->GetNumberField(TEXT("minor")));
+		for (const FNiagaraAssetVersion& V : Script->GetAllAvailableVersions())
+		{
+			if (V.MajorVersion == Major && V.MinorVersion == Minor) { TargetGuid = V.VersionGuid; break; }
+		}
+		if (!TargetGuid.IsValid())
+			return FMonolithActionResult::Error(FString::Printf(TEXT("No version %d.%d on this script (see list_script_versions)"), Major, Minor));
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("Provide either 'guid' or 'major'+'minor'"));
+	}
+
+	Script->Modify();
+	Script->ExposeVersion(TargetGuid);
+
+	const FNiagaraAssetVersion NowExposed = Script->GetExposedVersion();
+	if (NowExposed.VersionGuid != TargetGuid)
+	{
+		return FMonolithActionResult::Error(TEXT("ExposeVersion had no effect — guid not found in the script's version data"));
+	}
+
+	Script->MarkPackageDirty();
+	FString PackageFilename;
+	UPackage* Pkg = Script->GetOutermost();
+	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("exposed_guid"), TargetGuid.ToString());
+	R->SetStringField(TEXT("exposed_version"), FString::Printf(TEXT("%d.%d"), NowExposed.MajorVersion, NowExposed.MinorVersion));
 	return NA_SuccessObj(R);
 }
 

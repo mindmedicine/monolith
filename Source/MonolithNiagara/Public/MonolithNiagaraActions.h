@@ -212,6 +212,10 @@ public:
 	static FMonolithActionResult HandleGetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAuditStackWiring(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleListStackWriters(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleListScriptVersions(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddScriptVersion(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetExposedScriptVersion(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
