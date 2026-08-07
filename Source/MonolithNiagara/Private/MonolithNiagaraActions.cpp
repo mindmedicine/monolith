@@ -2959,6 +2959,14 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("category"), TEXT("string"), TEXT("Existing category name"))
 			.Build());
 
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_stage_graph"), TEXT("Dump the NODE GRAPH behind a system's or emitter's stages — the graph get_module_graph cannot reach. Lists every node (class, guid, position, link counts), every output node with its usage AND usage_id, every input node with its ENiagaraInputNodeUsage, and optionally runs the engine's own BuildTraversal for a usage and reports which input nodes it finds. That last part reproduces exactly what NiagaraNodeEmitter::Compile checks when it errors with 'Input nodes on called graph not found'."),
+		FMonolithActionHandler::CreateStatic(&HandleGetStageGraph),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter name; omit for the system graph"))
+			.Optional(TEXT("traversal_usage"), TEXT("string"), TEXT("Run BuildTraversal for this usage and report the input nodes it reaches (emitter_update, particle_spawn, ...)"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("niagara"), TEXT("clean_stack_orphans"), TEXT("Delete orphaned nodes from a system's stage graphs: fully disconnected nodes and dangling feeder MapGets (no consumed outputs). Leftover junk from module removal/rebinding makes later engine stack surgery unpredictable — run this before add/remove on churned systems. Use audit_stack_wiring first to inspect; dry_run previews."),
 		FMonolithActionHandler::CreateStatic(&HandleCleanStackOrphans),
 		FParamSchemaBuilder()
@@ -18561,6 +18569,141 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAssignScriptParameterToCate
 	R->SetStringField(TEXT("parameter"), ParamName);
 	R->SetStringField(TEXT("category"), CategoryName);
 	R->SetStringField(TEXT("variable_guid"), VarGuid.ToString());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleGetStageGraph(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath = NA_GetAssetPath(Params);
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	const FString EmitterName = Params->HasField(TEXT("emitter")) ? Params->GetStringField(TEXT("emitter")) : FString();
+
+	UNiagaraGraph* Graph = nullptr;
+	FString Owner;
+	if (EmitterName.IsEmpty())
+	{
+		if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+		{
+			if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
+			{
+				Graph = Src->NodeGraph;
+			}
+		}
+		Owner = TEXT("System");
+	}
+	else
+	{
+		for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+		{
+			if (H.GetName().ToString() != EmitterName && H.GetId().ToString() != EmitterName) continue;
+			if (FVersionedNiagaraEmitterData* ED = H.GetEmitterData())
+			{
+				if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
+				{
+					Graph = Src->NodeGraph;
+				}
+			}
+			Owner = H.GetName().ToString();
+			break;
+		}
+		if (Owner.IsEmpty()) return FMonolithActionResult::Error(FString::Printf(TEXT("Emitter '%s' not found"), *EmitterName));
+	}
+	if (!Graph) return FMonolithActionResult::Error(TEXT("No node graph found for that target"));
+
+	auto InputUsageToString = [](ENiagaraInputNodeUsage U) -> const TCHAR*
+	{
+		switch (U)
+		{
+		case ENiagaraInputNodeUsage::Parameter:            return TEXT("Parameter");
+		case ENiagaraInputNodeUsage::Attribute:            return TEXT("Attribute");
+		case ENiagaraInputNodeUsage::SystemConstant:       return TEXT("SystemConstant");
+		case ENiagaraInputNodeUsage::TranslatorConstant:   return TEXT("TranslatorConstant");
+		case ENiagaraInputNodeUsage::RapidIterationParameter: return TEXT("RapidIterationParameter");
+		default:                                           return TEXT("Undefined");
+		}
+	};
+
+	TArray<TSharedPtr<FJsonValue>> NodesArr;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node) continue;
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+		O->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+		O->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+		O->SetNumberField(TEXT("pos_x"), Node->NodePosX);
+		O->SetNumberField(TEXT("pos_y"), Node->NodePosY);
+
+		int32 LinkedPins = 0;
+		for (UEdGraphPin* P : Node->Pins) { if (P->LinkedTo.Num() > 0) LinkedPins++; }
+		O->SetNumberField(TEXT("pin_count"), Node->Pins.Num());
+		O->SetNumberField(TEXT("linked_pin_count"), LinkedPins);
+
+		if (UNiagaraNodeOutput* Out = Cast<UNiagaraNodeOutput>(Node))
+		{
+			O->SetStringField(TEXT("output_usage"), StaticEnum<ENiagaraScriptUsage>()->GetNameStringByValue(static_cast<int64>(Out->GetUsage())));
+			O->SetStringField(TEXT("output_usage_id"), Out->GetUsageId().ToString());
+		}
+		if (UNiagaraNodeInput* In = Cast<UNiagaraNodeInput>(Node))
+		{
+			O->SetStringField(TEXT("input_usage"), InputUsageToString(In->Usage));
+			O->SetStringField(TEXT("input_variable"), In->Input.GetName().ToString());
+			O->SetStringField(TEXT("input_type"), In->Input.GetType().IsValid() ? In->Input.GetType().GetName() : TEXT("<invalid>"));
+			O->SetNumberField(TEXT("call_sort_priority"), In->CallSortPriority);
+		}
+		NodesArr.Add(MakeShared<FJsonValueObject>(O));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("asset_path"), SystemPath);
+	R->SetStringField(TEXT("owner"), Owner);
+	R->SetNumberField(TEXT("node_count"), NodesArr.Num());
+	R->SetArrayField(TEXT("nodes"), NodesArr);
+
+	// Reproduce the engine's own query: BuildTraversal for a usage, then look for input nodes.
+	if (Params->HasField(TEXT("traversal_usage")))
+	{
+		ENiagaraScriptUsage Usage;
+		if (!ResolveScriptUsage(Params->GetStringField(TEXT("traversal_usage")), Usage))
+		{
+			return FMonolithActionResult::Error(TEXT("Unknown traversal_usage"));
+		}
+
+		TArray<UNiagaraNode*> Traversal;
+		Graph->BuildTraversal(Traversal, Usage, FGuid());
+
+		TArray<TSharedPtr<FJsonValue>> TravArr, FoundInputs;
+		for (UNiagaraNode* N : Traversal)
+		{
+			if (!N) continue;
+			TSharedRef<FJsonObject> TO = MakeShared<FJsonObject>();
+			TO->SetStringField(TEXT("class"), N->GetClass()->GetName());
+			TO->SetStringField(TEXT("title"), N->GetNodeTitle(ENodeTitleType::ListView).ToString());
+			TravArr.Add(MakeShared<FJsonValueObject>(TO));
+
+			if (UNiagaraNodeInput* In = Cast<UNiagaraNodeInput>(N))
+			{
+				TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+				IO->SetStringField(TEXT("variable"), In->Input.GetName().ToString());
+				IO->SetStringField(TEXT("usage"), InputUsageToString(In->Usage));
+				FoundInputs.Add(MakeShared<FJsonValueObject>(IO));
+			}
+		}
+
+		TSharedRef<FJsonObject> T = MakeShared<FJsonObject>();
+		T->SetStringField(TEXT("usage"), StaticEnum<ENiagaraScriptUsage>()->GetNameStringByValue(static_cast<int64>(Usage)));
+		T->SetNumberField(TEXT("traversal_node_count"), TravArr.Num());
+		T->SetArrayField(TEXT("traversal"), TravArr);
+		T->SetNumberField(TEXT("input_node_count"), FoundInputs.Num());
+		T->SetArrayField(TEXT("input_nodes"), FoundInputs);
+		T->SetStringField(TEXT("engine_verdict"), FoundInputs.Num() > 0
+			? TEXT("OK — NiagaraNodeEmitter::Compile would find input nodes here")
+			: TEXT("FAIL — this is what produces 'Input nodes on called graph not found'"));
+		R->SetObjectField(TEXT("traversal_diagnostic"), T);
+	}
+
 	return NA_SuccessObj(R);
 }
 
