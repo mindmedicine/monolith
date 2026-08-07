@@ -2844,6 +2844,9 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
 			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
 			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum"))
+			.Optional(TEXT("convert_mode"), TEXT("string"), TEXT("For node_type=convert: break (split a type into components) | make (assemble a type from components) | swizzle. Omit for an empty convert node. The engine autowires pins AND inner component connections."))
+			.Optional(TEXT("convert_type"), TEXT("string"), TEXT("Type for convert_mode=break/make (e.g. vec3, vec4, quat, color)"))
+			.Optional(TEXT("swizzle"), TEXT("string"), TEXT("Component string for convert_mode=swizzle, 1-4 chars, e.g. 'xyz' or 'zx'"))
 			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("UEnum asset path when switch_type=enum"))
 			.Optional(TEXT("position"), TEXT("array"), TEXT("Node position as [x, y] (default [0,0])"))
 			.Optional(TEXT("comment"), TEXT("string"), TEXT("Comment bubble text"))
@@ -17758,8 +17761,98 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 	}
 	else if (NodeType == TEXT("convert"))
 	{
+		// A bare convert node is an empty switchboard. The useful forms are break / make /
+		// swizzle, which the engine builds itself in AutowireNewNode — including the inner
+		// component connections — provided the corresponding autowire field is set first.
+		// Those fields are private UPROPERTYs (no exported setter), so they go in by
+		// reflection; AutowireNewNode is a public virtual on UEdGraphNode, so it dispatches.
 		UNiagaraNodeConvert* N = SpawnGraphNode<UNiagaraNodeConvert>(Graph);
+
+		const FString Mode = Params->HasField(TEXT("convert_mode"))
+			? Params->GetStringField(TEXT("convert_mode")).ToLower() : FString();
+
+		auto SetStructField = [N](const TCHAR* FieldName, const FNiagaraTypeDefinition& TypeDef) -> bool
+		{
+			if (FStructProperty* Prop = CastField<FStructProperty>(UNiagaraNodeConvert::StaticClass()->FindPropertyByName(FieldName)))
+			{
+				*Prop->ContainerPtrToValuePtr<FNiagaraTypeDefinition>(N) = TypeDef;
+				return true;
+			}
+			return false;
+		};
+
+		// Swizzle derives its type FROM a source pin: AutowireNewNode does
+		// PinToTypeDefinition(FromPin) and MakeLinkTo(FromPin) with no null check
+		// (NiagaraNodeConvert.cpp:664-668), so a missing source pin CRASHES the editor.
+		// Break/make handle a null FromPin fine.
+		UEdGraphPin* SwizzleSourcePin = nullptr;
+		if (Mode == TEXT("swizzle"))
+		{
+			const FString Swiz = Params->HasField(TEXT("swizzle")) ? Params->GetStringField(TEXT("swizzle")) : FString();
+			if (Swiz.IsEmpty() || Swiz.Len() > 4)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT("convert_mode=swizzle requires 'swizzle' of 1-4 components, e.g. 'xyz' or 'zx'"));
+			}
+
+			UEdGraphNode* SrcNode = Params->HasField(TEXT("from_node"))
+				? FindNodeByGuid(Graph, Params->GetStringField(TEXT("from_node"))) : nullptr;
+			if (!SrcNode)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT(
+					"convert_mode=swizzle requires 'from_node' (and 'from_pin'/'from_pin_index') naming the vector "
+					"output pin to swizzle. The engine reads the swizzle's type from that pin and links to it; "
+					"without it the editor would crash."));
+			}
+			const bool bHasIdx = Params->HasField(TEXT("from_pin_index"));
+			FString PinErr;
+			SwizzleSourcePin = ResolvePin(SrcNode,
+				Params->HasField(TEXT("from_pin")) ? Params->GetStringField(TEXT("from_pin")) : FString(),
+				bHasIdx ? static_cast<int32>(Params->GetNumberField(TEXT("from_pin_index"))) : 0,
+				EGPD_Output, bHasIdx, PinErr);
+			if (!SwizzleSourcePin)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(TEXT("from_pin: %s"), *PinErr));
+			}
+
+			if (FStrProperty* Prop = CastField<FStrProperty>(UNiagaraNodeConvert::StaticClass()->FindPropertyByName(TEXT("AutowireSwizzle"))))
+			{
+				Prop->SetPropertyValue(Prop->ContainerPtrToValuePtr<void>(N), Swiz);
+			}
+		}
+		else if (Mode == TEXT("make") || Mode == TEXT("break"))
+		{
+			const FString TypeStr = Params->HasField(TEXT("convert_type")) ? Params->GetStringField(TEXT("convert_type")) : FString();
+			bool bFellBack = false;
+			FNiagaraTypeDefinition TypeDef = TypeStr.IsEmpty() ? FNiagaraTypeDefinition() : ResolveNiagaraType(TypeStr, &bFellBack);
+			if (TypeStr.IsEmpty() || bFellBack)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("convert_mode=%s requires a valid 'convert_type' (e.g. vec3, vec4, quat, color)"), *Mode));
+			}
+			SetStructField(Mode == TEXT("make") ? TEXT("AutowireMakeType") : TEXT("AutowireBreakType"), TypeDef);
+		}
+		else if (!Mode.IsEmpty())
+		{
+			Graph->RemoveNode(N);
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown convert_mode '%s' (swizzle | make | break, or omit for an empty convert node)"), *Mode));
+		}
+
 		FinalizeSpawnedNode(N);
+		if (!Mode.IsEmpty())
+		{
+			// Builds the typed pins AND the inner component connections.
+			static_cast<UEdGraphNode*>(N)->AutowireNewNode(SwizzleSourcePin);
+		}
 		NewNode = N;
 	}
 #endif // WITH_NIAGARA_WIZARD_PRIVATE
@@ -18074,6 +18167,67 @@ FMonolithActionResult FMonolithNiagaraActions::HandleListGraphNodePins(const TSh
 	R->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 	R->SetArrayField(TEXT("input_pins"), InputsArr);
 	R->SetArrayField(TEXT("output_pins"), OutputsArr);
+
+	// A convert node's real behavior lives in its inner component wiring, not its pins.
+	// Connections is a private UPROPERTY with no exported getter — read it by reflection so
+	// the switchboard is inspectable (pin guid + component path on each side).
+	if (Node->GetClass()->GetName().Contains(TEXT("NiagaraNodeConvert")))
+	{
+		if (FArrayProperty* ConnProp = CastField<FArrayProperty>(Node->GetClass()->FindPropertyByName(TEXT("Connections"))))
+		{
+			TMap<FGuid, FString> PinNameById;
+			for (UEdGraphPin* P : Node->Pins) PinNameById.Add(P->PinId, P->PinName.ToString());
+
+			FScriptArrayHelper Helper(ConnProp, ConnProp->ContainerPtrToValuePtr<void>(Node));
+			FStructProperty* ElemProp = CastField<FStructProperty>(ConnProp->Inner);
+			TArray<TSharedPtr<FJsonValue>> ConnArr;
+			if (ElemProp && ElemProp->Struct)
+			{
+				// FGuid is a USTRUCT, so its properties are FStructProperty — there is no FGuidProperty.
+				FStructProperty* SrcIdP = CastField<FStructProperty>(ElemProp->Struct->FindPropertyByName(TEXT("SourcePinId")));
+				FStructProperty* DstIdP = CastField<FStructProperty>(ElemProp->Struct->FindPropertyByName(TEXT("DestinationPinId")));
+				FArrayProperty* SrcPathP = CastField<FArrayProperty>(ElemProp->Struct->FindPropertyByName(TEXT("SourcePath")));
+				FArrayProperty* DstPathP = CastField<FArrayProperty>(ElemProp->Struct->FindPropertyByName(TEXT("DestinationPath")));
+
+				auto PathToString = [](FArrayProperty* PathProp, const void* StructPtr) -> FString
+				{
+					if (!PathProp) return FString();
+					FScriptArrayHelper PathHelper(PathProp, PathProp->ContainerPtrToValuePtr<void>(StructPtr));
+					TArray<FString> Parts;
+					for (int32 i = 0; i < PathHelper.Num(); ++i)
+					{
+						if (FNameProperty* NameProp = CastField<FNameProperty>(PathProp->Inner))
+						{
+							Parts.Add(NameProp->GetPropertyValue(PathHelper.GetRawPtr(i)).ToString());
+						}
+					}
+					return FString::Join(Parts, TEXT("."));
+				};
+
+				for (int32 i = 0; i < Helper.Num(); ++i)
+				{
+					const void* Elem = Helper.GetRawPtr(i);
+					TSharedRef<FJsonObject> CO = MakeShared<FJsonObject>();
+					if (SrcIdP)
+					{
+						const FGuid Id = *SrcIdP->ContainerPtrToValuePtr<FGuid>(Elem);
+						CO->SetStringField(TEXT("from_pin"), PinNameById.FindRef(Id));
+					}
+					CO->SetStringField(TEXT("from_path"), PathToString(SrcPathP, Elem));
+					if (DstIdP)
+					{
+						const FGuid Id = *DstIdP->ContainerPtrToValuePtr<FGuid>(Elem);
+						CO->SetStringField(TEXT("to_pin"), PinNameById.FindRef(Id));
+					}
+					CO->SetStringField(TEXT("to_path"), PathToString(DstPathP, Elem));
+					ConnArr.Add(MakeShared<FJsonValueObject>(CO));
+				}
+			}
+			R->SetNumberField(TEXT("inner_connection_count"), ConnArr.Num());
+			R->SetArrayField(TEXT("inner_connections"), ConnArr);
+		}
+	}
+
 	return NA_SuccessObj(R);
 }
 
