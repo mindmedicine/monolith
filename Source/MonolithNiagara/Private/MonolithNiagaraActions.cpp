@@ -2784,6 +2784,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("category"), TEXT("string"), TEXT("UI category"))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Script description"))
 			.Optional(TEXT("keywords"), TEXT("string"), TEXT("Search keywords"))
+			.Optional(TEXT("debug_draw_message"), TEXT("string"), TEXT("Tooltip shown on the module's debug-visualization eye icon in the stack"))
 			.Optional(TEXT("suggested"), TEXT("bool"), TEXT("Show in Suggested category"))
 			.Optional(TEXT("experimental"), TEXT("bool"), TEXT("Mark as experimental"))
 			.Optional(TEXT("deprecated"), TEXT("bool"), TEXT("Mark as deprecated"))
@@ -2843,7 +2844,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("function_script"), TEXT("string"), TEXT("Function/module script asset path for node_type=function"))
 			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
 			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
-			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum"))
+			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum | debug_state. 'debug_state' creates the Function.DebugState switch that gives a module its debug-visualization eye icon in the stack."))
 			.Optional(TEXT("convert_mode"), TEXT("string"), TEXT("For node_type=convert: break (split a type into components) | make (assemble a type from components) | swizzle. Omit for an empty convert node. The engine autowires pins AND inner component connections."))
 			.Optional(TEXT("convert_type"), TEXT("string"), TEXT("Type for convert_mode=break/make (e.g. vec3, vec4, quat, color)"))
 			.Optional(TEXT("swizzle"), TEXT("string"), TEXT("Component string for convert_mode=swizzle, 1-4 chars, e.g. 'xyz' or 'zx'"))
@@ -2960,6 +2961,15 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.MyInput')"))
 			.Required(TEXT("category"), TEXT("string"), TEXT("Existing category name"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_debug_draw"), TEXT("Toggle a placed module's debug visualization — the 'eye' icon in the stack. Only works on modules that contain a Function.DebugState static switch (e.g. the stock ShapeLocation); the response reports supports_debug_draw either way. Drawing is done by the module's own DebugDraw data interface and is globally gated by the cvar fx.Niagara.DebugDraw.Enabled. Omit 'enabled' to just query the current state."),
+		FMonolithActionHandler::CreateStatic(&HandleSetModuleDebugDraw),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
+			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name or guid"))
+			.Optional(TEXT("enabled"), TEXT("bool"), TEXT("true to show debug visualization, false to hide. Omit to query without changing."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_stage_graph"), TEXT("Dump the NODE GRAPH behind a system's or emitter's stages — the graph get_module_graph cannot reach. Lists every node (class, guid, position, link counts), every output node with its usage AND usage_id, every input node with its ENiagaraInputNodeUsage, and optionally runs the engine's own BuildTraversal for a usage and reports which input nodes it finds. That last part reproduces exactly what NiagaraNodeEmitter::Compile checks when it errors with 'Input nodes on called graph not found'."),
@@ -16881,6 +16891,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptMetadata(const TSh
 	R->SetStringField(TEXT("category"), SD->Category.ToString());
 	R->SetStringField(TEXT("description"), SD->Description.ToString());
 	R->SetStringField(TEXT("keywords"), SD->Keywords.ToString());
+	R->SetStringField(TEXT("debug_draw_message"), SD->DebugDrawMessage.ToString());
 	R->SetBoolField(TEXT("suggested"), SD->bSuggested);
 	R->SetBoolField(TEXT("experimental"), (bool)SD->bExperimental);
 	R->SetBoolField(TEXT("deprecated"), SD->bDeprecated);
@@ -16936,6 +16947,12 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptMetadata(const TSh
 	{
 		SD->Keywords = FText::FromString(Params->GetStringField(TEXT("keywords")));
 		Applied.Add(TEXT("keywords"));
+	}
+	if (Params->HasField(TEXT("debug_draw_message")))
+	{
+		// Tooltip shown on the stack's debug-visualization eye icon.
+		SD->DebugDrawMessage = FText::FromString(Params->GetStringField(TEXT("debug_draw_message")));
+		Applied.Add(TEXT("debug_draw_message"));
 	}
 	if (Params->HasField(TEXT("suggested")))
 	{
@@ -17743,6 +17760,16 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 			}
 			N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
 			N->SwitchTypeData.Enum = SwitchEnum;
+		}
+		else if (SwitchType == TEXT("debug_state"))
+		{
+			// The debug-visualization opt-in: an enum switch driven by the Function.DebugState
+			// compile constant. Its presence is what makes the stack show the eye icon
+			// (UNiagaraNodeFunctionCall::ContainsDebugSwitch), and its value follows the placed
+			// node's DebugState, which set_module_debug_draw toggles.
+			N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
+			N->SwitchTypeData.Enum = FNiagaraTypeDefinition::GetFunctionDebugStateEnum();
+			N->SwitchTypeData.SwitchConstant = TEXT("Function.DebugState");
 		}
 		else
 		{
@@ -18723,6 +18750,67 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAssignScriptParameterToCate
 	R->SetStringField(TEXT("parameter"), ParamName);
 	R->SetStringField(TEXT("category"), CategoryName);
 	R->SetStringField(TEXT("variable_guid"), VarGuid.ToString());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleDebugDraw(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath = NA_GetAssetPath(Params);
+	FString EmitterHandleId = Params->GetStringField(TEXT("emitter"));
+	FString ModuleNodeId = Params->GetStringField(TEXT("module_node"));
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeId);
+	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
+
+	// A module only offers debug visualization if its graph carries a static switch bound to
+	// the Function.DebugState compile constant — that is exactly what puts the eye icon in
+	// the stack (UNiagaraStackModuleItem::SupportsDebugDraw).
+	const bool bSupports = MN->ContainsDebugSwitch();
+	const bool bWasEnabled = MN->DebugState != ENiagaraFunctionDebugState::NoDebug;
+
+	bool bNowEnabled = bWasEnabled;
+	bool bChanged = false;
+	if (Params->HasField(TEXT("enabled")))
+	{
+		const bool bRequested = Params->GetBoolField(TEXT("enabled"));
+		if (!bSupports && bRequested)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Module '%s' has no Function.DebugState static switch, so it has no debug visualization to enable "
+					 "(no eye icon in the stack). Modules must opt in by containing that switch — the stock "
+					 "ShapeLocation module is the reference implementation."),
+				*MN->GetFunctionName()));
+		}
+		if (bRequested != bWasEnabled)
+		{
+			GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModuleDebugDraw", "Set Module Debug Draw"));
+			MN->Modify();
+			MN->DebugState = bRequested ? ENiagaraFunctionDebugState::Basic : ENiagaraFunctionDebugState::NoDebug;
+			MN->MarkNodeRequiresSynchronization(TEXT("MonolithSetDebugDraw"), true);
+			GEditor->EndTransaction();
+			System->RequestCompile(false);
+			bChanged = true;
+		}
+		bNowEnabled = bRequested;
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("asset_path"), SystemPath);
+	R->SetStringField(TEXT("module"), MN->GetFunctionName());
+	R->SetBoolField(TEXT("supports_debug_draw"), bSupports);
+	R->SetBoolField(TEXT("debug_draw_enabled"), bNowEnabled);
+	R->SetBoolField(TEXT("changed"), bChanged);
+	if (!bSupports)
+	{
+		R->SetStringField(TEXT("note"), TEXT("This module has no Function.DebugState switch — nothing to visualize."));
+	}
+	else
+	{
+		R->SetStringField(TEXT("note"), TEXT("Drawing is gated globally by the cvar fx.Niagara.DebugDraw.Enabled (default 1)."));
+	}
 	return NA_SuccessObj(R);
 }
 
