@@ -208,6 +208,11 @@ public:
 	static FMonolithActionResult HandleFindNiagaraReferences(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListSystemDataInterfaces(const TSharedPtr<FJsonObject>& Params);
 
+	// --- AISandbox local extensions (2026-08): script metadata get/set + wiring audit ---
+	static FMonolithActionResult HandleGetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAuditStackWiring(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 

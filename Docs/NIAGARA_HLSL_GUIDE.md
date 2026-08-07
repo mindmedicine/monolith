@@ -37,6 +37,21 @@ Overwrite HLSL source on a `CustomHlsl` node with auto-compile.
 
 ### Critical Rules for `create_module_from_hlsl`
 
+**0. Namespaced Outputs & Stage Bitmask (local AISandbox patch, 2026-08)**
+- Output names may be namespaced: `System.X`, `Emitter.X`, `Particles.X`,
+  `StackContext.X`, `Transient.X` — the module then writes that context directly.
+  The HLSL body uses the bare last segment (`X`). Bare output names keep the
+  legacy module-local `Output.<name>` behavior.
+- New optional `stages` array sets the Module Usage Bitmask (where the module may
+  live): `particle_spawn`, `particle_update`, `particle_event`,
+  `particle_simulation_stage`, `emitter_spawn`, `emitter_update`, `system_spawn`,
+  `system_update`. Default: particle stages only. System/Emitter writes require
+  the matching stage.
+- Nodes are laid out left-to-right (InputMap → MapGet → CustomHlsl → MapSet → Output).
+- `description` is applied to the script asset.
+- CAUTION: never call `set_module_input_binding` on an input that is already
+  linked — the override graph gets corrupted. Remove the module, re-add, bind once.
+
 **1. Input/Output Variables Are Auto-Declared**
 - Do NOT redeclare them in HLSL
 - Niagara injects pins into shader scope automatically
