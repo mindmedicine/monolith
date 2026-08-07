@@ -219,6 +219,15 @@ public:
 	static FMonolithActionResult HandleSetNodeComment(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCleanStackOrphans(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Niagara script-graph authoring (Tier 1: public node classes) ---
+	static FMonolithActionResult HandleAddGraphNode(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveGraphNode(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleConnectGraphPins(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleDisconnectGraphPins(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetGraphPinDefault(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetGraphNodePosition(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleListGraphNodePins(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 

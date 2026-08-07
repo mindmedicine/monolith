@@ -16,6 +16,7 @@
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeCustomHlsl.h"
 #include "NiagaraNodeInput.h"
+#include "NiagaraNodeOp.h"
 #include "NiagaraNodeWithDynamicPins.h"
 #include "NiagaraDataInterface.h"
 // Tranche 2 (#64): per-system DI enumeration. Verified UE 5.7 (offline source index):
@@ -2817,6 +2818,72 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("comment"), TEXT("string"), TEXT("Comment text; empty string clears the comment"))
 			.Optional(TEXT("bubble_visible"), TEXT("bool"), TEXT("Show the bubble (default true when comment non-empty)"))
 			.Build());
+	// --- Script-graph authoring (Tier 1: public node classes) ---
+	// Distinct from the stack-level module actions: these edit the NODE GRAPH inside a
+	// Niagara script asset (or an embedded scratch script via "NS_X.NS_X:ScratchName").
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type). Returns node_guid + created pins."),
+		FMonolithActionHandler::CreateStatic(&HandleAddGraphNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_type"), TEXT("string"), TEXT("op | function | input"))
+			.Optional(TEXT("op_name"), TEXT("string"), TEXT("Operation name for node_type=op, e.g. 'Numeric::Add', 'Numeric::Multiply'"))
+			.Optional(TEXT("function_script"), TEXT("string"), TEXT("Function/module script asset path for node_type=function"))
+			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input"))
+			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("position"), TEXT("array"), TEXT("Node position as [x, y] (default [0,0])"))
+			.Optional(TEXT("comment"), TEXT("string"), TEXT("Comment bubble text"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_graph_node"), TEXT("Remove a node from a Niagara script's node graph by guid (breaks its links first)"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveGraphNode),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid (from get_module_graph)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("connect_graph_pins"), TEXT("Connect two pins in a Niagara script graph. Pins are addressed by name or index within their direction. Type compatibility is checked by the Niagara schema; incompatible connections return the schema's own reason instead of corrupting the graph."),
+		FMonolithActionHandler::CreateStatic(&HandleConnectGraphPins),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("from_node"), TEXT("string"), TEXT("Source node guid"))
+			.Required(TEXT("to_node"), TEXT("string"), TEXT("Target node guid"))
+			.Optional(TEXT("from_pin"), TEXT("string"), TEXT("Source output pin name (or use from_pin_index)"))
+			.Optional(TEXT("to_pin"), TEXT("string"), TEXT("Target input pin name (or use to_pin_index)"))
+			.Optional(TEXT("from_pin_index"), TEXT("integer"), TEXT("Source output pin index"))
+			.Optional(TEXT("to_pin_index"), TEXT("integer"), TEXT("Target input pin index"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("disconnect_graph_pins"), TEXT("Break links on a pin in a Niagara script graph (all links on the pin, or just the link to a specific other node)"),
+		FMonolithActionHandler::CreateStatic(&HandleDisconnectGraphPins),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
+			.Optional(TEXT("pin"), TEXT("string"), TEXT("Pin name (or use pin_index)"))
+			.Optional(TEXT("pin_index"), TEXT("integer"), TEXT("Pin index"))
+			.Optional(TEXT("direction"), TEXT("string"), TEXT("input | output (needed when a name is ambiguous)"))
+			.Optional(TEXT("other_node"), TEXT("string"), TEXT("Only break the link to this node guid"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_graph_pin_default"), TEXT("Set a pin's literal default value in a Niagara script graph (routed through the Niagara schema so the string is parsed for the pin's type)"),
+		FMonolithActionHandler::CreateStatic(&HandleSetGraphPinDefault),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
+			.Required(TEXT("value"), TEXT("string"), TEXT("Default value as a string (e.g. '1.5', 'true', '0,0,1')"))
+			.Optional(TEXT("pin"), TEXT("string"), TEXT("Pin name (or use pin_index)"))
+			.Optional(TEXT("pin_index"), TEXT("integer"), TEXT("Input pin index"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_graph_node_position"), TEXT("Move a node in a Niagara script graph"),
+		FMonolithActionHandler::CreateStatic(&HandleSetGraphNodePosition),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
+			.Required(TEXT("x"), TEXT("integer"), TEXT("Node X position"))
+			.Required(TEXT("y"), TEXT("integer"), TEXT("Node Y position"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("list_graph_node_pins"), TEXT("List a graph node's pins with index, name, direction, Niagara type, default value and link targets — the addressing reference for connect_graph_pins / set_graph_pin_default"),
+		FMonolithActionHandler::CreateStatic(&HandleListGraphNodePins),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("niagara"), TEXT("clean_stack_orphans"), TEXT("Delete orphaned nodes from a system's stage graphs: fully disconnected nodes and dangling feeder MapGets (no consumed outputs). Leftover junk from module removal/rebinding makes later engine stack surgery unpredictable — run this before add/remove on churned systems. Use audit_stack_wiring first to inspect; dry_run previews."),
 		FMonolithActionHandler::CreateStatic(&HandleCleanStackOrphans),
 		FParamSchemaBuilder()
@@ -17251,6 +17318,531 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNodeComment(const TShare
 	R->SetStringField(TEXT("node"), Target->GetName());
 	R->SetStringField(TEXT("comment"), Comment);
 	R->SetBoolField(TEXT("bubble_visible"), bVisible);
+	return NA_SuccessObj(R);
+}
+
+// ============================================================================
+// Niagara script-graph authoring (Tier 1: public node classes)
+//
+// Scope note: UNiagaraNodeOp / FunctionCall / Input / Output / CustomHlsl live in
+// NiagaraEditor/Public and are MinimalAPI-or-better, so NewObject links cleanly and
+// pin allocation runs through virtuals. ParameterMapGet/Set, If, Select, StaticSwitch
+// and Convert are engine-PRIVATE with no export macro — those are Tier 2 and are
+// reached (if at all) behind WITH_NIAGARA_WIZARD_PRIVATE.
+//
+// FNiagaraOpInfo is NOT exported, so op names cannot be enumerated or validated up
+// front. Instead we create the node, let the engine's AllocateDefaultPins resolve the
+// op, and treat "no pins produced" as an invalid op name (rolling the node back).
+// ============================================================================
+
+namespace MonolithNiagaraGraphAuthoring
+{
+	// Resolve a script asset (standalone or embedded scratch "NS_X.NS_X:ScratchName") to its graph.
+	static UNiagaraGraph* ResolveScriptGraph(const TSharedPtr<FJsonObject>& Params, UNiagaraScript*& OutScript, FString& OutPath, FString& OutError)
+	{
+		OutPath = Params->HasField(TEXT("script_path")) ? Params->GetStringField(TEXT("script_path")) : NA_GetAssetPath(Params);
+		if (OutPath.IsEmpty()) { OutError = TEXT("Missing required param: script_path"); return nullptr; }
+
+		OutScript = LoadObject<UNiagaraScript>(nullptr, *OutPath);
+		if (!OutScript) { OutError = FString::Printf(TEXT("Failed to load script '%s'"), *OutPath); return nullptr; }
+
+		UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(OutScript->GetLatestSource());
+		if (!Src || !Src->NodeGraph) { OutError = TEXT("Script has no editable node graph"); return nullptr; }
+		return Src->NodeGraph;
+	}
+
+	static UEdGraphNode* FindNodeByGuid(UNiagaraGraph* Graph, const FString& GuidStr)
+	{
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && Node->NodeGuid.ToString().Equals(GuidStr, ESearchCase::IgnoreCase)) return Node;
+		}
+		return nullptr;
+	}
+
+	// Pins are addressed by name or by index WITHIN a direction (the graph exposes several
+	// unnamed/duplicate-named pins, so index addressing is the reliable fallback).
+	static UEdGraphPin* ResolvePin(UEdGraphNode* Node, const FString& PinName, int32 PinIndex, EEdGraphPinDirection Direction, bool bHasIndex, FString& OutError)
+	{
+		TArray<UEdGraphPin*> Candidates;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (P->Direction == Direction) Candidates.Add(P);
+		}
+
+		if (bHasIndex)
+		{
+			if (!Candidates.IsValidIndex(PinIndex))
+			{
+				OutError = FString::Printf(TEXT("Pin index %d out of range — node has %d %s pins"),
+					PinIndex, Candidates.Num(), Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+				return nullptr;
+			}
+			return Candidates[PinIndex];
+		}
+
+		if (PinName.IsEmpty())
+		{
+			OutError = TEXT("Provide a pin name or a pin index");
+			return nullptr;
+		}
+
+		TArray<UEdGraphPin*> Matches;
+		for (UEdGraphPin* P : Candidates)
+		{
+			if (P->PinName.ToString().Equals(PinName, ESearchCase::IgnoreCase)) Matches.Add(P);
+		}
+		if (Matches.Num() == 1) return Matches[0];
+
+		TArray<FString> Names;
+		for (int32 i = 0; i < Candidates.Num(); ++i)
+		{
+			Names.Add(FString::Printf(TEXT("[%d] %s"), i, *Candidates[i]->PinName.ToString()));
+		}
+		OutError = Matches.Num() == 0
+			? FString::Printf(TEXT("No %s pin named '%s'. Available: %s"), Direction == EGPD_Input ? TEXT("input") : TEXT("output"), *PinName, *FString::Join(Names, TEXT(", ")))
+			: FString::Printf(TEXT("Pin name '%s' is ambiguous (%d matches) — use a pin index. Available: %s"), *PinName, Matches.Num(), *FString::Join(Names, TEXT(", ")));
+		return nullptr;
+	}
+
+	static void SavePackageFor(UNiagaraScript* Script)
+	{
+		Script->MarkPackageDirty();
+		FString PackageFilename;
+		UPackage* Pkg = Script->GetOutermost();
+		if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+		{
+			FSavePackageArgs SaveArgs;
+			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+			SaveArgs.Error = GError;
+			UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
+		}
+	}
+
+	static TSharedRef<FJsonObject> DescribePin(const UEdGraphPin* Pin, int32 IndexInDirection)
+	{
+		TSharedRef<FJsonObject> PO = MakeShared<FJsonObject>();
+		PO->SetNumberField(TEXT("index"), IndexInDirection);
+		PO->SetStringField(TEXT("name"), Pin->PinName.ToString());
+		PO->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+		const FNiagaraTypeDefinition TypeDef = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
+		PO->SetStringField(TEXT("type"), TypeDef.IsValid() ? TypeDef.GetName() : TEXT("<unresolved>"));
+		PO->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		TArray<TSharedPtr<FJsonValue>> Links;
+		for (const UEdGraphPin* LP : Pin->LinkedTo)
+		{
+			if (!LP || !LP->GetOwningNode()) continue;
+			TSharedRef<FJsonObject> LO = MakeShared<FJsonObject>();
+			LO->SetStringField(TEXT("node_guid"), LP->GetOwningNode()->NodeGuid.ToString());
+			LO->SetStringField(TEXT("pin"), LP->PinName.ToString());
+			Links.Add(MakeShared<FJsonValueObject>(LO));
+		}
+		PO->SetArrayField(TEXT("linked_to"), Links);
+		return PO;
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString NodeType = Params->GetStringField(TEXT("node_type")).ToLower();
+
+	int32 PosX = 0, PosY = 0;
+	{
+		const TArray<TSharedPtr<FJsonValue>>* PosArr;
+		if (Params->TryGetArrayField(TEXT("position"), PosArr) && PosArr->Num() >= 2)
+		{
+			PosX = static_cast<int32>((*PosArr)[0]->AsNumber());
+			PosY = static_cast<int32>((*PosArr)[1]->AsNumber());
+		}
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddGraphNode", "Add Niagara Graph Node"));
+	Graph->Modify();
+
+	UEdGraphNode* NewNode = nullptr;
+	FString CreateError;
+
+	if (NodeType == TEXT("op"))
+	{
+		const FString OpName = Params->HasField(TEXT("op_name")) ? Params->GetStringField(TEXT("op_name")) : FString();
+		if (OpName.IsEmpty())
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("node_type=op requires 'op_name' (e.g. 'Numeric::Add')"));
+		}
+		FGraphNodeCreator<UNiagaraNodeOp> Creator(*Graph);
+		UNiagaraNodeOp* OpNode = Creator.CreateNode(false);
+		OpNode->OpName = FName(*OpName);
+		Creator.Finalize();
+
+		// FNiagaraOpInfo isn't exported, so validity is judged by what AllocateDefaultPins produced.
+		if (OpNode->Pins.Num() == 0)
+		{
+			OpNode->BreakAllNodeLinks();
+			Graph->RemoveNode(OpNode);
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown op_name '%s' — the engine produced a node with no pins. Op names are 'Category::Name' "
+					 "(e.g. Numeric::Add, Numeric::Multiply, Numeric::Subtract, Numeric::Divide, Math::Sin, Boolean::And). "
+					 "FNiagaraOpInfo is not DLL-exported so names cannot be enumerated; verify against an existing graph."),
+				*OpName));
+		}
+		NewNode = OpNode;
+	}
+	else if (NodeType == TEXT("function"))
+	{
+		const FString FnPath = Params->HasField(TEXT("function_script")) ? Params->GetStringField(TEXT("function_script")) : FString();
+		if (FnPath.IsEmpty())
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("node_type=function requires 'function_script'"));
+		}
+		UNiagaraScript* FnScript = LoadObject<UNiagaraScript>(nullptr, *FnPath);
+		if (!FnScript)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load function_script '%s'"), *FnPath));
+		}
+		FGraphNodeCreator<UNiagaraNodeFunctionCall> Creator(*Graph);
+		UNiagaraNodeFunctionCall* FnNode = Creator.CreateNode(false);
+		FnNode->FunctionScript = FnScript;
+		Creator.Finalize();
+		NewNode = FnNode;
+	}
+	else if (NodeType == TEXT("input"))
+	{
+		const FString InName = Params->HasField(TEXT("input_name")) ? Params->GetStringField(TEXT("input_name")) : FString();
+		const FString InType = Params->HasField(TEXT("input_type")) ? Params->GetStringField(TEXT("input_type")) : FString();
+		if (InName.IsEmpty() || InType.IsEmpty())
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("node_type=input requires 'input_name' and 'input_type'"));
+		}
+		bool bFellBack = false;
+		FNiagaraTypeDefinition TypeDef = ResolveNiagaraType(InType, &bFellBack);
+		if (bFellBack)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown Niagara type '%s'"), *InType));
+		}
+		FGraphNodeCreator<UNiagaraNodeInput> Creator(*Graph);
+		UNiagaraNodeInput* InNode = Creator.CreateNode(false);
+		InNode->Usage = ENiagaraInputNodeUsage::Parameter;
+		InNode->Input = FNiagaraVariable(TypeDef, FName(*InName));
+		Creator.Finalize();
+		NewNode = InNode;
+	}
+	else
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown node_type '%s'. Tier 1 supports: op, function, input. "
+				 "(ParameterMapGet/Set, If, Select, StaticSwitch are engine-private — Tier 2.)"), *NodeType));
+	}
+
+	NewNode->NodePosX = PosX;
+	NewNode->NodePosY = PosY;
+	if (Params->HasField(TEXT("comment")))
+	{
+		NewNode->NodeComment = Params->GetStringField(TEXT("comment"));
+		NewNode->bCommentBubbleVisible = !NewNode->NodeComment.IsEmpty();
+		NewNode->bCommentBubblePinned = NewNode->bCommentBubbleVisible;
+	}
+
+	if (UNiagaraNode* NiagaraNode = Cast<UNiagaraNode>(NewNode))
+	{
+		NiagaraNode->MarkNodeRequiresSynchronization(TEXT("MonolithAddGraphNode"), true);
+	}
+	GEditor->EndTransaction();
+	SavePackageFor(Script);
+
+	TArray<TSharedPtr<FJsonValue>> PinsArr;
+	{
+		int32 InIdx = 0, OutIdx = 0;
+		for (UEdGraphPin* P : NewNode->Pins)
+		{
+			PinsArr.Add(MakeShared<FJsonValueObject>(DescribePin(P, P->Direction == EGPD_Input ? InIdx++ : OutIdx++)));
+		}
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), NewNode->NodeGuid.ToString());
+	R->SetStringField(TEXT("class"), NewNode->GetClass()->GetName());
+	R->SetStringField(TEXT("title"), NewNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	R->SetNumberField(TEXT("pin_count"), PinsArr.Num());
+	R->SetArrayField(TEXT("pins"), PinsArr);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleRemoveGraphNode(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString GuidStr = Params->GetStringField(TEXT("node_guid"));
+	UEdGraphNode* Node = FindNodeByGuid(Graph, GuidStr);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("No node with guid '%s'"), *GuidStr));
+
+	if (Cast<UNiagaraNodeOutput>(Node) || Cast<UNiagaraNodeInput>(Node))
+	{
+		// Removing the stack entry/exit nodes leaves an uncompilable graph; the engine's own
+		// stack walk requires both. Refuse rather than produce a broken script.
+		if (Cast<UNiagaraNodeOutput>(Node))
+		{
+			return FMonolithActionResult::Error(TEXT("Refusing to remove the graph's Output node — the script would no longer compile."));
+		}
+	}
+
+	const FString ClassName = Node->GetClass()->GetName();
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "RemoveGraphNode", "Remove Niagara Graph Node"));
+	Graph->Modify();
+	Node->Modify();
+	Node->BreakAllNodeLinks();
+	Graph->RemoveNode(Node);
+	GEditor->EndTransaction();
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("removed_guid"), GuidStr);
+	R->SetStringField(TEXT("class"), ClassName);
+	R->SetNumberField(TEXT("remaining_nodes"), Graph->Nodes.Num());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleConnectGraphPins(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* FromNode = FindNodeByGuid(Graph, Params->GetStringField(TEXT("from_node")));
+	UEdGraphNode* ToNode = FindNodeByGuid(Graph, Params->GetStringField(TEXT("to_node")));
+	if (!FromNode) return FMonolithActionResult::Error(TEXT("from_node guid not found"));
+	if (!ToNode) return FMonolithActionResult::Error(TEXT("to_node guid not found"));
+
+	const bool bHasFromIdx = Params->HasField(TEXT("from_pin_index"));
+	const bool bHasToIdx = Params->HasField(TEXT("to_pin_index"));
+	FString PinErr;
+	UEdGraphPin* FromPin = ResolvePin(FromNode,
+		Params->HasField(TEXT("from_pin")) ? Params->GetStringField(TEXT("from_pin")) : FString(),
+		bHasFromIdx ? static_cast<int32>(Params->GetNumberField(TEXT("from_pin_index"))) : 0,
+		EGPD_Output, bHasFromIdx, PinErr);
+	if (!FromPin) return FMonolithActionResult::Error(FString::Printf(TEXT("from_pin: %s"), *PinErr));
+
+	UEdGraphPin* ToPin = ResolvePin(ToNode,
+		Params->HasField(TEXT("to_pin")) ? Params->GetStringField(TEXT("to_pin")) : FString(),
+		bHasToIdx ? static_cast<int32>(Params->GetNumberField(TEXT("to_pin_index"))) : 0,
+		EGPD_Input, bHasToIdx, PinErr);
+	if (!ToPin) return FMonolithActionResult::Error(FString::Printf(TEXT("to_pin: %s"), *PinErr));
+
+	const UEdGraphSchema_Niagara* Schema = Cast<UEdGraphSchema_Niagara>(Graph->GetSchema());
+	if (!Schema) Schema = GetDefault<UEdGraphSchema_Niagara>();
+
+	// Ask the schema first so a rejected connection reports the engine's own reason.
+	const FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
+	if (Response.Response == CONNECT_RESPONSE_DISALLOW)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Niagara schema rejected the connection (%s -> %s): %s"),
+			*FromPin->PinName.ToString(), *ToPin->PinName.ToString(), *Response.Message.ToString()));
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "ConnectGraphPins", "Connect Niagara Pins"));
+	Graph->Modify();
+	FromNode->Modify();
+	ToNode->Modify();
+	const bool bConnected = Schema->TryCreateConnection(FromPin, ToPin);
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(ToNode)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithConnectPins"), true);
+	GEditor->EndTransaction();
+
+	if (!bConnected)
+	{
+		return FMonolithActionResult::Error(TEXT("TryCreateConnection returned false despite the schema allowing it"));
+	}
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("from"), FString::Printf(TEXT("%s.%s"), *FromNode->GetNodeTitle(ENodeTitleType::ListView).ToString(), *FromPin->PinName.ToString()));
+	R->SetStringField(TEXT("to"), FString::Printf(TEXT("%s.%s"), *ToNode->GetNodeTitle(ENodeTitleType::ListView).ToString(), *ToPin->PinName.ToString()));
+	R->SetStringField(TEXT("schema_response"), Response.Message.ToString());
+	R->SetNumberField(TEXT("from_pin_links"), FromPin->LinkedTo.Num());
+	R->SetNumberField(TEXT("to_pin_links"), ToPin->LinkedTo.Num());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleDisconnectGraphPins(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, Params->GetStringField(TEXT("node_guid")));
+	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
+
+	EEdGraphPinDirection Dir = EGPD_Input;
+	if (Params->HasField(TEXT("direction")) && Params->GetStringField(TEXT("direction")).ToLower() == TEXT("output"))
+	{
+		Dir = EGPD_Output;
+	}
+
+	const bool bHasIdx = Params->HasField(TEXT("pin_index"));
+	FString PinErr;
+	UEdGraphPin* Pin = ResolvePin(Node,
+		Params->HasField(TEXT("pin")) ? Params->GetStringField(TEXT("pin")) : FString(),
+		bHasIdx ? static_cast<int32>(Params->GetNumberField(TEXT("pin_index"))) : 0,
+		Dir, bHasIdx, PinErr);
+	if (!Pin) return FMonolithActionResult::Error(PinErr);
+
+	const FString OtherGuid = Params->HasField(TEXT("other_node")) ? Params->GetStringField(TEXT("other_node")) : FString();
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "DisconnectGraphPins", "Disconnect Niagara Pins"));
+	Graph->Modify();
+	Node->Modify();
+
+	int32 Broken = 0;
+	if (OtherGuid.IsEmpty())
+	{
+		Broken = Pin->LinkedTo.Num();
+		Pin->BreakAllPinLinks();
+	}
+	else
+	{
+		for (int32 i = Pin->LinkedTo.Num() - 1; i >= 0; --i)
+		{
+			UEdGraphPin* LP = Pin->LinkedTo[i];
+			if (LP && LP->GetOwningNode() && LP->GetOwningNode()->NodeGuid.ToString().Equals(OtherGuid, ESearchCase::IgnoreCase))
+			{
+				Pin->BreakLinkTo(LP);
+				Broken++;
+			}
+		}
+	}
+
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithDisconnectPins"), true);
+	GEditor->EndTransaction();
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+	R->SetNumberField(TEXT("links_broken"), Broken);
+	R->SetNumberField(TEXT("links_remaining"), Pin->LinkedTo.Num());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetGraphPinDefault(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, Params->GetStringField(TEXT("node_guid")));
+	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
+
+	const bool bHasIdx = Params->HasField(TEXT("pin_index"));
+	FString PinErr;
+	UEdGraphPin* Pin = ResolvePin(Node,
+		Params->HasField(TEXT("pin")) ? Params->GetStringField(TEXT("pin")) : FString(),
+		bHasIdx ? static_cast<int32>(Params->GetNumberField(TEXT("pin_index"))) : 0,
+		EGPD_Input, bHasIdx, PinErr);
+	if (!Pin) return FMonolithActionResult::Error(PinErr);
+
+	if (Pin->LinkedTo.Num() > 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Pin '%s' is connected (%d link(s)); a literal default would be ignored. Disconnect it first."),
+			*Pin->PinName.ToString(), Pin->LinkedTo.Num()));
+	}
+
+	const FString Value = Params->GetStringField(TEXT("value"));
+	const UEdGraphSchema_Niagara* Schema = Cast<UEdGraphSchema_Niagara>(Graph->GetSchema());
+	if (!Schema) Schema = GetDefault<UEdGraphSchema_Niagara>();
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetGraphPinDefault", "Set Niagara Pin Default"));
+	Graph->Modify();
+	Node->Modify();
+	Schema->TrySetDefaultValue(*Pin, Value, /*bMarkAsModified=*/true);
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithSetPinDefault"), true);
+	GEditor->EndTransaction();
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+	R->SetStringField(TEXT("requested_value"), Value);
+	R->SetStringField(TEXT("actual_value"), Pin->DefaultValue);
+	R->SetBoolField(TEXT("applied"), Pin->DefaultValue == Value);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetGraphNodePosition(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, Params->GetStringField(TEXT("node_guid")));
+	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
+
+	Node->Modify();
+	Node->NodePosX = static_cast<int32>(Params->GetNumberField(TEXT("x")));
+	Node->NodePosY = static_cast<int32>(Params->GetNumberField(TEXT("y")));
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+	R->SetNumberField(TEXT("x"), Node->NodePosX);
+	R->SetNumberField(TEXT("y"), Node->NodePosY);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleListGraphNodePins(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UEdGraphNode* Node = FindNodeByGuid(Graph, Params->GetStringField(TEXT("node_guid")));
+	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
+
+	TArray<TSharedPtr<FJsonValue>> InputsArr, OutputsArr;
+	int32 InIdx = 0, OutIdx = 0;
+	for (UEdGraphPin* P : Node->Pins)
+	{
+		if (P->Direction == EGPD_Input) InputsArr.Add(MakeShared<FJsonValueObject>(DescribePin(P, InIdx++)));
+		else OutputsArr.Add(MakeShared<FJsonValueObject>(DescribePin(P, OutIdx++)));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+	R->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+	R->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	R->SetArrayField(TEXT("input_pins"), InputsArr);
+	R->SetArrayField(TEXT("output_pins"), OutputsArr);
 	return NA_SuccessObj(R);
 }
 
