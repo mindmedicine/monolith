@@ -422,12 +422,15 @@ namespace MonolithNiagaraHelpers
 
 			for (UEdGraphNode* Feeder : FeederNodes)
 			{
-				bool bStillLinked = false;
+				// Outputs-only criterion: a feeder whose outputs feed nothing is dead even
+				// if its chain-side Source input is still linked (that residual link is
+				// exactly what makes it a dangling feeder — verified by audit_stack_wiring).
+				bool bOutputsStillUsed = false;
 				for (UEdGraphPin* P : Feeder->Pins)
 				{
-					if (P->LinkedTo.Num() > 0) { bStillLinked = true; break; }
+					if (P->Direction == EGPD_Output && P->LinkedTo.Num() > 0) { bOutputsStillUsed = true; break; }
 				}
-				if (!bStillLinked)
+				if (!bOutputsStillUsed)
 				{
 					Feeder->BreakAllNodeLinks();
 					Graph->RemoveNode(Feeder);
@@ -2806,6 +2809,21 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("major"), TEXT("integer"), TEXT("Major version number (with minor, alternative to guid)"))
 			.Optional(TEXT("minor"), TEXT("integer"), TEXT("Minor version number"))
 			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_node_comment"), TEXT("Set (or clear with empty text) the comment bubble on a node in a Niagara script graph — improves graph readability. Find node guids via get_module_graph."),
+		FMonolithActionHandler::CreateStatic(&HandleSetNodeComment),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid (from get_module_graph)"))
+			.Required(TEXT("comment"), TEXT("string"), TEXT("Comment text; empty string clears the comment"))
+			.Optional(TEXT("bubble_visible"), TEXT("bool"), TEXT("Show the bubble (default true when comment non-empty)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("clean_stack_orphans"), TEXT("Delete orphaned nodes from a system's stage graphs: fully disconnected nodes and dangling feeder MapGets (no consumed outputs). Leftover junk from module removal/rebinding makes later engine stack surgery unpredictable — run this before add/remove on churned systems. Use audit_stack_wiring first to inspect; dry_run previews."),
+		FMonolithActionHandler::CreateStatic(&HandleCleanStackOrphans),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Limit to one emitter's graph (system graph always included)"))
+			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("Report what would be removed without changing anything (default false)"))
+			.Build());
 
 	// Parameter (9)
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_all_parameters"), TEXT("Get all parameters in a system"),
@@ -4378,6 +4396,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleGraph(const TShare
 		NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 		NodeObj->SetNumberField(TEXT("pos_x"), Node->NodePosX);
 		NodeObj->SetNumberField(TEXT("pos_y"), Node->NodePosY);
+		if (!Node->NodeComment.IsEmpty())
+		{
+			NodeObj->SetStringField(TEXT("comment"), Node->NodeComment);
+			NodeObj->SetBoolField(TEXT("comment_visible"), Node->bCommentBubbleVisible);
+		}
 		if (UNiagaraNodeFunctionCall* FN = Cast<UNiagaraNodeFunctionCall>(Node))
 		{
 			NodeObj->SetStringField(TEXT("function_name"), FN->GetFunctionName());
@@ -6344,9 +6367,34 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	InputNode->NodePosX = -1150; InputNode->NodePosY = 0;
 	HlslNode->NodePosX = -350;   HlslNode->NodePosY = 0;
 	OutputNode->NodePosX = 400;  OutputNode->NodePosY = 0;
+
+	// Comment bubbles so generated graphs are self-describing
+	if (!Description.IsEmpty())
+	{
+		HlslNode->NodeComment = Description;
+		HlslNode->bCommentBubbleVisible = true;
+		HlslNode->bCommentBubblePinned = true;
+	}
 #if WITH_NIAGARA_WIZARD_PRIVATE
 	if (MapGetNode) { MapGetNode->NodePosX = -750; MapGetNode->NodePosY = 250; }
 	if (MapSetNode) { MapSetNode->NodePosX = 50;   MapSetNode->NodePosY = 0; }
+	if (MapGetNode && ParsedInputs.Num() > 0)
+	{
+		TArray<FString> InputNames;
+		for (const FPinDef& I : ParsedInputs) InputNames.Add(I.Name);
+		MapGetNode->NodeComment = FString::Printf(TEXT("Reads module inputs: %s"), *FString::Join(InputNames, TEXT(", ")));
+		MapGetNode->bCommentBubbleVisible = true;
+		MapGetNode->bCommentBubblePinned = true;
+	}
+	if (MapSetNode && ParsedOutputs.Num() > 0)
+	{
+		TArray<FString> WriteNames;
+		for (const FPinDef& O : ParsedOutputs)
+			WriteNames.Add(O.WritePinName.IsEmpty() ? FString::Printf(TEXT("Output.%s"), *O.Name) : O.WritePinName);
+		MapSetNode->NodeComment = FString::Printf(TEXT("Writes: %s"), *FString::Join(WriteNames, TEXT(", ")));
+		MapSetNode->bCommentBubbleVisible = true;
+		MapSetNode->bCommentBubblePinned = true;
+	}
 #endif
 	{
 		int32 TypedInputIndex = 1;
@@ -17125,6 +17173,172 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetExposedScriptVersion(con
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("exposed_guid"), TargetGuid.ToString());
 	R->SetStringField(TEXT("exposed_version"), FString::Printf(TEXT("%d.%d"), NowExposed.MajorVersion, NowExposed.MinorVersion));
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetNodeComment(const TSharedPtr<FJsonObject>& Params)
+{
+	FString ScriptPath = Params->GetStringField(TEXT("script_path"));
+	if (ScriptPath.IsEmpty()) ScriptPath = NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: script_path"));
+	const FString NodeGuidStr = Params->GetStringField(TEXT("node_guid"));
+	const FString Comment = Params->GetStringField(TEXT("comment"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
+
+	UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(Script->GetLatestSource());
+	if (!Src || !Src->NodeGraph) return FMonolithActionResult::Error(TEXT("Script has no editable node graph"));
+
+	UEdGraphNode* Target = nullptr;
+	for (UEdGraphNode* Node : Src->NodeGraph->Nodes)
+	{
+		if (Node && Node->NodeGuid.ToString().Equals(NodeGuidStr, ESearchCase::IgnoreCase))
+		{
+			Target = Node;
+			break;
+		}
+	}
+	if (!Target)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No node with guid '%s' in script graph (%d nodes). Use get_module_graph to list node guids."),
+			*NodeGuidStr, Src->NodeGraph->Nodes.Num()));
+	}
+
+	const bool bVisible = Params->HasField(TEXT("bubble_visible"))
+		? Params->GetBoolField(TEXT("bubble_visible"))
+		: !Comment.IsEmpty();
+
+	Target->Modify();
+	Target->NodeComment = Comment;
+	Target->bCommentBubbleVisible = bVisible;
+	Target->bCommentBubblePinned = bVisible;
+
+	Script->MarkPackageDirty();
+	FString PackageFilename;
+	UPackage* Pkg = Script->GetOutermost();
+	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node"), Target->GetName());
+	R->SetStringField(TEXT("comment"), Comment);
+	R->SetBoolField(TEXT("bubble_visible"), bVisible);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleCleanStackOrphans(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SystemPath = NA_GetAssetPath(Params);
+	FString EmitterFilter = Params->HasField(TEXT("emitter")) ? Params->GetStringField(TEXT("emitter")) : TEXT("");
+	const bool bDryRun = Params->HasField(TEXT("dry_run")) && Params->GetBoolField(TEXT("dry_run"));
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	struct FGraphEntry { UNiagaraGraph* Graph; FString OwnerName; };
+	TArray<FGraphEntry> Graphs;
+	if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+	{
+		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
+		{
+			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
+		}
+	}
+	for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+	{
+		FString EName = H.GetName().ToString();
+		if (!EmitterFilter.IsEmpty() && EName != EmitterFilter && H.GetId().ToString() != EmitterFilter) continue;
+		FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
+		if (!ED) continue;
+		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
+		{
+			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, EName });
+		}
+	}
+	if (Graphs.Num() == 0) return FMonolithActionResult::Error(TEXT("No graphs found"));
+
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+	auto IsMapPin = [&MapDef](const UEdGraphPin* P) { return UEdGraphSchema_Niagara::PinToTypeDefinition(P) == MapDef; };
+
+	TArray<TSharedPtr<FJsonValue>> Removed;
+
+	if (!bDryRun) GEditor->BeginTransaction(NSLOCTEXT("Monolith", "CleanOrphans", "Clean Stack Orphans"));
+	if (!bDryRun) System->Modify();
+
+	for (const FGraphEntry& GE : Graphs)
+	{
+		// Iterate until stable: removing one orphan can orphan its feeders.
+		bool bRemovedAny = true;
+		int32 Passes = 0;
+		while (bRemovedAny && Passes++ < 16)
+		{
+			bRemovedAny = false;
+			TArray<UEdGraphNode*> ToRemove;
+			for (UEdGraphNode* Node : GE.Graph->Nodes)
+			{
+				if (!Node) continue;
+				if (Cast<UNiagaraNodeInput>(Node) || Cast<UNiagaraNodeOutput>(Node)) continue;
+
+				bool bAnyLink = false;
+				for (UEdGraphPin* P : Node->Pins)
+				{
+					if (P->LinkedTo.Num() > 0) { bAnyLink = true; break; }
+				}
+
+				bool bDanglingFeeder = false;
+				if (bAnyLink && Node->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapGet")))
+				{
+					bDanglingFeeder = true;
+					for (UEdGraphPin* P : Node->Pins)
+					{
+						if (P->Direction == EGPD_Output && P->LinkedTo.Num() > 0) { bDanglingFeeder = false; break; }
+					}
+				}
+
+				if (!bAnyLink || bDanglingFeeder)
+				{
+					TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+					O->SetStringField(TEXT("graph"), GE.OwnerName);
+					O->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+					O->SetStringField(TEXT("node"), Node->GetName());
+					O->SetStringField(TEXT("kind"), bAnyLink ? TEXT("dangling_feeder") : TEXT("disconnected"));
+					Removed.Add(MakeShared<FJsonValueObject>(O));
+					ToRemove.Add(Node);
+				}
+			}
+
+			if (!bDryRun)
+			{
+				for (UEdGraphNode* Node : ToRemove)
+				{
+					Node->Modify();
+					Node->BreakAllNodeLinks();
+					GE.Graph->RemoveNode(Node);
+					bRemovedAny = true;
+				}
+			}
+		}
+	}
+
+	if (!bDryRun)
+	{
+		GEditor->EndTransaction();
+		if (Removed.Num() > 0) System->RequestCompile(false);
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("asset_path"), SystemPath);
+	R->SetBoolField(TEXT("dry_run"), bDryRun);
+	R->SetNumberField(TEXT("removed_count"), Removed.Num());
+	R->SetArrayField(TEXT("removed"), Removed);
 	return NA_SuccessObj(R);
 }
 
