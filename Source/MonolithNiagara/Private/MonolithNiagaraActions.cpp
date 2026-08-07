@@ -2757,6 +2757,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("inputs"), TEXT("array"), TEXT("Array of {name, type} objects for input parameters"))
 			.Optional(TEXT("outputs"), TEXT("array"), TEXT("Array of {name, type} objects. Bare name → module-local 'Output.<name>'. Namespaced name (System.X, Emitter.X, Particles.X, StackContext.X, Transient.X) → writes that context directly; the HLSL body uses the bare last segment."))
 			.Optional(TEXT("stages"), TEXT("array"), TEXT("Stack stages this module may live in (sets ModuleUsageBitmask): particle_spawn, particle_update, particle_event, particle_simulation_stage, emitter_spawn, emitter_update, system_spawn, system_update. Default: particle stages only."))
+			.Optional(TEXT("default_mode"), TEXT("string"), TEXT("Default mode for the parameters this module declares: value (DEFAULT — module works standalone) | binding | custom | fail_if_previously_not_set. Without this the engine would leave outputs on fail_if_previously_not_set, which hard-fails compilation when nothing upstream initialized them."))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Optional description for the module"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("create_function_from_hlsl"), TEXT("Create a Niagara function script from custom HLSL"),
@@ -6563,6 +6564,49 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		{
 			Pair.Value->NodePosX = InputNode->NodePosX;
 			Pair.Value->NodePosY = 150 * TypedInputIndex++;
+		}
+	}
+
+	// Default mode for the parameters this module declares.
+	//
+	// Left alone, the engine hands OUTPUT parameters (Emitter.X / Particles.X / Output.X)
+	// ENiagaraDefaultMode::FailIfPreviouslyNotSet, which hard-fails compilation whenever
+	// nothing earlier in the stack initialized them — a module that cannot stand on its own.
+	// Author policy: Value unless the caller asks otherwise (Binding/Custom are then set per
+	// parameter with set_script_parameter_meta).
+	{
+		ENiagaraDefaultMode DesiredMode = ENiagaraDefaultMode::Value;
+		if (Params->HasField(TEXT("default_mode")))
+		{
+			const FString ModeStr = Params->GetStringField(TEXT("default_mode")).ToLower().Replace(TEXT("_"), TEXT(""));
+			if (ModeStr == TEXT("binding")) DesiredMode = ENiagaraDefaultMode::Binding;
+			else if (ModeStr == TEXT("custom")) DesiredMode = ENiagaraDefaultMode::Custom;
+			else if (ModeStr == TEXT("failifpreviouslynotset") || ModeStr == TEXT("fail")) DesiredMode = ENiagaraDefaultMode::FailIfPreviouslyNotSet;
+			else if (ModeStr != TEXT("value"))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Unknown default_mode '%s' (value | binding | custom | fail_if_previously_not_set)"),
+					*Params->GetStringField(TEXT("default_mode"))));
+			}
+		}
+
+		TArray<FName> DeclaredNames;
+		for (const FPinDef& In : ParsedInputs)
+		{
+			DeclaredNames.Add(FName(*FString::Printf(TEXT("Module.%s"), *In.Name)));
+		}
+		for (const FPinDef& Out : ParsedOutputs)
+		{
+			DeclaredNames.Add(Out.WritePinName.IsEmpty()
+				? FName(*FString::Printf(TEXT("Output.%s"), *Out.Name))
+				: FName(*Out.WritePinName));
+		}
+		for (const FName& VarName : DeclaredNames)
+		{
+			if (UNiagaraScriptVariable* SV = Graph->GetScriptVariable(VarName))
+			{
+				SV->DefaultMode = DesiredMode;
+			}
 		}
 	}
 
