@@ -229,6 +229,14 @@ public:
 	static FMonolithActionResult HandleListGraphNodePins(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddMapParameterPin(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Script parameter metadata / default mode / hierarchy ---
+	static FMonolithActionResult HandleGetScriptParameters(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetScriptParameterMeta(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetScriptParameterHierarchy(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddScriptHierarchySection(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddScriptHierarchyCategory(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAssignScriptParameterToCategory(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 

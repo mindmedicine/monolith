@@ -52,6 +52,9 @@
 #include "NiagaraParameterMapHistory.h"
 #include "NiagaraSystemEditorData.h"
 #include "NiagaraScriptVariable.h"
+#include "NiagaraVariableMetaData.h"
+#include "DataHierarchyViewModelBase.h"
+#include "ViewModels/HierarchyEditor/NiagaraScriptParametersHierarchyViewModel.h"
 #include "NiagaraEditorUtilities.h"
 #include "NiagaraShared.h"
 // NiagaraEffectType.h — needed for UNiagaraEffectType (SetEffectType, GetEffectType)
@@ -2902,6 +2905,57 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Full parameter name, e.g. 'Module.MyInput', 'Emitter.MyOutput', 'Engine.DeltaTime'"))
 			.Required(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, ...)"))
+			.Build());
+
+	// --- Script parameter metadata / default mode / hierarchy ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_script_parameters"), TEXT("Read a script's parameters with their DEFAULT MODE (value | binding | custom | fail_if_previously_not_set), default binding, and UI metadata (description/tooltip, advanced flag, edit/visible conditions, slider min/max). This is how you see whether an input will fail when nothing upstream initialized it."),
+		FMonolithActionHandler::CreateStatic(&HandleGetScriptParameters),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Optional(TEXT("parameter"), TEXT("string"), TEXT("Only this parameter (e.g. 'Module.MyInput')"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_script_parameter_meta"), TEXT("Set a script parameter's default mode / default binding and UI metadata. default_mode='binding' with default_binding='Engine.DeltaTime' makes an input self-initialize instead of failing; 'fail_if_previously_not_set' deliberately hard-fails compilation when nothing upstream set it."),
+		FMonolithActionHandler::CreateStatic(&HandleSetScriptParameterMeta),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.MyInput')"))
+			.Optional(TEXT("default_mode"), TEXT("string"), TEXT("value | binding | custom | fail_if_previously_not_set"))
+			.Optional(TEXT("default_binding"), TEXT("string"), TEXT("Parameter to read when default_mode=binding (e.g. 'Engine.DeltaTime')"))
+			.Optional(TEXT("description"), TEXT("string"), TEXT("Tooltip shown in the stack"))
+			.Optional(TEXT("advanced_display"), TEXT("bool"), TEXT("Hide behind the stack's Advanced expander"))
+			.Optional(TEXT("inline_edit_condition_toggle"), TEXT("bool"), TEXT("Render this bool as an inline toggle on the input it gates"))
+			.Optional(TEXT("edit_condition_input"), TEXT("string"), TEXT("Input name that must match edit_condition_values for this input to be editable"))
+			.Optional(TEXT("edit_condition_values"), TEXT("array"), TEXT("Values of edit_condition_input that enable this input (default: ['true'])"))
+			.Optional(TEXT("visible_condition_input"), TEXT("string"), TEXT("Input name controlling visibility of this input"))
+			.Optional(TEXT("visible_condition_values"), TEXT("array"), TEXT("Values of visible_condition_input that show this input (default: ['true'])"))
+			.Optional(TEXT("min_value"), TEXT("number"), TEXT("Slider/clamp minimum"))
+			.Optional(TEXT("max_value"), TEXT("number"), TEXT("Slider/clamp maximum"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_script_parameter_hierarchy"), TEXT("Read a module's Parameter Hierarchy (sections, categories and the parameters assigned to them) — the grouping that replaced the deprecated CategoryName/EditorSortPriority metadata in UE5."),
+		FMonolithActionHandler::CreateStatic(&HandleGetScriptParameterHierarchy),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_script_hierarchy_section"), TEXT("Add a top-level section (tab) to a module's Parameter Hierarchy"),
+		FMonolithActionHandler::CreateStatic(&HandleAddScriptHierarchySection),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("section"), TEXT("string"), TEXT("Section name"))
+			.Optional(TEXT("tooltip"), TEXT("string"), TEXT("Section tooltip"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_script_hierarchy_category"), TEXT("Add a category to a module's Parameter Hierarchy (optionally nested under an existing category)"),
+		FMonolithActionHandler::CreateStatic(&HandleAddScriptHierarchyCategory),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("category"), TEXT("string"), TEXT("Category name"))
+			.Optional(TEXT("parent_category"), TEXT("string"), TEXT("Nest under this existing category instead of the root"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("assign_script_parameter_to_category"), TEXT("Place a script parameter inside a Parameter Hierarchy category, so it appears grouped in the module's stack UI"),
+		FMonolithActionHandler::CreateStatic(&HandleAssignScriptParameterToCategory),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.MyInput')"))
+			.Required(TEXT("category"), TEXT("string"), TEXT("Existing category name"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("clean_stack_orphans"), TEXT("Delete orphaned nodes from a system's stage graphs: fully disconnected nodes and dangling feeder MapGets (no consumed outputs). Leftover junk from module removal/rebinding makes later engine stack surgery unpredictable — run this before add/remove on churned systems. Use audit_stack_wiring first to inspect; dry_run previews."),
@@ -18033,6 +18087,437 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	R->SetStringField(TEXT("type"), TypeDef.GetName());
 	return NA_SuccessObj(R);
 #endif
+}
+
+// ============================================================================
+// Script parameter metadata / default mode / hierarchy
+//
+// ENiagaraDefaultMode decides what happens when nothing upstream in the stack has
+// written an input: Value (use the literal), Binding (auto-read another parameter),
+// Custom (default sub-graph), FailIfPreviouslyNotSet (hard compile error). Grouping in
+// the module UI moved off FNiagaraVariableMetaData::CategoryName/EditorSortPriority
+// (deprecated in UE5) onto the UHierarchyRoot data model hanging off UNiagaraGraph.
+// ============================================================================
+
+namespace MonolithNiagaraParamMeta
+{
+	static bool ParseDefaultMode(const FString& In, ENiagaraDefaultMode& Out)
+	{
+		const FString S = In.ToLower().Replace(TEXT(" "), TEXT("")).Replace(TEXT("_"), TEXT(""));
+		if (S == TEXT("value"))                   { Out = ENiagaraDefaultMode::Value; return true; }
+		if (S == TEXT("binding"))                 { Out = ENiagaraDefaultMode::Binding; return true; }
+		if (S == TEXT("custom"))                  { Out = ENiagaraDefaultMode::Custom; return true; }
+		if (S == TEXT("failifpreviouslynotset") || S == TEXT("fail")) { Out = ENiagaraDefaultMode::FailIfPreviouslyNotSet; return true; }
+		return false;
+	}
+
+	static const TCHAR* DefaultModeToString(ENiagaraDefaultMode Mode)
+	{
+		switch (Mode)
+		{
+		case ENiagaraDefaultMode::Value:   return TEXT("value");
+		case ENiagaraDefaultMode::Binding: return TEXT("binding");
+		case ENiagaraDefaultMode::Custom:  return TEXT("custom");
+		case ENiagaraDefaultMode::FailIfPreviouslyNotSet: return TEXT("fail_if_previously_not_set");
+		default: return TEXT("unknown");
+		}
+	}
+
+	static TSharedRef<FJsonObject> DescribeCondition(const FNiagaraInputConditionMetadata& Cond)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("input"), Cond.InputName.ToString());
+		TArray<TSharedPtr<FJsonValue>> Vals;
+		for (const FString& V : Cond.TargetValues) Vals.Add(MakeShared<FJsonValueString>(V));
+		O->SetArrayField(TEXT("values"), Vals);
+		return O;
+	}
+
+	// Resolve a script's graph, and optionally locate one script variable by name.
+	static UNiagaraGraph* ResolveGraph(const TSharedPtr<FJsonObject>& Params, UNiagaraScript*& OutScript, FString& OutPath, FString& OutError)
+	{
+		OutPath = Params->HasField(TEXT("script_path")) ? Params->GetStringField(TEXT("script_path")) : NA_GetAssetPath(Params);
+		if (OutPath.IsEmpty()) { OutError = TEXT("Missing required param: script_path"); return nullptr; }
+		OutScript = LoadObject<UNiagaraScript>(nullptr, *OutPath);
+		if (!OutScript) { OutError = FString::Printf(TEXT("Failed to load script '%s'"), *OutPath); return nullptr; }
+		UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(OutScript->GetLatestSource());
+		if (!Src || !Src->NodeGraph) { OutError = TEXT("Script has no editable node graph"); return nullptr; }
+		return Src->NodeGraph;
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptParameters(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString Filter = Params->HasField(TEXT("parameter")) ? Params->GetStringField(TEXT("parameter")) : FString();
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& Pair : Graph->GetAllMetaData())
+	{
+		UNiagaraScriptVariable* SV = Pair.Value;
+		if (!SV) continue;
+		const FString Name = Pair.Key.GetName().ToString();
+		if (!Filter.IsEmpty() && !Name.Equals(Filter, ESearchCase::IgnoreCase)) continue;
+
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("name"), Name);
+		O->SetStringField(TEXT("type"), Pair.Key.GetType().GetName());
+		O->SetStringField(TEXT("default_mode"), DefaultModeToString(SV->DefaultMode));
+		O->SetStringField(TEXT("default_binding"), SV->DefaultBinding.GetName().ToString());
+		O->SetStringField(TEXT("description"), SV->Metadata.Description.ToString());
+		O->SetBoolField(TEXT("advanced_display"), SV->Metadata.bAdvancedDisplay);
+		O->SetBoolField(TEXT("inline_edit_condition_toggle"), SV->Metadata.bInlineEditConditionToggle);
+		O->SetObjectField(TEXT("edit_condition"), DescribeCondition(SV->Metadata.EditCondition));
+		O->SetObjectField(TEXT("visible_condition"), DescribeCondition(SV->Metadata.VisibleCondition));
+		O->SetStringField(TEXT("variable_guid"), SV->Metadata.GetVariableGuid().ToString());
+
+		TSharedRef<FJsonObject> W = MakeShared<FJsonObject>();
+		W->SetBoolField(TEXT("has_min"), SV->Metadata.WidgetCustomization.bHasMinValue);
+		W->SetNumberField(TEXT("min"), SV->Metadata.WidgetCustomization.MinValue);
+		W->SetBoolField(TEXT("has_max"), SV->Metadata.WidgetCustomization.bHasMaxValue);
+		W->SetNumberField(TEXT("max"), SV->Metadata.WidgetCustomization.MaxValue);
+		O->SetObjectField(TEXT("widget"), W);
+
+		Arr.Add(MakeShared<FJsonValueObject>(O));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetNumberField(TEXT("count"), Arr.Num());
+	R->SetArrayField(TEXT("parameters"), Arr);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptParameterMeta(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString ParamName = Params->GetStringField(TEXT("parameter"));
+	UNiagaraScriptVariable* SV = Graph->GetScriptVariable(FName(*ParamName));
+	if (!SV)
+	{
+		TArray<FString> Known;
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+		{
+			Known.Add(P.Key.GetName().ToString());
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No script parameter '%s'. Known: %s"), *ParamName, *FString::Join(Known, TEXT(", "))));
+	}
+
+	TArray<FString> Applied;
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetParamMeta", "Set Niagara Parameter Metadata"));
+	Graph->Modify();
+	SV->Modify();
+
+	if (Params->HasField(TEXT("default_mode")))
+	{
+		ENiagaraDefaultMode Mode;
+		if (!ParseDefaultMode(Params->GetStringField(TEXT("default_mode")), Mode))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("default_mode must be one of: value, binding, custom, fail_if_previously_not_set"));
+		}
+		SV->DefaultMode = Mode;
+		Applied.Add(FString::Printf(TEXT("default_mode=%s"), DefaultModeToString(Mode)));
+	}
+	if (Params->HasField(TEXT("default_binding")))
+	{
+		SV->DefaultBinding.SetName(FName(*Params->GetStringField(TEXT("default_binding"))));
+		Applied.Add(TEXT("default_binding"));
+	}
+	if (Params->HasField(TEXT("description")))
+	{
+		SV->Metadata.Description = FText::FromString(Params->GetStringField(TEXT("description")));
+		Applied.Add(TEXT("description"));
+	}
+	if (Params->HasField(TEXT("advanced_display")))
+	{
+		SV->Metadata.bAdvancedDisplay = Params->GetBoolField(TEXT("advanced_display"));
+		Applied.Add(TEXT("advanced_display"));
+	}
+	if (Params->HasField(TEXT("inline_edit_condition_toggle")))
+	{
+		SV->Metadata.bInlineEditConditionToggle = Params->GetBoolField(TEXT("inline_edit_condition_toggle"));
+		Applied.Add(TEXT("inline_edit_condition_toggle"));
+	}
+
+	auto ApplyCondition = [&Params](const TCHAR* InputField, const TCHAR* ValuesField, FNiagaraInputConditionMetadata& Cond) -> bool
+	{
+		if (!Params->HasField(InputField)) return false;
+		Cond.InputName = FName(*Params->GetStringField(InputField));
+		Cond.TargetValues.Reset();
+		const TArray<TSharedPtr<FJsonValue>>* Vals;
+		if (Params->TryGetArrayField(ValuesField, Vals))
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Vals) Cond.TargetValues.Add(V->AsString());
+		}
+		if (Cond.TargetValues.Num() == 0) Cond.TargetValues.Add(TEXT("true"));
+		return true;
+	};
+	if (ApplyCondition(TEXT("edit_condition_input"), TEXT("edit_condition_values"), SV->Metadata.EditCondition)) Applied.Add(TEXT("edit_condition"));
+	if (ApplyCondition(TEXT("visible_condition_input"), TEXT("visible_condition_values"), SV->Metadata.VisibleCondition)) Applied.Add(TEXT("visible_condition"));
+
+	if (Params->HasField(TEXT("min_value")))
+	{
+		SV->Metadata.WidgetCustomization.bHasMinValue = true;
+		SV->Metadata.WidgetCustomization.MinValue = static_cast<float>(Params->GetNumberField(TEXT("min_value")));
+		Applied.Add(TEXT("min_value"));
+	}
+	if (Params->HasField(TEXT("max_value")))
+	{
+		SV->Metadata.WidgetCustomization.bHasMaxValue = true;
+		SV->Metadata.WidgetCustomization.MaxValue = static_cast<float>(Params->GetNumberField(TEXT("max_value")));
+		Applied.Add(TEXT("max_value"));
+	}
+
+	GEditor->EndTransaction();
+
+	if (Applied.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No fields provided. Pass at least one of: default_mode, default_binding, description, advanced_display, inline_edit_condition_toggle, edit_condition_input, visible_condition_input, min_value, max_value"));
+	}
+
+	Graph->NotifyGraphChanged();
+	MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("parameter"), ParamName);
+	R->SetStringField(TEXT("applied"), FString::Join(Applied, TEXT(", ")));
+	R->SetStringField(TEXT("default_mode"), DefaultModeToString(SV->DefaultMode));
+	R->SetStringField(TEXT("default_binding"), SV->DefaultBinding.GetName().ToString());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptParameterHierarchy(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UHierarchyRoot* Root = Graph->GetScriptParameterHierarchyRoot();
+	if (!Root) return FMonolithActionResult::Error(TEXT("Script graph has no parameter hierarchy root"));
+
+	// Guid -> parameter name, so hierarchy items resolve to readable names.
+	TMap<FGuid, FString> GuidToName;
+	for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+	{
+		if (P.Value) GuidToName.Add(P.Value->Metadata.GetVariableGuid(), P.Key.GetName().ToString());
+	}
+
+	TFunction<TSharedRef<FJsonObject>(UHierarchyElement*)> Describe = [&](UHierarchyElement* Element) -> TSharedRef<FJsonObject>
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("class"), Element->GetClass()->GetName());
+		if (UHierarchyCategory* Cat = Cast<UHierarchyCategory>(Element))
+		{
+			O->SetStringField(TEXT("kind"), TEXT("category"));
+			O->SetStringField(TEXT("name"), Cat->GetCategoryName().ToString());
+		}
+		else if (UHierarchySection* Sec = Cast<UHierarchySection>(Element))
+		{
+			O->SetStringField(TEXT("kind"), TEXT("section"));
+			O->SetStringField(TEXT("name"), Sec->GetSectionName().ToString());
+		}
+		else
+		{
+			O->SetStringField(TEXT("kind"), TEXT("parameter"));
+			const TArray<FGuid>& Guids = Element->GetPersistentIdentity().Guids;
+			FString Resolved = TEXT("<unresolved>");
+			for (const FGuid& G : Guids)
+			{
+				if (const FString* Found = GuidToName.Find(G)) { Resolved = *Found; break; }
+			}
+			O->SetStringField(TEXT("name"), Resolved);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> Kids;
+		for (const TObjectPtr<UHierarchyElement>& Child : Element->GetChildren())
+		{
+			if (Child) Kids.Add(MakeShared<FJsonValueObject>(Describe(Child)));
+		}
+		if (Kids.Num() > 0) O->SetArrayField(TEXT("children"), Kids);
+		return O;
+	};
+
+	TArray<TSharedPtr<FJsonValue>> Sections;
+	for (const TObjectPtr<UHierarchySection>& Sec : Root->GetSectionData())
+	{
+		if (!Sec) continue;
+		TSharedRef<FJsonObject> SO = MakeShared<FJsonObject>();
+		SO->SetStringField(TEXT("name"), Sec->GetSectionName().ToString());
+		SO->SetStringField(TEXT("tooltip"), Sec->GetTooltip().ToString());
+		Sections.Add(MakeShared<FJsonValueObject>(SO));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Children;
+	for (const TObjectPtr<UHierarchyElement>& Child : Root->GetChildren())
+	{
+		if (Child) Children.Add(MakeShared<FJsonValueObject>(Describe(Child)));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetNumberField(TEXT("section_count"), Sections.Num());
+	R->SetArrayField(TEXT("sections"), Sections);
+	R->SetArrayField(TEXT("root_children"), Children);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptHierarchySection(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UHierarchyRoot* Root = Graph->GetScriptParameterHierarchyRoot();
+	if (!Root) return FMonolithActionResult::Error(TEXT("Script graph has no parameter hierarchy root"));
+
+	const FString SectionName = Params->GetStringField(TEXT("section"));
+	for (const TObjectPtr<UHierarchySection>& Existing : Root->GetSectionData())
+	{
+		if (Existing && Existing->GetSectionName().ToString().Equals(SectionName, ESearchCase::IgnoreCase))
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Section '%s' already exists"), *SectionName));
+		}
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddHierarchySection", "Add Hierarchy Section"));
+	Root->Modify();
+	UHierarchySection* NewSection = NewObject<UHierarchySection>(Root, NAME_None, RF_Transactional);
+	NewSection->SetSectionName(FName(*SectionName));
+	if (Params->HasField(TEXT("tooltip")))
+	{
+		NewSection->SetTooltip(FText::FromString(Params->GetStringField(TEXT("tooltip"))));
+	}
+	Root->GetSectionDataMutable().Add(NewSection);
+	GEditor->EndTransaction();
+
+	Graph->NotifyGraphChanged();
+	MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("section"), SectionName);
+	R->SetNumberField(TEXT("section_count"), Root->GetSectionData().Num());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptHierarchyCategory(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UHierarchyRoot* Root = Graph->GetScriptParameterHierarchyRoot();
+	if (!Root) return FMonolithActionResult::Error(TEXT("Script graph has no parameter hierarchy root"));
+
+	const FString CategoryName = Params->GetStringField(TEXT("category"));
+	const FString ParentName = Params->HasField(TEXT("parent_category")) ? Params->GetStringField(TEXT("parent_category")) : FString();
+
+	// Locate the parent (root, or a named existing category anywhere in the tree)
+	UHierarchyElement* Parent = Root;
+	if (!ParentName.IsEmpty())
+	{
+		TArray<UHierarchyCategory*> AllCats;
+		Root->GetChildrenOfType<UHierarchyCategory>(AllCats, /*bRecursive=*/true);
+		UHierarchyCategory* Found = nullptr;
+		for (UHierarchyCategory* C : AllCats)
+		{
+			if (C && C->GetCategoryName().ToString().Equals(ParentName, ESearchCase::IgnoreCase)) { Found = C; break; }
+		}
+		if (!Found) return FMonolithActionResult::Error(FString::Printf(TEXT("parent_category '%s' not found"), *ParentName));
+		Parent = Found;
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddHierarchyCategory", "Add Hierarchy Category"));
+	Root->Modify();
+	UHierarchyCategory* NewCat = Parent->AddChild<UHierarchyCategory>();
+	NewCat->SetCategoryName(FName(*CategoryName));
+	NewCat->SetIdentity(UHierarchyCategory::ConstructIdentity());
+	GEditor->EndTransaction();
+
+	Graph->NotifyGraphChanged();
+	MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("category"), CategoryName);
+	R->SetStringField(TEXT("parent"), ParentName.IsEmpty() ? TEXT("<root>") : ParentName);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleAssignScriptParameterToCategory(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	UHierarchyRoot* Root = Graph->GetScriptParameterHierarchyRoot();
+	if (!Root) return FMonolithActionResult::Error(TEXT("Script graph has no parameter hierarchy root"));
+
+	const FString ParamName = Params->GetStringField(TEXT("parameter"));
+	const FString CategoryName = Params->GetStringField(TEXT("category"));
+
+	UNiagaraScriptVariable* SV = Graph->GetScriptVariable(FName(*ParamName));
+	if (!SV) return FMonolithActionResult::Error(FString::Printf(TEXT("No script parameter '%s'"), *ParamName));
+
+	const FGuid VarGuid = SV->Metadata.GetVariableGuid();
+	if (!VarGuid.IsValid())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parameter '%s' has no stable variable guid; the hierarchy entry would be dropped on refresh."), *ParamName));
+	}
+
+	TArray<UHierarchyCategory*> AllCats;
+	Root->GetChildrenOfType<UHierarchyCategory>(AllCats, /*bRecursive=*/true);
+	UHierarchyCategory* Category = nullptr;
+	for (UHierarchyCategory* C : AllCats)
+	{
+		if (C && C->GetCategoryName().ToString().Equals(CategoryName, ESearchCase::IgnoreCase)) { Category = C; break; }
+	}
+	if (!Category)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Category '%s' not found — create it first with add_script_hierarchy_category"), *CategoryName));
+	}
+
+	// Identity is what binds a hierarchy entry to its parameter. Mirrors
+	// UNiagaraHierarchyScriptParameter::Initialize, which is not DLL-exported.
+	const FHierarchyElementIdentity Identity({ VarGuid }, {});
+	if (Root->FindChildWithIdentity(Identity, /*bSearchRecursively=*/true))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parameter '%s' is already placed in the hierarchy; remove it there first."), *ParamName));
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AssignParamToCategory", "Assign Parameter To Category"));
+	Root->Modify();
+	UNiagaraHierarchyScriptParameter* Item = Category->AddChild<UNiagaraHierarchyScriptParameter>();
+	Item->SetIdentity(Identity);
+	GEditor->EndTransaction();
+
+	Graph->NotifyGraphChanged();
+	MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("parameter"), ParamName);
+	R->SetStringField(TEXT("category"), CategoryName);
+	R->SetStringField(TEXT("variable_guid"), VarGuid.ToString());
+	return NA_SuccessObj(R);
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleCleanStackOrphans(const TSharedPtr<FJsonObject>& Params)

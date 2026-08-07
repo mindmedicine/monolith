@@ -26,7 +26,10 @@ public class MonolithNiagara : ModuleRules
 			"JsonUtilities",
 			"AssetTools",
 			"Slate",
-			"SlateCore"
+			"SlateCore",
+			// Parameter-hierarchy data model (UHierarchyRoot/Section/Category/Item) that backs
+			// the Niagara module editor's Parameter Hierarchy panel.
+			"DataHierarchyEditor"
 		});
 
 		// WITH_NIAGARA_WIZARD_PRIVATE — gates the create_module_from_hlsl ParameterMap bridge,
