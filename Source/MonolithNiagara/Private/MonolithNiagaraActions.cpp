@@ -6363,10 +6363,28 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	}
 
 	// Lay out nodes left-to-right in dataflow order (InputMap → MapGet → CustomHlsl → MapSet → Output)
-	// instead of leaving everything stacked at (0,0). ~400uu horizontal spacing.
-	InputNode->NodePosX = -1150; InputNode->NodePosY = 0;
-	HlslNode->NodePosX = -350;   HlslNode->NodePosY = 0;
-	OutputNode->NodePosX = 400;  OutputNode->NodePosY = 0;
+	// instead of leaving everything stacked at (0,0).
+	//
+	// Spacing can't be uniform: a CustomHlsl node renders its whole body, so its width is
+	// driven by the longest source line and dwarfs the fixed-width Map nodes. Estimate that
+	// width from the body text (~9uu per char at default zoom) so downstream nodes clear it
+	// instead of abutting it.
+	int32 MaxLineLen = 0;
+	{
+		TArray<FString> BodyLines;
+		HlslBody.ParseIntoArrayLines(BodyLines, /*bCullEmpty=*/false);
+		for (const FString& Line : BodyLines)
+		{
+			MaxLineLen = FMath::Max(MaxLineLen, Line.Len());
+		}
+	}
+	const int32 HlslWidth = FMath::Clamp(320 + MaxLineLen * 9, 520, 1500);
+	const int32 HlslX = -600;
+
+	InputNode->NodePosX = HlslX - 800;               InputNode->NodePosY = 0;
+	HlslNode->NodePosX = HlslX;                      HlslNode->NodePosY = 0;
+	const int32 MapSetX = HlslX + HlslWidth + 160;
+	OutputNode->NodePosX = MapSetX + 480;            OutputNode->NodePosY = 0;
 
 	// Comment bubbles so generated graphs are self-describing
 	if (!Description.IsEmpty())
@@ -6376,8 +6394,10 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		HlslNode->bCommentBubblePinned = true;
 	}
 #if WITH_NIAGARA_WIZARD_PRIVATE
-	if (MapGetNode) { MapGetNode->NodePosX = -750; MapGetNode->NodePosY = 250; }
-	if (MapSetNode) { MapSetNode->NodePosX = 50;   MapSetNode->NodePosY = 0; }
+	// MapGet sits between InputMap and the HLSL node, dropped just far enough to keep its
+	// per-input wires clear of the straight ParameterMap spine.
+	if (MapGetNode) { MapGetNode->NodePosX = HlslX - 420; MapGetNode->NodePosY = 190; }
+	if (MapSetNode) { MapSetNode->NodePosX = MapSetX;     MapSetNode->NodePosY = 0; }
 	if (MapGetNode && ParsedInputs.Num() > 0)
 	{
 		TArray<FString> InputNames;
@@ -6400,7 +6420,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		int32 TypedInputIndex = 1;
 		for (const auto& Pair : TypedInputNodesByName)
 		{
-			Pair.Value->NodePosX = -1150;
+			Pair.Value->NodePosX = InputNode->NodePosX;
 			Pair.Value->NodePosY = 150 * TypedInputIndex++;
 		}
 	}
