@@ -2835,13 +2835,18 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 	// --- Script-graph authoring (Tier 1: public node classes) ---
 	// Distinct from the stack-level module actions: these edit the NODE GRAPH inside a
 	// Niagara script asset (or an embedded scratch script via "NS_X.NS_X:ScratchName").
-	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type). Returns node_guid + created pins."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type), 'custom_hlsl' (needs hlsl; optional inputs/outputs — this is how you add HLSL to an EXISTING module, e.g. a duplicated engine one). Returns node_guid + created pins."),
 		FMonolithActionHandler::CreateStatic(&HandleAddGraphNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
-			.Required(TEXT("node_type"), TEXT("string"), TEXT("Tier 1 (public classes): op | function | input. Tier 2 (engine-private, dev builds only): map_get | map_set | if | select | static_switch | reroute | convert"))
+			.Required(TEXT("node_type"), TEXT("string"), TEXT("Tier 1 (public classes): op | function | input | custom_hlsl. Tier 2 (engine-private, dev builds only): map_get | map_set | if | select | static_switch | reroute | convert"))
 			.Optional(TEXT("op_name"), TEXT("string"), TEXT("Operation name for node_type=op, e.g. 'Numeric::Add', 'Numeric::Multiply'"))
 			.Optional(TEXT("function_script"), TEXT("string"), TEXT("Function/module script asset path for node_type=function"))
+			.Optional(TEXT("hlsl"), TEXT("string"), TEXT("HLSL body for node_type=custom_hlsl. Same rules as create_module_from_hlsl: bare I/O identifiers, no '%', functions wrapped in structs. Call a data interface passed as an input pin by that pin's name, e.g. DebugDraw.DrawSphere(Execute, Center, Radius, 24, Color);"))
+			.Optional(TEXT("inputs"), TEXT("array"), TEXT("For node_type=custom_hlsl: [{name, type}] typed input pins. Names must be bare identifiers (no dots). Data interface types resolve by fuzzy class name (e.g. 'DebugDraw')."))
+			.Optional(TEXT("outputs"), TEXT("array"), TEXT("For node_type=custom_hlsl: [{name, type}] typed output pins. At least one consumed output keeps the node from being dead-stripped."))
+			.Optional(TEXT("hlsl_usage"), TEXT("string"), TEXT("For node_type=custom_hlsl: module (default) | function. Module usage adds the ParameterMap flow pins that let the node splice into a module's map chain; use function only inside function scripts."))
+			.Optional(TEXT("name"), TEXT("string"), TEXT("Display name for node_type=custom_hlsl (default 'CustomHlsl')"))
 			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
 			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
 			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum | debug_state. 'debug_state' creates the Function.DebugState switch that gives a module its debug-visualization eye icon in the stack."))
@@ -17708,6 +17713,120 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		Creator.Finalize();
 		NewNode = InNode;
 	}
+	else if (NodeType == TEXT("custom_hlsl"))
+	{
+		// Closes the gap that HLSL could be authored into a NEW module (create_module_from_hlsl)
+		// but never ADDED to an existing graph — so a duplicated engine module could not be
+		// extended with custom logic. Node construction mirrors create_module_from_hlsl's
+		// CustomHlsl section; the Signature is what drives pin creation, so it must be complete
+		// BEFORE AllocateDefaultPins runs (which is why this uses SpawnGraphNode/Finalize).
+		const FString HlslBody = Params->HasField(TEXT("hlsl")) ? Params->GetStringField(TEXT("hlsl")) : FString();
+		if (HlslBody.IsEmpty())
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("node_type=custom_hlsl requires 'hlsl' (the body text)"));
+		}
+
+		// inputs/outputs may arrive as real JSON arrays or string-serialized ones (MCP double-encodes).
+		auto GetPinArray = [&Params](const TCHAR* Field) -> TArray<TSharedPtr<FJsonValue>>
+		{
+			if (!Params->HasField(Field)) return {};
+			const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
+			if (Params->TryGetArrayField(Field, ArrPtr)) return *ArrPtr;
+			const FString Str = Params->GetStringField(Field);
+			if (Str.IsEmpty()) return {};
+			TArray<TSharedPtr<FJsonValue>> Parsed;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Str);
+			FJsonSerializer::Deserialize(Reader, Parsed);
+			return Parsed;
+		};
+
+		TArray<FNiagaraVariable> SigInputs;
+		TArray<FNiagaraVariableBase> SigOutputs;
+		FString PinError;
+		auto ParsePins = [&](const TCHAR* Field, bool bIsInput) -> bool
+		{
+			for (const TSharedPtr<FJsonValue>& Val : GetPinArray(Field))
+			{
+				TSharedPtr<FJsonObject> Obj = AsObjectOrParseString(Val);
+				if (!Obj.IsValid() || Obj->Values.Num() == 0) continue;
+				const FString PinName = Obj->GetStringField(TEXT("name"));
+				const FString TypeStr = Obj->GetStringField(TEXT("type"));
+				if (PinName.IsEmpty() || TypeStr.IsEmpty()) continue;
+				// Dots become struct member access in the generated In_/Out_ identifier.
+				if (PinName.Contains(TEXT(".")))
+				{
+					PinError = FString::Printf(
+						TEXT("Pin name '%s' contains a dot. Use a bare identifier (e.g. 'Center' not 'Module.Center') — "
+							 "the translator prefixes In_/Out_ and 'In_Module.Center' is invalid HLSL."), *PinName);
+					return false;
+				}
+				bool bFellBack = false;
+				const FNiagaraTypeDefinition TypeDef = ResolveNiagaraType(TypeStr, &bFellBack);
+				if (bFellBack)
+				{
+					PinError = FString::Printf(
+						TEXT("Unknown Niagara type '%s' for pin '%s'. Data interfaces resolve by fuzzy class name (e.g. 'DebugDraw')."),
+						*TypeStr, *PinName);
+					return false;
+				}
+				if (bIsInput) SigInputs.Add(FNiagaraVariable(TypeDef, FName(*PinName)));
+				else          SigOutputs.Add(FNiagaraVariableBase(TypeDef, FName(*PinName)));
+			}
+			return true;
+		};
+		if (!ParsePins(TEXT("inputs"), true) || !ParsePins(TEXT("outputs"), false))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(PinError);
+		}
+
+		UNiagaraNodeCustomHlsl* N = SpawnGraphNode<UNiagaraNodeCustomHlsl>(Graph);
+
+		// A node placed in a module graph must be Module usage or it gets no ParameterMap flow pins.
+		const FString UsageStr = Params->HasField(TEXT("hlsl_usage"))
+			? Params->GetStringField(TEXT("hlsl_usage")).ToLower() : TEXT("module");
+		const bool bIsModuleUsage = (UsageStr != TEXT("function"));
+		N->ScriptUsage = bIsModuleUsage ? ENiagaraScriptUsage::Module : ENiagaraScriptUsage::Function;
+
+		const FString DisplayName = Params->HasField(TEXT("name")) ? Params->GetStringField(TEXT("name")) : TEXT("CustomHlsl");
+		N->Signature.Name = FName(*DisplayName);
+		N->Signature.bRequiresExecPin = false;
+
+		// CRITICAL (same invariant as create_module_from_hlsl): for module usage the ParameterMap
+		// must be the FIRST entry of both Inputs and Outputs — NOT bRequiresExecPin.
+		// BuildParameterMapHistory (NiagaraNodeCustomHlsl.cpp:478) asserts
+		// InputPins.Num() == Signature.Inputs.Num() + 1, the +1 being the dynamic Add pin. Pins
+		// created outside the Signature break that count, parameter-map registration is skipped
+		// silently, and it surfaces much later as "Incorrect number of outputs".
+		if (bIsModuleUsage)
+		{
+			N->Signature.Inputs.Add(FNiagaraVariable(FNiagaraTypeDefinition::GetParameterMapDef(), FName(TEXT(""))));
+			N->Signature.Outputs.Add(FNiagaraVariableBase(FNiagaraTypeDefinition::GetParameterMapDef(), FName(TEXT(""))));
+		}
+		N->Signature.Inputs.Append(SigInputs);
+		N->Signature.Outputs.Append(SigOutputs);
+
+		// FunctionDisplayName is protected on UNiagaraNodeFunctionCall, and CustomHlsl is a private
+		// EditAnywhere field whose accessors are not DLL-exported (LNK2019) — both go in by reflection.
+		if (FProperty* NameProp = UNiagaraNodeFunctionCall::StaticClass()->FindPropertyByName(TEXT("FunctionDisplayName")))
+		{
+			if (FStrProperty* NameStrProp = CastField<FStrProperty>(NameProp))
+			{
+				NameStrProp->SetPropertyValue(NameProp->ContainerPtrToValuePtr<void>(N), DisplayName);
+			}
+		}
+		if (FProperty* HlslProp = UNiagaraNodeCustomHlsl::StaticClass()->FindPropertyByName(TEXT("CustomHlsl")))
+		{
+			if (FStrProperty* StrProp = CastField<FStrProperty>(HlslProp))
+			{
+				StrProp->SetPropertyValue(HlslProp->ContainerPtrToValuePtr<void>(N), HlslBody);
+			}
+		}
+
+		FinalizeSpawnedNode(N);
+		NewNode = N;
+	}
 #if WITH_NIAGARA_WIZARD_PRIVATE
 	// --- Tier 2: engine-private node classes (gated; unavailable in release builds) ---
 	else if (NodeType == TEXT("map_get"))
@@ -17889,9 +18008,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		// Note: the supported-type list is built outside the Printf call — a #if inside a
 		// function-like macro's argument list is undefined behavior (MSVC C5101).
 #if WITH_NIAGARA_WIZARD_PRIVATE
-		const TCHAR* SupportedTypes = TEXT("op, function, input, map_get, map_set, if, select, static_switch, reroute, convert");
+		const TCHAR* SupportedTypes = TEXT("op, function, input, custom_hlsl, map_get, map_set, if, select, static_switch, reroute, convert");
 #else
-		const TCHAR* SupportedTypes = TEXT("op, function, input (Tier 2 node types need WITH_NIAGARA_WIZARD_PRIVATE=1; this is a release build)");
+		const TCHAR* SupportedTypes = TEXT("op, function, input, custom_hlsl (Tier 2 node types need WITH_NIAGARA_WIZARD_PRIVATE=1; this is a release build)");
 #endif
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Unknown node_type '%s'. Supported: %s"), *NodeType, SupportedTypes));
