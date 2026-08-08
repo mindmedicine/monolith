@@ -238,6 +238,7 @@ public:
 	static FMonolithActionResult HandleAddScriptHierarchySection(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddScriptHierarchyCategory(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAssignScriptParameterToCategory(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveScriptParameter(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);

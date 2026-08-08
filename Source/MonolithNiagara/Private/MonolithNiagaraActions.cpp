@@ -1823,6 +1823,348 @@ void FMonolithNiagaraActions::AddStaticSwitchEnumMetadata(TSharedRef<FJsonObject
 }
 
 // ============================================================================
+// Shared static-switch enumeration (gaps #18 + #26)
+// ----------------------------------------------------------------------------
+// ONE enumeration used by set_static_switch_value, set_module_input_value and
+// get_module_script_inputs, so the three can never disagree about what is a
+// static switch.
+//
+// UNiagaraGraph::FindStaticSwitchInputs (NIAGARAEDITOR_API, NiagaraGraph.h:284)
+// is the engine's own answer, but it deliberately SKIPS switches that are
+// "set by pin": NiagaraGraph.cpp:2192 filters on
+//     SwitchNode && !SwitchNode->IsSetByCompiler() && !SwitchNode->IsSetByPin()
+// and IsSetByPin() (NiagaraNodeStaticSwitch.cpp:473) is
+//     SwitchTypeData.bExposeAsPin && !IsSetByCompiler() && !IsDebugSwitch().
+// Those switches take their value from a *Selector* input pin
+// (NiagaraNodeStaticSwitch.cpp:536 creates it as CreatePin(EGPD_Input, ..., "Selector"))
+// which the module graph drives from a parameter-map read. That is exactly how
+// the stock /Niagara/Modules/Update/Utility/DebugDraw drives "Debug Draw Mode"
+// and "Line Mode" — hence "this module has no static switches" (gap #26a).
+//
+// So the second pass below walks the graph itself for expose-as-pin switches and
+// reports the PARAMETER FEEDING THE SELECTOR as the thing to set. Note that
+// UNiagaraNodeStaticSwitch is UCLASS(MinimalAPI) and none of its accessors carry
+// NIAGARAEDITOR_API — IsSetByPin/IsSetByCompiler/GetInputType/GetSelectorPin would
+// all fail to LINK. Only StaticClass() is exported, so Cast<> works and the
+// UPROPERTYs are read directly; the three predicates are re-derived inline from
+// SwitchTypeData (IsDebugSwitch implies a non-None SwitchConstant, so
+// "bExposeAsPin && SwitchConstant.IsNone()" is equivalent to IsSetByPin()).
+// ============================================================================
+
+namespace MonolithNiagaraHelpers
+{
+	/** One static-switch-controlled input of a module script. */
+	struct FStaticSwitchInput
+	{
+		/**
+		 * What the caller must name to set it. For a classic switch this is the switch
+		 * parameter itself; for an expose-as-pin switch it is the module parameter wired
+		 * into the Selector pin (e.g. "Module.Debug Draw Mode").
+		 */
+		FNiagaraVariable Variable;
+
+		/** UNiagaraNodeStaticSwitch::InputParameterName of the switch node itself. */
+		FName SwitchParameterName;
+
+		/** Enum for enum switches, null otherwise. */
+		UEnum* Enum = nullptr;
+
+		/** True when the switch takes its value from a Selector pin rather than a switch pin. */
+		bool bSelectorExposedAsPin = false;
+	};
+
+	void CollectStaticSwitchInputs(UNiagaraGraph* Graph, TArray<FStaticSwitchInput>& Out)
+	{
+		Out.Reset();
+		if (!Graph) return;
+
+		auto AlreadyPresent = [&Out](const FName& Name) -> bool
+		{
+			for (const FStaticSwitchInput& Existing : Out)
+			{
+				if (Existing.Variable.GetName() == Name) return true;
+			}
+			return false;
+		};
+
+		// Pass 1 — the engine's own view (classic switches + propagated ones).
+		for (const FNiagaraVariable& Var : Graph->FindStaticSwitchInputs())
+		{
+			if (AlreadyPresent(Var.GetName())) continue;
+			FStaticSwitchInput& Entry = Out.AddDefaulted_GetRef();
+			Entry.Variable = Var;
+			Entry.SwitchParameterName = Var.GetName();
+			Entry.Enum = Var.GetType().GetEnum();
+			Entry.bSelectorExposedAsPin = false;
+		}
+
+#if WITH_NIAGARA_WIZARD_PRIVATE
+		// Pass 2 — expose-as-pin switches, which pass 1 filtered out.
+		const UEdGraphSchema_Niagara* Schema = GetDefault<UEdGraphSchema_Niagara>();
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			UNiagaraNodeStaticSwitch* SwitchNode = Cast<UNiagaraNodeStaticSwitch>(Node);
+			if (!SwitchNode) continue;
+
+			const bool bSetByCompiler = !SwitchNode->SwitchTypeData.SwitchConstant.IsNone();
+			const bool bSetByPin = SwitchNode->SwitchTypeData.bExposeAsPin && !bSetByCompiler;
+			if (!bSetByPin) continue;
+
+			// Mirror of UNiagaraNodeStaticSwitch::GetInputType (NiagaraNodeStaticSwitch.cpp:44).
+			FNiagaraTypeDefinition SwitchType;
+			UEnum* SwitchEnum = nullptr;
+			if (SwitchNode->SwitchTypeData.SwitchType == ENiagaraStaticSwitchType::Bool)
+			{
+				SwitchType = FNiagaraTypeDefinition::GetBoolDef();
+			}
+			else if (SwitchNode->SwitchTypeData.SwitchType == ENiagaraStaticSwitchType::Integer)
+			{
+				SwitchType = FNiagaraTypeDefinition::GetIntDef();
+			}
+			else if (SwitchNode->SwitchTypeData.SwitchType == ENiagaraStaticSwitchType::Enum && SwitchNode->SwitchTypeData.Enum)
+			{
+				SwitchEnum = SwitchNode->SwitchTypeData.Enum;
+				SwitchType = FNiagaraTypeDefinition(SwitchEnum);
+			}
+
+			// Find the Selector pin by the literal name the engine creates it with, rather than
+			// GetSelectorPin()/SelectorGuid (not exported / not in the public header).
+			UEdGraphPin* SelectorPin = nullptr;
+			for (UEdGraphPin* Pin : SwitchNode->Pins)
+			{
+				if (Pin && Pin->Direction == EGPD_Input && Pin->PinName == TEXT("Selector"))
+				{
+					SelectorPin = Pin;
+					break;
+				}
+			}
+
+			// Trace back to whatever drives the selector. For a module that is a
+			// ParameterMapGet output pin, whose PinName IS the parameter name
+			// (e.g. "Module.Debug Draw Mode"). Reroutes are hopped through.
+			FName DrivingName = SwitchNode->InputParameterName;
+			FNiagaraTypeDefinition DrivingType = SwitchType;
+			UEdGraphPin* SourcePin = (SelectorPin && SelectorPin->LinkedTo.Num() > 0) ? SelectorPin->LinkedTo[0] : nullptr;
+			for (int32 HopGuard = 0; SourcePin && HopGuard < 16; ++HopGuard)
+			{
+				UNiagaraNodeReroute* Reroute = Cast<UNiagaraNodeReroute>(SourcePin->GetOwningNodeUnchecked());
+				if (!Reroute) break;
+				UEdGraphPin* RerouteInput = nullptr;
+				for (UEdGraphPin* Pin : Reroute->Pins)
+				{
+					if (Pin && Pin->Direction == EGPD_Input) { RerouteInput = Pin; break; }
+				}
+				SourcePin = (RerouteInput && RerouteInput->LinkedTo.Num() > 0) ? RerouteInput->LinkedTo[0] : nullptr;
+			}
+			if (SourcePin && !SourcePin->PinName.IsNone())
+			{
+				DrivingName = SourcePin->PinName;
+				if (Schema)
+				{
+					const FNiagaraTypeDefinition SourceType = Schema->PinToTypeDefinition(SourcePin);
+					if (SourceType.IsValid()) DrivingType = SourceType;
+				}
+			}
+
+			if (DrivingName.IsNone() || AlreadyPresent(DrivingName)) continue;
+
+			FStaticSwitchInput& Entry = Out.AddDefaulted_GetRef();
+			Entry.Variable = FNiagaraVariable(DrivingType, DrivingName);
+			Entry.SwitchParameterName = SwitchNode->InputParameterName;
+			Entry.Enum = SwitchEnum ? SwitchEnum : DrivingType.GetEnum();
+			Entry.bSelectorExposedAsPin = true;
+		}
+#endif // WITH_NIAGARA_WIZARD_PRIVATE
+	}
+
+	const FStaticSwitchInput* FindStaticSwitchInput(const TArray<FStaticSwitchInput>& Switches, const FString& RequestedName)
+	{
+		if (RequestedName.IsEmpty()) return nullptr;
+
+		auto Normalize = [](const FString& In) -> FString
+		{
+			FString Out = In;
+			if (Out.StartsWith(TEXT("Module."))) Out = Out.Mid(7);
+			Out.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+			return Out;
+		};
+
+		const FString Wanted = Normalize(RequestedName);
+		for (const FStaticSwitchInput& Candidate : Switches)
+		{
+			if (Normalize(Candidate.Variable.GetName().ToString()).Equals(Wanted, ESearchCase::IgnoreCase)) return &Candidate;
+			if (Normalize(Candidate.SwitchParameterName.ToString()).Equals(Wanted, ESearchCase::IgnoreCase)) return &Candidate;
+		}
+		return nullptr;
+	}
+
+	FString DescribeStaticSwitchInputs(const TArray<FStaticSwitchInput>& Switches)
+	{
+		TArray<FString> Names;
+		for (const FStaticSwitchInput& Candidate : Switches)
+		{
+			Names.Add(StripModulePrefix(Candidate.Variable.GetName()).ToString());
+		}
+		return FString::Join(Names, TEXT(", "));
+	}
+
+	// ========================================================================
+	// Gap #27 — bool / integer static switch value validation
+	// ------------------------------------------------------------------------
+	// The ENUM path already refused bad values (ResolveStaticSwitchEnumValue). Bool
+	// and integer switches accepted ANY string and silently behaved as false / 0 —
+	// the same silent-success class as gap #26b. Both engine paths are lenient by
+	// construction:
+	//
+	//   * BOOL. FNiagaraEditorBoolTypeUtilities::SetValueFromPinDefaultString
+	//     (NiagaraBoolTypeEditorUtilities.cpp:80) forwards to LexTryParseString(bool&),
+	//     which UnrealString.h.inl:2244 literally comments as "Try and parse a bool -
+	//     always returns true". It cannot fail. It funnels into
+	//     FToBoolHelper::FromCStringWide (CString.cpp:123), whose keyword set is
+	//     True/Yes/On -> true, False/No/Off -> false (all Stricmp, plus the localized
+	//     CoreTexts spellings) with a final `return Atoi(String) ? true : false;`
+	//     fallback — which is why "banana" compiled clean as false.
+	//
+	//   * INTEGER. UNiagaraNodeStaticSwitch::GetVarIndex (NiagaraNodeStaticSwitch.cpp:664)
+	//     takes `MaxValue = NumOptionsPerVariable - 1` and then
+	//     `FMath::Clamp(Value, 0, MaxValue)`, emitting only a translator Warning for an
+	//     out-of-range case index. Clamping to a valid-but-wrong branch is exactly the
+	//     failure mode worth erroring on.
+	//
+	// What we WRITE back is the canonical pin encoding the engine itself produces:
+	// FNiagaraEditorBoolTypeUtilities::GetPinDefaultStringFromValue
+	// (NiagaraBoolTypeEditorUtilities.cpp:74) is LexToString(bool), i.e. lowercase
+	// "true"/"false" (UnrealString.h:173-179) — the same form set_module_input_value
+	// writes (MonolithNiagaraActions.cpp, JSON-bool branch). Integers go back as a bare
+	// decimal, matching FNiagaraEditorIntegerTypeUtilities::GetPinDefaultStringFromValue
+	// (NiagaraIntegerTypeEditorUtilities.cpp:243).
+	// ========================================================================
+
+	/** Strict numeric literal: optional sign, at most one dot, at least one digit. */
+	bool TryParseStaticSwitchNumericLiteral(const FString& Value, double& OutNumber)
+	{
+		// TCString::IsNumeric (CString.h) allows a bare "-", "+" or "." through, so the
+		// digit check below is not redundant.
+		if (!Value.IsNumeric()) return false;
+
+		bool bHasDigit = false;
+		for (const TCHAR Char : Value)
+		{
+			if (FChar::IsDigit(Char)) { bHasDigit = true; break; }
+		}
+		if (!bHasDigit) return false;
+
+		OutNumber = FCString::Atod(*Value);
+		return true;
+	}
+
+	/** The spellings a bool switch accepts, phrased for an error message. */
+	const TCHAR* DescribeStaticSwitchBoolOptions()
+	{
+		return TEXT("true (true, yes, on, 1), false (false, no, off, 0)");
+	}
+
+	/**
+	 * Accepts exactly what FToBoolHelper::FromCStringWide recognises unambiguously —
+	 * the true/false keyword pairs plus a numeric literal — and normalises to the
+	 * canonical "true"/"false" pin encoding. Everything else is rejected instead of
+	 * being coerced to false.
+	 */
+	bool ResolveStaticSwitchBoolValue(const FString& RequestedValue, FString& OutRawValue)
+	{
+		const FString Trimmed = RequestedValue.TrimStartAndEnd();
+		if (Trimmed.IsEmpty()) return false;
+
+		static const TCHAR* TrueSpellings[] = { TEXT("true"), TEXT("yes"), TEXT("on") };
+		static const TCHAR* FalseSpellings[] = { TEXT("false"), TEXT("no"), TEXT("off") };
+
+		for (const TCHAR* Spelling : TrueSpellings)
+		{
+			if (Trimmed.Equals(Spelling, ESearchCase::IgnoreCase)) { OutRawValue = TEXT("true"); return true; }
+		}
+		for (const TCHAR* Spelling : FalseSpellings)
+		{
+			if (Trimmed.Equals(Spelling, ESearchCase::IgnoreCase)) { OutRawValue = TEXT("false"); return true; }
+		}
+
+		// A JSON number arrives here already stringified by FString::SanitizeFloat
+		// ("1.000000"), so numeric literals must be accepted: 0 is false, anything else
+		// true, matching FromCStringWide's Atoi fallback.
+		double Number = 0.0;
+		if (TryParseStaticSwitchNumericLiteral(Trimmed, Number))
+		{
+			OutRawValue = FMath::IsNearlyZero(Number) ? TEXT("false") : TEXT("true");
+			return true;
+		}
+
+		return false;
+	}
+
+	/** Parses a switch case index. Rejects non-numeric input and fractional values. */
+	bool ResolveStaticSwitchIntValue(const FString& RequestedValue, int32& OutValue)
+	{
+		const FString Trimmed = RequestedValue.TrimStartAndEnd();
+		double Number = 0.0;
+		if (!TryParseStaticSwitchNumericLiteral(Trimmed, Number)) return false;
+
+		const double Rounded = FMath::RoundToDouble(Number);
+		if (!FMath::IsNearlyEqual(Number, Rounded)) return false;   // 1.5 is not a case index
+
+		OutValue = static_cast<int32>(Rounded);
+		return true;
+	}
+
+	/**
+	 * How many integer cases a static switch offers, or INDEX_NONE when it cannot be
+	 * determined. The bound the compiler actually applies is
+	 * UNiagaraNodeUsageSelector::NumOptionsPerVariable (NiagaraNodeUsageSelector.h:88):
+	 * GetVarIndex clamps to [0, NumOptionsPerVariable - 1].
+	 *
+	 * That member is `protected`, and UNiagaraNodeStaticSwitch is UCLASS(MinimalAPI) in a
+	 * PRIVATE header, so it is read by reflection and the node is matched by class NAME —
+	 * which keeps the bounds check working in release builds too
+	 * (WITH_NIAGARA_WIZARD_PRIVATE=0, where the type is not even declared).
+	 *
+	 * Caveat: when a switch's script variable uses ENiagaraInputWidgetType::EnumStyle, the
+	 * editor DISPLAYS EnumStyleDropdownValues.Num() cases (NiagaraNodeStaticSwitch.cpp:232)
+	 * while GetVarIndex still clamps against NumOptionsPerVariable. We bound against the
+	 * compiler's number, which is the one that decides which branch is generated.
+	 *
+	 * Same-named switch nodes share one parameter (the stock DebugDraw module has three
+	 * `Static Switch (Emitter.LocalSpace)` nodes), so the SMALLEST case count wins: a value
+	 * out of range for any one node silently clamps there, and a loud false rejection beats
+	 * a quiet wrong branch.
+	 */
+	int32 FindStaticSwitchIntegerOptionCount(UNiagaraGraph* Graph, const FName& SwitchParameterName)
+	{
+		if (!Graph || SwitchParameterName.IsNone()) return INDEX_NONE;
+
+		int32 SmallestCount = INDEX_NONE;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			UClass* NodeClass = Node->GetClass();
+			if (!NodeClass || NodeClass->GetName() != TEXT("NiagaraNodeStaticSwitch")) continue;
+
+			FNameProperty* NameProp = CastField<FNameProperty>(NodeClass->FindPropertyByName(TEXT("InputParameterName")));
+			if (!NameProp) continue;
+			if (NameProp->GetPropertyValue_InContainer(Node) != SwitchParameterName) continue;
+
+			FIntProperty* CountProp = CastField<FIntProperty>(NodeClass->FindPropertyByName(TEXT("NumOptionsPerVariable")));
+			if (!CountProp) continue;
+
+			const int32 Count = CountProp->GetPropertyValue_InContainer(Node);
+			if (Count > 0 && (SmallestCount == INDEX_NONE || Count < SmallestCount))
+			{
+				SmallestCount = Count;
+			}
+		}
+
+		return SmallestCount;
+	}
+}
+
+// ============================================================================
 // Core Helpers
 // ============================================================================
 
@@ -2720,7 +3062,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
 			.Required(TEXT("enabled"), TEXT("bool"), TEXT("Whether to enable the module"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_input_value"), TEXT("Set a module input value"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_input_value"), TEXT("Set a module input value. Refuses static switch selectors (and any static-typed input) — those go through set_static_switch_value; writing them here silently corrupts the module."),
 		FMonolithActionHandler::CreateStatic(&HandleSetModuleInputValue),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
@@ -2835,7 +3177,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 	// --- Script-graph authoring (Tier 1: public node classes) ---
 	// Distinct from the stack-level module actions: these edit the NODE GRAPH inside a
 	// Niagara script asset (or an embedded scratch script via "NS_X.NS_X:ScratchName").
-	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type), 'custom_hlsl' (needs hlsl; optional inputs/outputs — this is how you add HLSL to an EXISTING module, e.g. a duplicated engine one). Returns node_guid + created pins."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type; exposure defaults to exposed + NOT required + auto-bindable, see the 'required' param for why), 'custom_hlsl' (needs hlsl; optional inputs/outputs — this is how you add HLSL to an EXISTING module, e.g. a duplicated engine one). Returns node_guid + created pins."),
 		FMonolithActionHandler::CreateStatic(&HandleAddGraphNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
@@ -2849,6 +3191,10 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Display name for node_type=custom_hlsl (default 'CustomHlsl')"))
 			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
 			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("exposed"), TEXT("bool"), TEXT("node_type=input: expose this input to the calling node (default TRUE). Turn off for inputs that exist only inside the script."))
+			.Optional(TEXT("required"), TEXT("bool"), TEXT("node_type=input: caller MUST bind it (default FALSE — deliberately NOT the engine's own default of true). A required, unbound input whose pin ignores default values — every data interface does — fails compilation with 'Required input X was not bound and could not be automatically bound'. Pass true only for function-script inputs you know every caller wires."))
+			.Optional(TEXT("can_auto_bind"), TEXT("bool"), TEXT("node_type=input: let the translator auto-bind this input to a matching system parameter or emitter attribute (default TRUE; the engine's own default is false). Never auto-binds to custom parameters."))
+			.Optional(TEXT("hidden"), TEXT("bool"), TEXT("node_type=input: put the pin in the caller's advanced section (default FALSE). Function scripts only — no effect in modules or dynamic inputs."))
 			.Optional(TEXT("switch_type"), TEXT("string"), TEXT("For node_type=static_switch: bool (default) | integer | enum | debug_state. 'debug_state' creates the Function.DebugState switch that gives a module its debug-visualization eye icon in the stack."))
 			.Optional(TEXT("convert_mode"), TEXT("string"), TEXT("For node_type=convert: break (split a type into components) | make (assemble a type from components) | swizzle. Omit for an empty convert node. The engine autowires pins AND inner component connections."))
 			.Optional(TEXT("convert_type"), TEXT("string"), TEXT("Type for convert_mode=break/make (e.g. vec3, vec4, quat, color)"))
@@ -2908,13 +3254,14 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node guid"))
 			.Build());
 
-	Registry.RegisterAction(TEXT("niagara"), TEXT("add_map_parameter_pin"), TEXT("Add a typed parameter pin to a ParameterMapGet (read) or ParameterMapSet (write) node — the pins that actually carry named parameters like 'Module.X' or 'Emitter.Y'. Requires the engine-private wizard utilities (dev builds only)."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_map_parameter_pin"), TEXT("Add a typed parameter pin to a ParameterMapGet (read) or ParameterMapSet (write) node — the pins that actually carry named parameters like 'Module.X' or 'Emitter.Y'. By default this CREATES a new parameter and fails if the name is already taken, because the engine would silently uniquify it to 'X001' — a never-written parameter that compiles clean and reads a default forever. To point a pin at a parameter that ALREADY exists, pass existing=true (types must match; static switch parameters are refused, they do not resolve through a map read). If the node already has that pin it is returned untouched with reused=true. Requires the engine-private wizard utilities (dev builds only)."),
 		FMonolithActionHandler::CreateStatic(&HandleAddMapParameterPin),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Full parameter name, e.g. 'Module.MyInput', 'Emitter.MyOutput', 'Engine.DeltaTime'"))
 			.Required(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("existing"), TEXT("bool"), TEXT("true = reference a parameter that already exists instead of creating a new one (the pin is repaired onto the existing parameter). Default false, which refuses a name that is already taken."))
 			.Build());
 
 	// --- Script parameter metadata / default mode / hierarchy ---
@@ -2966,6 +3313,13 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.MyInput')"))
 			.Required(TEXT("category"), TEXT("string"), TEXT("Existing category name"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_script_parameter"), TEXT("Remove a parameter from a module script's parameter registry — for sweeping RESIDUE, such as a uniquified 'Module.X001' left behind after its node was deleted. Deletes NO nodes and NO pins (deliberately: bulk graph deletion has broken a compile before), and REFUSES if the parameter is still referenced by any pin or is a static switch parameter, reporting every reference it found either way."),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveScriptParameter),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.Shape Origin001')"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_debug_draw"), TEXT("Toggle a placed module's debug visualization — the 'eye' icon in the stack. Only works on modules that contain a Function.DebugState static switch (e.g. the stock ShapeLocation); the response reports supports_debug_draw either way. Drawing is done by the module's own DebugDraw data interface and is globally gated by the cvar fx.Niagara.DebugDraw.Enabled. Omit 'enabled' to just query the current state."),
@@ -3186,7 +3540,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	// Static Switch (1)
-	Registry.RegisterAction(TEXT("niagara"), TEXT("set_static_switch_value"), TEXT("Set a static switch value on a module"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_static_switch_value"), TEXT("Set a static switch value on a module. Handles BOTH kinds: switches with their own pin on the module node, and 'expose as pin' switches whose selector is driven by a module parameter (how the stock DebugDraw module's 'Debug Draw Mode' and 'Line Mode' work) — for the latter the value is written on the input override pin with the enum literal resolved. This is the ONLY safe way to set either; set_module_input_value refuses them."),
 		FMonolithActionHandler::CreateStatic(&HandleSetStaticSwitchValue),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
@@ -3619,7 +3973,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara asset path to save"))
 			.Optional(TEXT("only_if_dirty"), TEXT("bool"), TEXT("Only save if the asset has unsaved changes (default: true)"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("get_static_switch_value"), TEXT("Get static switch value(s) on a module — omit input to list all switches"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_static_switch_value"), TEXT("Get static switch value(s) on a module — omit input to list all switches. Lists BOTH kinds (see set_static_switch_value), each flagged with selector_exposed_as_pin + switch_parameter, so this read and that write always agree about what exists. is_default=true means no override is set and the script's own default is in effect."),
 		FMonolithActionHandler::CreateStatic(&HandleGetStaticSwitchValue),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
@@ -3648,7 +4002,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name or handle ID"))
 			.Optional(TEXT("usage"), TEXT("string"), TEXT("Stage filter: particle_update, particle_spawn, emitter_update, emitter_spawn, or all (default: all)"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("get_module_script_inputs"), TEXT("Introspect a module script's inputs WITHOUT adding it to an emitter"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_module_script_inputs"), TEXT("Introspect a module script's inputs WITHOUT adding it to an emitter. Includes static switches, flagged is_static_switch=true (plus selector_exposed_as_pin and the enum's valid_options) — set those with set_static_switch_value, never set_module_input_value."),
 		FMonolithActionHandler::CreateStatic(&HandleGetModuleScriptInputs),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Module script asset path (e.g. /Niagara/Modules/Update/Forces/Gravity.Gravity)"))
@@ -5226,6 +5580,43 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Input '%s' not found on module. Valid inputs: [%s]"),
 			*InputName, *FString::Join(ValidNames, TEXT(", "))));
+	}
+
+	// ------------------------------------------------------------------------
+	// Gap #26b — REFUSE static-switch selectors.
+	// Writing one through the ordinary override-pin path used to SUCCEED SILENTLY and then
+	// break every script compiling the module with
+	//   "Could not resolve static variable through pin. - Node: Static Switch Pin: Selector"
+	// (NiagaraGraphDigest.cpp:4262 / NiagaraHlslTranslator.cpp:6959 — the selector's static
+	// variable no longer resolves once an unresolvable literal is parked on the pin).
+	// Two independent tests, because either one alone can miss:
+	//   1. the shared enumeration attributes this input to a static switch node, or
+	//   2. the input's own type carries the static flag (FNiagaraTypeDefinition::IsStatic,
+	//      NiagaraTypes.h:899), which only ever happens for compile-time constants.
+	// ------------------------------------------------------------------------
+	{
+		const MonolithNiagaraHelpers::FStaticSwitchInput* SwitchDriver = nullptr;
+		TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+		if (UNiagaraGraph* CalledGraph = MN->GetCalledGraph())
+		{
+			MonolithNiagaraHelpers::CollectStaticSwitchInputs(CalledGraph, SwitchInputs);
+			SwitchDriver = MonolithNiagaraHelpers::FindStaticSwitchInput(SwitchInputs, InputName);
+		}
+
+		if (SwitchDriver || InputType.IsStatic())
+		{
+			FString SwitchClause;
+			if (SwitchDriver && !SwitchDriver->SwitchParameterName.IsNone())
+			{
+				SwitchClause = FString::Printf(TEXT(" driving switch '%s'"), *SwitchDriver->SwitchParameterName.ToString());
+			}
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' is a static switch selector%s — set_module_input_value must not write it. ")
+				TEXT("A literal parked on this pin compiles to 'Could not resolve static variable through pin' ")
+				TEXT("and breaks every script using the module (recovery: remove and re-add the module). ")
+				TEXT("Use set_static_switch_value with the same input name instead."),
+				*InputName, *SwitchClause));
+		}
 	}
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModIn", "Set Module Input"));
@@ -8907,7 +9298,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 	if (!EmitterHandleId.IsEmpty() && FindEmitterHandleIndex(System, EmitterHandleId) == INDEX_NONE)
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Emitter '%s' not found"), *EmitterHandleId));
 
-	ENiagaraScriptUsage FoundUsage;
+	ENiagaraScriptUsage FoundUsage = ENiagaraScriptUsage::ParticleUpdateScript;
 	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage);
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
 
@@ -8916,67 +9307,109 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 	if (!CalledGraph)
 		return FMonolithActionResult::Error(TEXT("Module has no script graph — cannot enumerate static switches"));
 
-	TArray<FNiagaraVariable> SwitchInputs = CalledGraph->FindStaticSwitchInputs();
+	// Gap #26a: detection goes through the shared enumeration, which also sees the
+	// expose-as-pin switches UNiagaraGraph::FindStaticSwitchInputs deliberately hides
+	// (that filter is why the stock DebugDraw module reported "no static switches").
+	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+	MonolithNiagaraHelpers::CollectStaticSwitchInputs(CalledGraph, SwitchInputs);
+
+	const MonolithNiagaraHelpers::FStaticSwitchInput* Matched =
+		MonolithNiagaraHelpers::FindStaticSwitchInput(SwitchInputs, InputName);
 
 	FNiagaraTypeDefinition InputType;
 	FName MatchedFullName;
-	bool bInputFound = false;
-	FString InputNameNoSpaces = InputName;
-	InputNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
-	for (const FNiagaraVariable& In : SwitchInputs)
-	{
-		FString VarName = In.GetName().ToString();
-		bool bMatch = VarName.Equals(InputName, ESearchCase::IgnoreCase);
-		if (!bMatch)
-		{
-			FString VarNameNoSpaces = VarName;
-			VarNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
-			bMatch = VarNameNoSpaces.Equals(InputNameNoSpaces, ESearchCase::IgnoreCase);
-		}
-		if (bMatch) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
-	}
+	UEnum* SwitchEnum = nullptr;
+	bool bSelectorExposedAsPin = false;
 
-	if (!bInputFound)
+	if (Matched)
 	{
-		TArray<FString> ValidNames;
-		for (const FNiagaraVariable& In : SwitchInputs) { ValidNames.Add(In.GetName().ToString()); }
-		if (ValidNames.Num() == 0)
-		{
-			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Input '%s' not found — this module has no static switches"), *InputName));
-		}
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Static switch '%s' not found. Valid static switches: [%s]"), *InputName, *FString::Join(ValidNames, TEXT(", "))));
+		InputType = Matched->Variable.GetType();
+		MatchedFullName = Matched->Variable.GetName();
+		SwitchEnum = Matched->Enum;
+		bSelectorExposedAsPin = Matched->bSelectorExposedAsPin;
 	}
-
-	// Static switch pins live directly on the FunctionCall node — find by matching variable name
-	UEdGraphPin* SwitchPin = nullptr;
-	for (UEdGraphPin* Pin : MN->Pins)
+	else
 	{
-		if (Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
+		// Fallback: a module input whose TYPE carries the static flag
+		// (FNiagaraTypeDefinition::IsStatic, NiagaraTypes.h:899) is compile-time constant
+		// and therefore switch-selector material, even when the selector trace above could
+		// not attribute it to a specific switch node. Accepting it here guarantees
+		// set_module_input_value's refusal (gap #26b) never leaves the caller without a route.
+		TArray<FNiagaraVariable> ModuleInputs;
+		const int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
+		if (EmitterIdx != INDEX_NONE)
 		{
-			SwitchPin = Pin;
+			FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+			FCompileConstantResolver Resolver(VE, FoundUsage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, ModuleInputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+		else
+		{
+			FCompileConstantResolver Resolver(System, FoundUsage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, ModuleInputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+
+		FString InputNameNoSpaces = InputName;
+		InputNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+		for (const FNiagaraVariable& In : ModuleInputs)
+		{
+			if (!In.GetType().IsStatic()) continue;
+			FString ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString();
+			bool bMatch = ShortName.Equals(InputName, ESearchCase::IgnoreCase);
+			if (!bMatch)
+			{
+				FString ShortNameNoSpaces = ShortName;
+				ShortNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+				bMatch = ShortNameNoSpaces.Equals(InputNameNoSpaces, ESearchCase::IgnoreCase);
+			}
+			if (!bMatch) continue;
+
+			InputType = In.GetType();
+			MatchedFullName = In.GetName();
+			SwitchEnum = In.GetType().GetEnum();
+			bSelectorExposedAsPin = true;
 			break;
 		}
 	}
-	if (!SwitchPin)
+
+	if (MatchedFullName.IsNone())
 	{
+		const FString ValidNames = MonolithNiagaraHelpers::DescribeStaticSwitchInputs(SwitchInputs);
+		if (ValidNames.IsEmpty())
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' not found — this module exposes no static switches and no static-typed inputs. ")
+				TEXT("If it is an ordinary input, use set_module_input_value."), *InputName));
+		}
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Static switch pin '%s' not found on module node. The switch exists in the script but has no corresponding pin."), *InputName));
+			TEXT("Static switch '%s' not found. Valid static switches: [%s]"), *InputName, *ValidNames));
 	}
 
-	UEnum* SwitchEnum = TryGetStaticSwitchEnum(SwitchPin, MN);
-
-	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetStaticSwitch", "Set Static Switch"));
-	System->Modify();
-
-	// Break existing links
-	if (SwitchPin->LinkedTo.Num() > 0)
+	// Classic switch pins live directly on the FunctionCall node — find by matching variable name.
+	// Expose-as-pin switches have no such pin; their value travels through the parameter map and
+	// is written on the module input override pin further below.
+	UEdGraphPin* SwitchPin = nullptr;
+	if (!bSelectorExposedAsPin)
 	{
-		SwitchPin->BreakAllPinLinks();
+		for (UEdGraphPin* Pin : MN->Pins)
+		{
+			if (Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
+			{
+				SwitchPin = Pin;
+				break;
+			}
+		}
+		if (!SwitchPin)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Static switch pin '%s' not found on module node. The switch exists in the script but has no corresponding pin."), *InputName));
+		}
+		if (!SwitchEnum) SwitchEnum = TryGetStaticSwitchEnum(SwitchPin, MN);
 	}
 
-	// Set the value
+	// Resolve the value BEFORE opening the transaction, so a rejected value cannot leave one open.
 	FString ValStr;
 	if (JV->Type == EJson::Number) ValStr = FString::SanitizeFloat(JV->AsNumber());
 	else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
@@ -8999,7 +9432,6 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 					*SwitchEnum->GetNameStringByValue(OptionValue)));
 			}
 
-			GEditor->EndTransaction();
 			return FMonolithActionResult::Error(FString::Printf(
 				TEXT("Enum switch '%s' does not accept value '%s'. Valid options: [%s]"),
 				*InputName,
@@ -9010,13 +9442,86 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 		ValStr = ResolvedRawValue;
 		DisplayValue = ResolvedDisplayValue.IsEmpty() ? ResolvedRawValue : ResolvedDisplayValue;
 	}
+	// ------------------------------------------------------------------------
+	// Gap #27 — the bool and integer paths used to accept ANY string. "banana" on a
+	// bool switch was stored verbatim, read back verbatim and compiled clean, silently
+	// behaving as false (LexTryParseString(bool&) cannot fail — UnrealString.h.inl:2244);
+	// an out-of-range integer is silently clamped by GetVarIndex
+	// (NiagaraNodeStaticSwitch.cpp:664-671). Both are rejected here, before the
+	// transaction opens, in the same style as the enum path above.
+	// ------------------------------------------------------------------------
+	else if (InputType.IsSameBaseDefinition(FNiagaraTypeDefinition::GetBoolDef()))
+	{
+		FString ResolvedRawValue;
+		if (!MonolithNiagaraHelpers::ResolveStaticSwitchBoolValue(ValStr, ResolvedRawValue))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Bool switch '%s' does not accept value '%s'. Valid options: [%s]"),
+				*InputName,
+				*ValStr,
+				MonolithNiagaraHelpers::DescribeStaticSwitchBoolOptions()));
+		}
+
+		ValStr = ResolvedRawValue;
+		DisplayValue = ResolvedRawValue;
+	}
+	else if (InputType.IsSameBaseDefinition(FNiagaraTypeDefinition::GetIntDef()))
+	{
+		// The switch node knows its own case count; the fallback match (a static-typed
+		// module input with no attributable switch node) does not, and then we validate
+		// parse-only rather than inventing a bound.
+		const FName SwitchParameterName = Matched ? Matched->SwitchParameterName : FName();
+		const int32 OptionCount = MonolithNiagaraHelpers::FindStaticSwitchIntegerOptionCount(CalledGraph, SwitchParameterName);
+		const FString ValidOptions = OptionCount > 0
+			? FString::Printf(TEXT("0 .. %d"), OptionCount - 1)
+			: FString(TEXT("any whole number — this switch's case count could not be determined, so the value is NOT bounds-checked"));
+
+		int32 ParsedValue = 0;
+		if (!MonolithNiagaraHelpers::ResolveStaticSwitchIntValue(ValStr, ParsedValue))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Integer switch '%s' does not accept value '%s' — it is not a whole number. Valid options: [%s]"),
+				*InputName, *ValStr, *ValidOptions));
+		}
+
+		if (OptionCount > 0 && (ParsedValue < 0 || ParsedValue >= OptionCount))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Integer switch '%s' does not accept value '%s' — the switch has %d case(s) and the compiler ")
+				TEXT("silently CLAMPS out-of-range values to a wrong-but-valid branch. Valid options: [%s]"),
+				*InputName, *ValStr, OptionCount, *ValidOptions));
+		}
+
+		ValStr = FString::FromInt(ParsedValue);
+		DisplayValue = ValStr;
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetStaticSwitch", "Set Static Switch"));
+	System->Modify();
+
+	if (bSelectorExposedAsPin)
+	{
+		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+			FNiagaraParameterHandle(MatchedFullName), MN);
+		SwitchPin = &FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+			*MN, AH, InputType, FGuid(), FGuid());
+	}
+
+	// Break existing links so the literal DefaultValue actually takes effect
+	if (SwitchPin->LinkedTo.Num() > 0)
+	{
+		SwitchPin->BreakAllPinLinks();
+	}
 
 	SwitchPin->DefaultValue = ValStr;
 
 	GEditor->EndTransaction();
 	System->RequestCompile(false);
 
-	return NA_SuccessStr(FString::Printf(TEXT("Static switch '%s' set to '%s' (raw='%s')"), *InputName, *DisplayValue, *ValStr));
+	return NA_SuccessStr(FString::Printf(
+		TEXT("Static switch '%s' set to '%s' (raw='%s'%s)"),
+		*InputName, *DisplayValue, *ValStr,
+		bSelectorExposedAsPin ? TEXT(", written on the selector-driving input override pin") : TEXT("")));
 }
 
 // ============================================================================
@@ -14990,30 +15495,69 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetStaticSwitchValue(const 
 	if (!CalledGraph)
 		return FMonolithActionResult::Error(TEXT("Module has no script graph — cannot enumerate static switches"));
 
-	TArray<FNiagaraVariable> SwitchInputs = CalledGraph->FindStaticSwitchInputs();
+	// Same shared enumeration as set_static_switch_value — otherwise this read reports
+	// "no static switches" for a module the write path happily sets (expose-as-pin switches,
+	// which UNiagaraGraph::FindStaticSwitchInputs filters out at NiagaraGraph.cpp:2192).
+	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+	MonolithNiagaraHelpers::CollectStaticSwitchInputs(CalledGraph, SwitchInputs);
+
+	// Fills one JSON object for a switch, reading from wherever that kind of switch keeps
+	// its value: a pin on the module node for classic switches, the module input override
+	// pin (read-only lookup — never creates one) for expose-as-pin switches.
+	auto DescribeSwitch = [&](const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput, TSharedRef<FJsonObject> SO)
+	{
+		const FName FullName = SwitchInput.Variable.GetName();
+		SO->SetStringField(TEXT("name"), FullName.ToString());
+		SO->SetStringField(TEXT("type"), SwitchInput.Variable.GetType().GetName());
+		SO->SetBoolField(TEXT("is_static_switch"), true);
+		SO->SetBoolField(TEXT("selector_exposed_as_pin"), SwitchInput.bSelectorExposedAsPin);
+		if (!SwitchInput.SwitchParameterName.IsNone())
+		{
+			SO->SetStringField(TEXT("switch_parameter"), SwitchInput.SwitchParameterName.ToString());
+		}
+
+		UEdGraphPin* ValuePin = nullptr;
+		if (SwitchInput.bSelectorExposedAsPin)
+		{
+			FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+				FNiagaraParameterHandle(FullName), MN);
+			ValuePin = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(*MN, AH);
+		}
+		else
+		{
+			for (UEdGraphPin* Pin : MN->Pins)
+			{
+				if (Pin->Direction == EGPD_Input && Pin->GetFName() == FullName) { ValuePin = Pin; break; }
+			}
+		}
+
+		UEnum* SwitchEnum = SwitchInput.Enum;
+		if (!SwitchEnum && ValuePin) SwitchEnum = TryGetStaticSwitchEnum(ValuePin, MN);
+
+		if (ValuePin)
+		{
+			SO->SetStringField(TEXT("value"), ValuePin->DefaultValue);
+			SO->SetStringField(TEXT("raw_value"), ValuePin->DefaultValue);
+			SO->SetBoolField(TEXT("is_default"), false);
+			AddStaticSwitchEnumMetadata(SO, SwitchEnum, ValuePin->DefaultValue);
+		}
+		else
+		{
+			// No override written yet — the value in effect is the script's own default.
+			SO->SetStringField(TEXT("value"), TEXT("(default)"));
+			SO->SetBoolField(TEXT("is_default"), true);
+			AddStaticSwitchEnumMetadata(SO, SwitchEnum, FString());
+		}
+	};
 
 	if (InputName.IsEmpty())
 	{
-		// List ALL static switches
+		// List ALL static switches, both kinds
 		TArray<TSharedPtr<FJsonValue>> SwitchArr;
-		for (const FNiagaraVariable& In : SwitchInputs)
+		for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
 		{
 			TSharedRef<FJsonObject> SO = MakeShared<FJsonObject>();
-			FString VarName = In.GetName().ToString();
-			SO->SetStringField(TEXT("name"), VarName);
-			SO->SetStringField(TEXT("type"), In.GetType().GetName());
-
-			// Find the pin to get the current value
-			for (UEdGraphPin* Pin : MN->Pins)
-			{
-				if (Pin->Direction == EGPD_Input && Pin->GetFName() == In.GetName())
-				{
-					SO->SetStringField(TEXT("value"), Pin->DefaultValue);
-					SO->SetStringField(TEXT("raw_value"), Pin->DefaultValue);
-					AddStaticSwitchEnumMetadata(SO, TryGetStaticSwitchEnum(Pin, MN), Pin->DefaultValue);
-					break;
-				}
-			}
+			DescribeSwitch(SwitchInput, SO);
 			SwitchArr.Add(MakeShared<FJsonValueObject>(SO));
 		}
 
@@ -15023,52 +15567,21 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetStaticSwitchValue(const 
 		return NA_SuccessObj(R);
 	}
 
-	// Find specific switch — same name-matching logic as set_static_switch_value
-	FName MatchedFullName;
-	bool bInputFound = false;
-	FString InputNameNoSpaces = InputName;
-	InputNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
-	for (const FNiagaraVariable& In : SwitchInputs)
-	{
-		FString VarName = In.GetName().ToString();
-		bool bMatch = VarName.Equals(InputName, ESearchCase::IgnoreCase);
-		if (!bMatch)
-		{
-			FString VarNameNoSpaces = VarName;
-			VarNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
-			bMatch = VarNameNoSpaces.Equals(InputNameNoSpaces, ESearchCase::IgnoreCase);
-		}
-		if (bMatch) { MatchedFullName = In.GetName(); bInputFound = true; break; }
-	}
+	// Find specific switch — same name matching as set_static_switch_value
+	const MonolithNiagaraHelpers::FStaticSwitchInput* Matched =
+		MonolithNiagaraHelpers::FindStaticSwitchInput(SwitchInputs, InputName);
 
-	if (!bInputFound)
+	if (!Matched)
 	{
-		TArray<FString> ValidNames;
-		for (const FNiagaraVariable& In : SwitchInputs) ValidNames.Add(In.GetName().ToString());
-		if (ValidNames.Num() == 0)
+		const FString ValidNames = MonolithNiagaraHelpers::DescribeStaticSwitchInputs(SwitchInputs);
+		if (ValidNames.IsEmpty())
 			return FMonolithActionResult::Error(FString::Printf(TEXT("Input '%s' not found — this module has no static switches"), *InputName));
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Static switch '%s' not found. Valid static switches: [%s]"), *InputName, *FString::Join(ValidNames, TEXT(", "))));
+			TEXT("Static switch '%s' not found. Valid static switches: [%s]"), *InputName, *ValidNames));
 	}
-
-	// Find the pin
-	UEdGraphPin* SwitchPin = nullptr;
-	for (UEdGraphPin* Pin : MN->Pins)
-	{
-		if (Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
-		{
-			SwitchPin = Pin;
-			break;
-		}
-	}
-	if (!SwitchPin)
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Static switch pin '%s' not found on module node"), *InputName));
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
-	R->SetStringField(TEXT("name"), MatchedFullName.ToString());
-	R->SetStringField(TEXT("value"), SwitchPin->DefaultValue);
-	R->SetStringField(TEXT("raw_value"), SwitchPin->DefaultValue);
-	AddStaticSwitchEnumMetadata(R, TryGetStaticSwitchEnum(SwitchPin, MN), SwitchPin->DefaultValue);
+	DescribeSwitch(*Matched, R);
 	return NA_SuccessObj(R);
 }
 
@@ -15665,8 +16178,43 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleScriptInputs(const
 		IO->SetStringField(TEXT("type"), InputVar.GetType().GetName());
 		IO->SetStringField(TEXT("usage"), TEXT("parameter"));
 		IO->SetBoolField(TEXT("is_parameter"), true);
+		IO->SetBoolField(TEXT("is_static_switch"), false);
 
 		InputArr.Add(MakeShared<FJsonValueObject>(IO));
+	}
+
+	// Gap #18: UNiagaraNodeInput enumeration alone never sees static switches, so a module's
+	// switches were invisible here while get_module_inputs (placed-node path) reported them.
+	// Same shared enumeration as set_static_switch_value, so the read and the write agree.
+	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+	MonolithNiagaraHelpers::CollectStaticSwitchInputs(Graph, SwitchInputs);
+	int32 StaticSwitchCount = 0;
+	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
+	{
+		const FName FullName = SwitchInput.Variable.GetName();
+		if (SeenNames.Contains(FullName)) continue;
+		SeenNames.Add(FullName);
+
+		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+		IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(FullName).ToString());
+		IO->SetStringField(TEXT("type"), SwitchInput.Variable.GetType().GetName());
+		IO->SetStringField(TEXT("usage"), TEXT("static_switch"));
+		IO->SetBoolField(TEXT("is_parameter"), false);
+		IO->SetBoolField(TEXT("is_static_switch"), true);
+		// True when the switch reads a Selector pin instead of owning a pin on the calling node.
+		// Both kinds are written with set_static_switch_value; NEVER with set_module_input_value.
+		IO->SetBoolField(TEXT("selector_exposed_as_pin"), SwitchInput.bSelectorExposedAsPin);
+		if (!SwitchInput.SwitchParameterName.IsNone())
+		{
+			IO->SetStringField(TEXT("switch_parameter"), SwitchInput.SwitchParameterName.ToString());
+		}
+		if (SwitchInput.Enum)
+		{
+			AddStaticSwitchEnumMetadata(IO, SwitchInput.Enum, FString());
+		}
+
+		InputArr.Add(MakeShared<FJsonValueObject>(IO));
+		++StaticSwitchCount;
 	}
 
 	// Get script metadata from latest version data
@@ -15674,6 +16222,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleScriptInputs(const
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("script_name"), Script->GetName());
 	R->SetNumberField(TEXT("input_count"), InputArr.Num());
+	R->SetNumberField(TEXT("static_switch_count"), StaticSwitchCount);
 	R->SetArrayField(TEXT("inputs"), InputArr);
 
 	// Module usage bitmask and metadata from versioned data
@@ -17710,6 +18259,32 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		UNiagaraNodeInput* InNode = Creator.CreateNode(false);
 		InNode->Usage = ENiagaraInputNodeUsage::Parameter;
 		InNode->Input = FNiagaraVariable(TypeDef, FName(*InName));
+
+		// Gap #25: ExposureOptions was never set, so the node kept the engine's struct defaults
+		// (FNiagaraInputExposureOptions ctor, NiagaraNodeInput.h:21 — bExposed=1, bRequired=1,
+		// bCanAutoBind=0, bHidden=0). bExposed+bRequired with no binding is precisely the
+		// condition that raises "Required input X was not bound and could not be automatically
+		// bound" (NiagaraNodeFunctionCall.cpp:809, NiagaraGraphDigest.cpp:2812) for any pin with
+		// bDefaultValueIsIgnored — which is every data interface. Defaults below therefore
+		// deviate from the engine's on purpose: exposed but NOT required, and auto-bindable.
+		// create_module_from_hlsl (the InputNode block above) sets all four explicitly too.
+		auto GetOptionalBool = [&Params](const TCHAR* Field, bool bDefault) -> bool
+		{
+			bool bValue = bDefault;
+			if (Params->TryGetBoolField(Field, bValue)) return bValue;
+			FString AsText;
+			if (Params->TryGetStringField(Field, AsText))
+			{
+				if (AsText.Equals(TEXT("true"), ESearchCase::IgnoreCase) || AsText == TEXT("1")) return true;
+				if (AsText.Equals(TEXT("false"), ESearchCase::IgnoreCase) || AsText == TEXT("0")) return false;
+			}
+			return bDefault;
+		};
+		InNode->ExposureOptions.bExposed     = GetOptionalBool(TEXT("exposed"), true) ? 1u : 0u;
+		InNode->ExposureOptions.bRequired    = GetOptionalBool(TEXT("required"), false) ? 1u : 0u;
+		InNode->ExposureOptions.bCanAutoBind = GetOptionalBool(TEXT("can_auto_bind"), true) ? 1u : 0u;
+		InNode->ExposureOptions.bHidden      = GetOptionalBool(TEXT("hidden"), false) ? 1u : 0u;
+
 		Creator.Finalize();
 		NewNode = InNode;
 	}
@@ -18377,12 +18952,172 @@ FMonolithActionResult FMonolithNiagaraActions::HandleListGraphNodePins(const TSh
 	return NA_SuccessObj(R);
 }
 
+// ============================================================================
+// Parameter-map pin plumbing (gap #23)
+//
+// The only route to a parameter-map pin that is reachable from outside NiagaraEditor is
+// UNiagaraNodeWithDynamicPins::AddParameterPin, via the exported wizard wrappers. It
+// UNIQUIFIES the requested name unless it is a reserved engine constant
+// (NiagaraNodeWithDynamicPins.cpp:416):
+//
+//     if (FNiagaraConstants::FindEngineConstant(Parameter) == nullptr)
+//         Parameter.SetName(Graph->MakeUniqueParameterName(Parameter.GetName()));
+//
+// So asking for a READ of an existing 'Module.X' silently yields 'Module.X001' — a brand
+// new parameter that nothing ever writes. That is the I-4 dead read: it compiles clean and
+// returns a default forever. Never hand one of those back as a success.
+//
+// The obvious bypass does NOT exist: RequestNewTypedPin is declared without
+// NIAGARAEDITOR_API in a public header (NiagaraNodeWithDynamicPins.h:29) on a
+// UCLASS(Abstract) carrying no MinimalAPI — it compiles and then fails to link. Same for
+// AddParameterPin, RemoveDynamicPin, IsAddPin and AddPinSubCategory.
+//
+// The repair is therefore after the fact, and the engine does export what it needs:
+// UNiagaraGraph::RenameParameter (NiagaraGraph.h:399) has a MERGE path — when the target
+// name already maps to a script variable it renames every referencing pin through
+// CommitEditablePinName, keeps the EXISTING parameter's metadata, and drops the spurious
+// one from VariableToScriptVariable (NiagaraGraph.cpp:2823-2879). That is exactly the
+// editor's own "point this pin at a parameter that already exists" operation, which
+// UNiagaraNodeParameterMapGet::VerifyEditablePinName (NiagaraNodeParameterMapGet.cpp:76-89)
+// explicitly permits — and refuses only when the types differ. Hence `existing=true`.
+// ============================================================================
+
+namespace MonolithNiagaraParamPins
+{
+	// NOTE: Add pins cannot collide here — they are named "Add", never a namespaced
+	// parameter name — so no IsAddPin test is needed (which is just as well: both
+	// IsAddPin and AddPinSubCategory are unexported).
+	static UEdGraphPin* FindPinByName(UEdGraphNode* Node, const FString& PinName, EEdGraphPinDirection Direction)
+	{
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (!P || P->Direction != Direction) continue;
+			if (P->PinName.ToString().Equals(PinName, ESearchCase::CaseSensitive)) return P;
+		}
+		return nullptr;
+	}
+
+	// Re-resolve a pin after a graph-level rename: RenameParameter re-enters the node
+	// (CommitEditablePinName -> OnPinRenamed -> SynchronizeDefaultInputPin), so look the
+	// pin up again by its persistent guid rather than trusting the old pointer.
+	static UEdGraphPin* FindPinByPersistentGuid(UEdGraphNode* Node, const FGuid& PinGuid)
+	{
+		if (!PinGuid.IsValid()) return nullptr;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (P && P->PersistentGuid == PinGuid) return P;
+		}
+		return nullptr;
+	}
+
+	struct FParamReference
+	{
+		FString NodeGuid;
+		FString NodeTitle;
+		FString PinName;
+		FString Direction;
+		FString Kind;      // "pin" | "static_switch_selector"
+	};
+
+	/**
+	 * Every place in the graph that names this parameter. Used both as a pre-flight
+	 * predictor of uniquification (MakeUniqueParameterName uniquifies against the
+	 * PARAMETER REFERENCE map — i.e. pins — not against VariableToScriptVariable;
+	 * NiagaraGraph.cpp:2541-2556) and as the safety interlock for remove_script_parameter.
+	 * UNiagaraGraph::GetParameterReferenceMap is not exported, so walk the nodes instead.
+	 */
+	static void CollectParameterReferences(UNiagaraGraph* Graph, const FString& ParamName, TArray<FParamReference>& Out)
+	{
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+
+			for (UEdGraphPin* P : Node->Pins)
+			{
+				if (!P || !P->PinName.ToString().Equals(ParamName, ESearchCase::CaseSensitive)) continue;
+				FParamReference Ref;
+				Ref.NodeGuid  = Node->NodeGuid.ToString();
+				Ref.NodeTitle = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+				Ref.PinName   = P->PinName.ToString();
+				Ref.Direction = P->Direction == EGPD_Input ? TEXT("input") : TEXT("output");
+				Ref.Kind      = TEXT("pin");
+				Out.Add(Ref);
+			}
+
+			// Static switch parameters have no pin of their own — the name lives on the node.
+			if (UNiagaraNodeStaticSwitch* SwitchNode = Cast<UNiagaraNodeStaticSwitch>(Node))
+			{
+				if (SwitchNode->InputParameterName.ToString().Equals(ParamName, ESearchCase::CaseSensitive))
+				{
+					FParamReference Ref;
+					Ref.NodeGuid  = Node->NodeGuid.ToString();
+					Ref.NodeTitle = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+					Ref.PinName   = SwitchNode->InputParameterName.ToString();
+					Ref.Direction = TEXT("none");
+					Ref.Kind      = TEXT("static_switch_selector");
+					Out.Add(Ref);
+				}
+			}
+		}
+	}
+
+	static TSharedRef<FJsonObject> ParamReferenceToJson(const FParamReference& Ref)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("node_guid"), Ref.NodeGuid);
+		O->SetStringField(TEXT("node"), Ref.NodeTitle);
+		O->SetStringField(TEXT("pin"), Ref.PinName);
+		O->SetStringField(TEXT("direction"), Ref.Direction);
+		O->SetStringField(TEXT("kind"), Ref.Kind);
+		return O;
+	}
+
+	static FString SummarizeReferences(const TArray<FParamReference>& Refs, int32 MaxShown = 6)
+	{
+		TArray<FString> Parts;
+		for (int32 i = 0; i < Refs.Num() && i < MaxShown; ++i)
+		{
+			Parts.Add(FString::Printf(TEXT("%s (%s, %s)"), *Refs[i].NodeTitle, *Refs[i].Kind, *Refs[i].NodeGuid));
+		}
+		if (Refs.Num() > MaxShown) Parts.Add(FString::Printf(TEXT("+%d more"), Refs.Num() - MaxShown));
+		return FString::Join(Parts, TEXT("; "));
+	}
+
+	/**
+	 * Drop a parameter from the graph's script-variable registry WITHOUT touching a single
+	 * node or pin. UNiagaraGraph::RemoveParameter is not exported (NiagaraGraph.h:387) — and
+	 * we would not want it anyway, because it deletes every referencing pin
+	 * (NiagaraGraph.cpp:2589-2593). The exported non-const UNiagaraGraph::GetAllMetaData
+	 * (NiagaraGraph.h:368) hands back the real VariableToScriptVariable map
+	 * (NiagaraGraph.cpp:2296-2301), which is all we need. Matches on name only, so a
+	 * name registered under two types is fully cleared.
+	 */
+	static int32 RemoveScriptVariableEntries(UNiagaraGraph* Graph, const FString& ParamName)
+	{
+		TMap<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& Vars = Graph->GetAllMetaData();
+		TArray<FNiagaraVariable> ToRemove;
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Vars)
+		{
+			if (P.Key.GetName().ToString().Equals(ParamName, ESearchCase::CaseSensitive)) ToRemove.Add(P.Key);
+		}
+		for (const FNiagaraVariable& V : ToRemove) Vars.Remove(V);
+		return ToRemove.Num();
+	}
+
+	/** The advice string every dead-read refusal ends with (invariant I-16). */
+	static const TCHAR* ReadIdiomHint =
+		TEXT("Better idiom: wire from a ParameterMapGet output pin the graph ALREADY has — engine modules "
+		     "already read their own inputs, so the pin usually exists (list_graph_node_pins on the MapGet). "
+		     "Use add_map_parameter_pin with existing=true only when you genuinely need a second reader.");
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TSharedPtr<FJsonObject>& Params)
 {
 #if !WITH_NIAGARA_WIZARD_PRIVATE
 	return FMonolithActionResult::Error(TEXT("add_map_parameter_pin requires WITH_NIAGARA_WIZARD_PRIVATE=1 (engine-private wizard utilities); unavailable in release builds."));
 #else
 	using namespace MonolithNiagaraGraphAuthoring;
+	using namespace MonolithNiagaraParamPins;
 
 	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
 	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
@@ -18393,41 +19128,177 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 
 	const FString ParamName = Params->GetStringField(TEXT("parameter"));
 	const FString TypeStr = Params->GetStringField(TEXT("type"));
+	const bool bExisting = Params->HasField(TEXT("existing")) && Params->GetBoolField(TEXT("existing"));
 	bool bFellBack = false;
 	FNiagaraTypeDefinition TypeDef = ResolveNiagaraType(TypeStr, &bFellBack);
 	if (bFellBack) return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown Niagara type '%s'"), *TypeStr));
 
-	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddMapPin", "Add Map Parameter Pin"));
-	Graph->Modify();
-	Node->Modify();
-
-	UEdGraphPin* NewPin = nullptr;
-	FString Kind;
-	if (UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node))
+	UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
+	UNiagaraNodeParameterMapSet* SetNode = Cast<UNiagaraNodeParameterMapSet>(Node);
+	if (!GetNode && !SetNode)
 	{
-		NewPin = UE::Niagara::Wizard::Utilities::AddReadParameterPin(TypeDef, FName(*ParamName), GetNode);
-		Kind = TEXT("read");
-	}
-	else if (UNiagaraNodeParameterMapSet* SetNode = Cast<UNiagaraNodeParameterMapSet>(Node))
-	{
-		NewPin = UE::Niagara::Wizard::Utilities::AddWriteParameterPin(TypeDef, FName(*ParamName), SetNode);
-		Kind = TEXT("write");
-	}
-	else
-	{
-		GEditor->EndTransaction();
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Node is a %s — add_map_parameter_pin only applies to ParameterMapGet / ParameterMapSet nodes"),
 			*Node->GetClass()->GetName()));
 	}
 
-	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithAddMapPin"), true);
-	GEditor->EndTransaction();
+	const EEdGraphPinDirection PinDir = GetNode ? EGPD_Output : EGPD_Input;
+	const FString Kind = GetNode ? TEXT("read") : TEXT("write");
+
+	// --- Case 1: this node already carries the pin. Hand it back, change nothing. ------
+	// Idempotent, and it is the answer the caller actually wants: that pin IS the
+	// parameter, whereas anything new would be a duplicate at best.
+	if (UEdGraphPin* Reused = FindPinByName(Node, ParamName, PinDir))
+	{
+		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetStringField(TEXT("script_path"), ScriptPath);
+		R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+		R->SetStringField(TEXT("kind"), Kind);
+		R->SetStringField(TEXT("pin"), Reused->PinName.ToString());
+		R->SetStringField(TEXT("direction"), Reused->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+		R->SetStringField(TEXT("type"), TypeDef.GetName());
+		R->SetBoolField(TEXT("created"), false);
+		R->SetBoolField(TEXT("reused"), true);
+		R->SetStringField(TEXT("note"), TEXT("This node already had that pin — nothing was added. Connect from it directly."));
+		return NA_SuccessObj(R);
+	}
+
+	// --- Case 2: pre-flight. Refuse BEFORE mutating anything if the name is taken. -----
+	UNiagaraScriptVariable* ExistingVar = Graph->GetScriptVariable(FName(*ParamName));
+	TArray<FParamReference> ExistingRefs;
+	CollectParameterReferences(Graph, ParamName, ExistingRefs);
+	const bool bNameTaken = (ExistingVar != nullptr) || (ExistingRefs.Num() > 0);
+
+	if (bExisting)
+	{
+		if (!ExistingVar)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("existing=true, but this script has no parameter named '%s'%s. Check the exact name with "
+				     "get_script_parameters, or drop existing=true to create it."),
+				*ParamName,
+				ExistingRefs.Num() > 0
+					? *FString::Printf(TEXT(" in its parameter registry (it appears on %d pin(s): %s)"),
+						ExistingRefs.Num(), *SummarizeReferences(ExistingRefs))
+					: TEXT("")));
+		}
+		if (ExistingVar->GetIsStaticSwitch())
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' is a STATIC SWITCH parameter. A parameter-map read of a static switch does not resolve "
+				     "to the switch's value — it would become a separate parameter and read a default forever "
+				     "(gap #22). Branch on the switch node itself instead (add_graph_node static_switch, or splice "
+				     "into an existing case branch)."), *ParamName));
+		}
+		if (ExistingVar->Variable.GetType() != TypeDef)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' already exists with type '%s'; you asked for '%s'. A pin of a different type cannot "
+				     "reference it — this is the same rule the editor enforces in "
+				     "UNiagaraNodeParameterMapGet::VerifyEditablePinName."),
+				*ParamName, *ExistingVar->Variable.GetType().GetName(), *TypeDef.GetName()));
+		}
+	}
+	else if (bNameTaken)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' already exists in this script%s, so the engine would UNIQUIFY the new pin to something like "
+			     "'%s001' (UNiagaraNodeWithDynamicPins::AddParameterPin, NiagaraNodeWithDynamicPins.cpp:416). That "
+			     "new pin would be a brand-new parameter nothing ever writes — a dead read that compiles clean and "
+			     "returns a default forever. NOTHING WAS CHANGED. Pass existing=true to point this pin at the "
+			     "parameter that is already there instead.%s"),
+			*ParamName,
+			ExistingRefs.Num() > 0 ? *FString::Printf(TEXT(" (referenced by: %s)"), *SummarizeReferences(ExistingRefs)) : TEXT(""),
+			*ParamName,
+			GetNode ? *FString::Printf(TEXT(" %s"), ReadIdiomHint) : TEXT("")));
+	}
+
+	// --- Case 3: add the pin, then VERIFY the name we actually got. -------------------
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddMapPin", "Add Map Parameter Pin"));
+	Graph->Modify();
+	Node->Modify();
+
+	UEdGraphPin* NewPin = GetNode
+		? UE::Niagara::Wizard::Utilities::AddReadParameterPin(TypeDef, FName(*ParamName), GetNode)
+		: UE::Niagara::Wizard::Utilities::AddWriteParameterPin(TypeDef, FName(*ParamName), SetNode);
 
 	if (!NewPin)
 	{
+		GEditor->EndTransaction();
 		return FMonolithActionResult::Error(TEXT("The wizard utility returned no pin — the parameter name or type was rejected."));
 	}
+
+	const FGuid PinGuid = NewPin->PersistentGuid;
+	FString ActualName = NewPin->PinName.ToString();
+	const bool bDiverged = !ActualName.Equals(ParamName, ESearchCase::CaseSensitive);
+	bool bRepaired = false;
+	bool bMerged = false;
+	int32 SpuriousRemoved = 0;
+
+	// The engine may diverge from the requested name in two ways: uniquification
+	// ('Module.X' -> 'Module.X001', NiagaraNodeWithDynamicPins.cpp:416) and auto-namespacing
+	// of a bare name ('X' -> 'Local.X', NiagaraNodeParameterMapGet.cpp:105-107). Both mean
+	// the pin does not carry the parameter that was asked for.
+	if (bDiverged && bExisting)
+	{
+		// Merge-rename onto the parameter that already exists. Renames the pin through
+		// CommitEditablePinName and removes the spurious variable (NiagaraGraph.cpp:2823-2879).
+		const FString SpuriousName = ActualName;
+		Graph->RenameParameter(FNiagaraVariable(TypeDef, FName(*SpuriousName)), FName(*ParamName),
+			/*bRenameRequestedFromStaticSwitch=*/false, &bMerged, /*bSuppressEvents=*/false);
+
+		NewPin = FindPinByPersistentGuid(Node, PinGuid);
+		ActualName = NewPin ? NewPin->PinName.ToString() : FString();
+		bRepaired = ActualName.Equals(ParamName, ESearchCase::CaseSensitive);
+
+		// Belt and braces: the merge path should have dropped it, but never leave the
+		// residue behind if it did not.
+		if (!SpuriousName.Equals(ParamName, ESearchCase::CaseSensitive))
+		{
+			SpuriousRemoved = RemoveScriptVariableEntries(Graph, SpuriousName);
+		}
+	}
+
+	// --- Case 4: still not the requested name → roll back and fail loudly. ------------
+	if (!NewPin || !ActualName.Equals(ParamName, ESearchCase::CaseSensitive))
+	{
+		FString Rollback;
+		if (NewPin)
+		{
+			NewPin->BreakAllPinLinks();
+			// UEdGraphNode::RemovePin fires OnPinRemoved (EdGraphNode.cpp:480), which on a
+			// MapGet also removes the paired default-value input pin
+			// (NiagaraNodeParameterMapGet.cpp:175-199).
+			const bool bPinRemoved = Node->RemovePin(NewPin);
+			const int32 Dropped = ActualName.IsEmpty() ? 0 : RemoveScriptVariableEntries(Graph, ActualName);
+			Rollback = FString::Printf(TEXT("Rolled back: pin %s, %d spurious parameter entr%s removed."),
+				bPinRemoved ? TEXT("removed") : TEXT("COULD NOT BE REMOVED — inspect the node"),
+				Dropped, Dropped == 1 ? TEXT("y") : TEXT("ies"));
+		}
+		else
+		{
+			Rollback = TEXT("NOT rolled back: the pin could not be re-resolved after the rename, so it may still "
+			                "exist on the node under an unexpected name — inspect it with list_graph_node_pins "
+			                "before doing anything else.");
+		}
+
+		if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithAddMapPinRollback"), true);
+		Graph->NotifyGraphChanged();
+		GEditor->EndTransaction();
+		SavePackageFor(Script);
+
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Asked for '%s' but the engine produced '%s' — a DIFFERENT, never-written parameter (dead read: "
+			     "compiles clean, returns a default forever). %s %s"),
+			*ParamName,
+			ActualName.IsEmpty() ? TEXT("<pin lost>") : *ActualName,
+			*Rollback,
+			ReadIdiomHint));
+	}
+
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithAddMapPin"), true);
+	Graph->NotifyGraphChanged();
+	GEditor->EndTransaction();
 	SavePackageFor(Script);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
@@ -18437,6 +19308,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	R->SetStringField(TEXT("pin"), NewPin->PinName.ToString());
 	R->SetStringField(TEXT("direction"), NewPin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
 	R->SetStringField(TEXT("type"), TypeDef.GetName());
+	R->SetBoolField(TEXT("created"), true);
+	R->SetBoolField(TEXT("reused"), false);
+	R->SetBoolField(TEXT("references_existing_parameter"), bExisting);
+	if (bExisting)
+	{
+		// engine_uniquified=false means the engine handed back the exact name and no repair
+		// was needed (the parameter existed but had no pin references, so
+		// MakeUniqueParameterName had nothing to collide with).
+		R->SetBoolField(TEXT("engine_uniquified"), bDiverged);
+		R->SetBoolField(TEXT("repaired_uniquified_name"), bRepaired);
+		R->SetBoolField(TEXT("merged_with_existing_parameter"), bMerged);
+		R->SetNumberField(TEXT("spurious_parameters_removed"), SpuriousRemoved);
+	}
 	return NA_SuccessObj(R);
 #endif
 }
@@ -18869,6 +19753,92 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAssignScriptParameterToCate
 	R->SetStringField(TEXT("parameter"), ParamName);
 	R->SetStringField(TEXT("category"), CategoryName);
 	R->SetStringField(TEXT("variable_guid"), VarGuid.ToString());
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleRemoveScriptParameter(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	using namespace MonolithNiagaraParamPins;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString ParamName = Params->GetStringField(TEXT("parameter"));
+
+	UNiagaraScriptVariable* SV = Graph->GetScriptVariable(FName(*ParamName));
+	if (!SV)
+	{
+		TArray<FString> Known;
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+		{
+			Known.Add(P.Key.GetName().ToString());
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No script parameter '%s'. Known: %s"), *ParamName, *FString::Join(Known, TEXT(", "))));
+	}
+
+	const FString VarType = SV->Variable.GetType().GetName();
+	const FString VarGuid = SV->Metadata.GetVariableGuid().ToString();
+	const bool bIsStaticSwitch = SV->GetIsStaticSwitch();
+
+	// Report what we found whether or not we remove anything.
+	TArray<FParamReference> Refs;
+	CollectParameterReferences(Graph, ParamName, Refs);
+
+	TArray<TSharedPtr<FJsonValue>> RefArr;
+	for (const FParamReference& Ref : Refs) RefArr.Add(MakeShared<FJsonValueObject>(ParamReferenceToJson(Ref)));
+
+	// Interlock 1: a static switch parameter is owned by its node — the engine repopulates
+	// it from the graph and refuses the same removal itself (NiagaraGraph.cpp:2583-2588).
+	if (bIsStaticSwitch)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is a static switch parameter (%d reference(s): %s). Static switch parameters are owned by "
+			     "their switch node and are re-registered automatically; delete the switch node instead if you "
+			     "really want it gone. The engine refuses this same removal in UNiagaraGraph::RemoveParameter."),
+			*ParamName, Refs.Num(), *SummarizeReferences(Refs)));
+	}
+
+	// Interlock 2: never remove a parameter something still points at. This action exists to
+	// sweep REGISTRY RESIDUE (e.g. a uniquified 'Module.X001' whose node was deleted), not to
+	// perform graph surgery — per gap C14, bulk-deleting graph junk once broke a system's
+	// compile persistently, so it deletes no nodes and no pins, ever.
+	if (Refs.Num() > 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' (%s) is still referenced by %d pin/node(s): %s. Refusing — removing it would leave those "
+			     "pins pointing at a parameter that no longer exists. Disconnect and remove those pins first "
+			     "(or delete the node that owns them), then run this again."),
+			*ParamName, *VarType, Refs.Num(), *SummarizeReferences(Refs)));
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "RemoveScriptParam", "Remove Niagara Script Parameter"));
+	Graph->Modify();
+	const int32 Removed = RemoveScriptVariableEntries(Graph, ParamName);
+	GEditor->EndTransaction();
+
+	if (Removed == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Found '%s' via GetScriptVariable but no entry matched by name in the script-variable map — "
+			     "nothing was removed. Report this; the graph may be in an unexpected state."), *ParamName));
+	}
+
+	Graph->ConditionalRefreshParameterReferences();
+	Graph->NotifyGraphChanged();
+	MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("parameter"), ParamName);
+	R->SetStringField(TEXT("type"), VarType);
+	R->SetStringField(TEXT("variable_guid"), VarGuid);
+	R->SetNumberField(TEXT("entries_removed"), Removed);
+	R->SetNumberField(TEXT("references_found"), 0);
+	R->SetArrayField(TEXT("references"), RefArr);
+	R->SetStringField(TEXT("note"), TEXT("Registry entry only — no node and no pin was deleted."));
 	return NA_SuccessObj(R);
 }
 
