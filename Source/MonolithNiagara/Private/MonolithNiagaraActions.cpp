@@ -1088,6 +1088,165 @@ static FString NA_GetAssetPath(const TSharedPtr<FJsonObject>& Params)
 	return Path;
 }
 
+// ---------------------------------------------------------------------------
+// Shared package-save tail.
+//
+// The naive tail — SavePackage(Object->GetOutermost(), Object, ...) with
+// SaveArgs.Error = GError — takes the EDITOR DOWN for any object that is not its own
+// asset. Observed 2026-08-08 via set_script_metadata on a scratch-pad script path
+// (/Game/FX/_Probes/NS_Test_ScratchProbe.NS_Test_ScratchProbe:StepCounter). Two
+// independent defects, both fixed here:
+//
+//  1. WRONG InAsset. A scratch-pad script is a SUBOBJECT of the owning system: it is not
+//     the package's top-level asset and carries neither RF_Public nor RF_Standalone.
+//     ValidatePackage (SavePackage2.cpp:159-214) rejects an InAsset that lacks the
+//     requested TopLevelFlags — "The Asset <name> being saved does not have any of the
+//     provided object flags (0x10000003); saving the package would cause data loss."
+//     The engine's check is correct and our argument was wrong, so the fix is to pass the
+//     package's real top-level asset (the owning system). Do NOT "fix" it by relaxing
+//     TopLevelFlags: that suppresses the check while writing a package whose declared
+//     asset is a subobject, i.e. it trades a crash for a corrupt asset.
+//     Note this is not only scratch pads — event-handler scripts (:11191) and
+//     simulation-stage scripts (:11685) are created the same way, outered to the
+//     emitter/stage with RF_Transactional only.
+//
+//  2. GError AS THE SAVE ERROR DEVICE. FSavePackageArgs::Error DEFAULTS to GError
+//     (SavePackage.h:90) and our tails also set it explicitly. On Windows GError is
+//     FWindowsErrorOutputDevice, whose Serialize() sets GIsCriticalError and tears the
+//     process down for ANY verbosity — including the Warning that ValidatePackage emits
+//     (WindowsErrorOutputDevice.cpp:31-92). That is what turned a soft
+//     ESavePackageResult::Error into an editor crash. Epic's own editor save paths pass
+//     GWarn/GLog instead (EditorServer.cpp:962, DiffUtils.cpp:222); we pass GLog and read
+//     SavePackage's bool return value.
+//
+// Ordering rule (from gap #26b): resolve the save target with NA_ResolveSaveTarget BEFORE
+// mutating anything, and refuse while the asset is still untouched. NA_SaveObjectPackage
+// is then the tail that cannot be fatal.
+// ---------------------------------------------------------------------------
+struct FMonolithSaveOutcome
+{
+	bool bSaved = false;
+	bool bEmbedded = false;  // requested object is not its package's top-level asset
+	FString PackageName;
+	FString SavedAssetPath;  // what was actually handed to SavePackage as InAsset
+	FString Error;           // caller-facing reason; non-empty iff bSaved == false
+};
+
+// Pure: works out what SavePackage will need, WITHOUT mutating, dirtying or saving.
+static bool NA_ResolveSaveTarget(UObject* Object, UPackage*& OutPackage, UObject*& OutAsset,
+	bool& bOutEmbedded, FString& OutPackageFilename, FString& OutError)
+{
+	OutPackage = nullptr;
+	OutAsset = nullptr;
+	bOutEmbedded = false;
+	OutPackageFilename.Reset();
+	OutError.Reset();
+
+	if (!Object)
+	{
+		OutError = TEXT("Nothing to save (null object)");
+		return false;
+	}
+
+	UPackage* Pkg = Object->GetOutermost();
+	if (!Pkg)
+	{
+		OutError = FString::Printf(TEXT("'%s' has no package"), *Object->GetPathName());
+		return false;
+	}
+
+	if (!FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), OutPackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		OutError = FString::Printf(
+			TEXT("Package '%s' has no on-disk filename (transient or memory-only package?) — cannot save."),
+			*Pkg->GetName());
+		return false;
+	}
+
+	// Standalone asset (NM_*/NF_* script, system, emitter, NPC, effect type…): it IS the
+	// package's asset, so it is a legal InAsset.
+	if (Object->GetOuter() == Pkg && Object->HasAnyFlags(RF_Public | RF_Standalone))
+	{
+		OutPackage = Pkg;
+		OutAsset = Object;
+		return true;
+	}
+
+	// Embedded subobject — scratch-pad module, event script, simulation-stage script.
+	// It has no package of its own, so the only way to persist it is to save the package
+	// under its real top-level asset.
+	UObject* TopLevel = Pkg->FindAssetInPackage(RF_Public | RF_Standalone);
+	if (!TopLevel)
+	{
+		OutError = FString::Printf(
+			TEXT("'%s' is not its package's top-level asset, and package '%s' contains no RF_Public|RF_Standalone asset to save under. Refusing: handing a subobject to SavePackage as the saved asset trips the engine's data-loss check."),
+			*Object->GetPathName(), *Pkg->GetName());
+		return false;
+	}
+
+	OutPackage = Pkg;
+	OutAsset = TopLevel;
+	bOutEmbedded = (TopLevel != Object);
+	return true;
+}
+
+// Mark dirty + save. NEVER fatal: a save failure is reported, not asserted.
+static FMonolithSaveOutcome NA_SaveObjectPackage(UObject* Object)
+{
+	FMonolithSaveOutcome Outcome;
+
+	UPackage* Pkg = nullptr;
+	UObject* Asset = nullptr;
+	FString PackageFilename;
+	if (!NA_ResolveSaveTarget(Object, Pkg, Asset, Outcome.bEmbedded, PackageFilename, Outcome.Error))
+	{
+		UE_LOG(LogMonolithNiagara, Warning, TEXT("Package save skipped: %s"), *Outcome.Error);
+		return Outcome;
+	}
+
+	Outcome.PackageName = Pkg->GetName();
+	Outcome.SavedAssetPath = Asset->GetPathName();
+
+	Pkg->MarkPackageDirty();
+
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	// Deliberately NOT GError — see the header comment; GError is the FATAL device.
+	SaveArgs.Error = GLog;
+	Outcome.bSaved = UPackage::SavePackage(Pkg, Asset, *PackageFilename, SaveArgs);
+
+	if (!Outcome.bSaved)
+	{
+		Outcome.Error = FString::Printf(
+			TEXT("SavePackage failed for package '%s' (asset '%s'). The change is applied in memory and the package is left dirty — save it from the editor or investigate the log."),
+			*Outcome.PackageName, *Outcome.SavedAssetPath);
+		UE_LOG(LogMonolithNiagara, Warning, TEXT("%s"), *Outcome.Error);
+	}
+	else if (Outcome.bEmbedded)
+	{
+		UE_LOG(LogMonolithNiagara, Warning,
+			TEXT("'%s' is embedded in package '%s'; saved the owning asset '%s' instead. This also writes any other unsaved changes in that package."),
+			*Object->GetPathName(), *Outcome.PackageName, *Outcome.SavedAssetPath);
+	}
+
+	return Outcome;
+}
+
+// Merge save reporting into an action response, so an embedded save is never silent.
+static void NA_ReportSave(const TSharedRef<FJsonObject>& R, const FMonolithSaveOutcome& Outcome, const FString& RequestedPath)
+{
+	R->SetBoolField(TEXT("saved"), Outcome.bSaved);
+	if (!Outcome.SavedAssetPath.IsEmpty()) R->SetStringField(TEXT("saved_asset"), Outcome.SavedAssetPath);
+	if (Outcome.bEmbedded)
+	{
+		R->SetBoolField(TEXT("embedded"), true);
+		R->SetStringField(TEXT("save_note"), FString::Printf(
+			TEXT("'%s' is EMBEDDED (scratch-pad / event / sim-stage script), not its own asset, so it cannot be saved on its own. The owning asset '%s' was saved instead, which also writes any other unsaved changes in that package."),
+			*RequestedPath, *Outcome.SavedAssetPath));
+	}
+	if (!Outcome.bSaved && !Outcome.Error.IsEmpty()) R->SetStringField(TEXT("save_error"), Outcome.Error);
+}
+
 namespace
 {
 	enum class EMonolithSemanticDetailLevel
@@ -3190,7 +3349,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("hlsl_usage"), TEXT("string"), TEXT("For node_type=custom_hlsl: module (default) | function. Module usage adds the ParameterMap flow pins that let the node splice into a module's map chain; use function only inside function scripts."))
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Display name for node_type=custom_hlsl (default 'CustomHlsl')"))
 			.Optional(TEXT("input_name"), TEXT("string"), TEXT("Parameter name for node_type=input, or the switch parameter name for node_type=static_switch"))
-			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Niagara type for node_type=input (float, int, bool, vec3, position, ...). A DATA INTERFACE type is accepted but the resulting node is NOT stack-assignable — set_module_input_di cannot see Input-node DIs, because stack inputs are built from `Module.*` ParameterMapGet reads. Fine for a DI used only inside the script; if the stack must set it, expose `Module.<Name>` via add_map_parameter_pin instead. The response carries a warning when this applies."))
 			.Optional(TEXT("exposed"), TEXT("bool"), TEXT("node_type=input: expose this input to the calling node (default TRUE). Turn off for inputs that exist only inside the script."))
 			.Optional(TEXT("required"), TEXT("bool"), TEXT("node_type=input: caller MUST bind it (default FALSE — deliberately NOT the engine's own default of true). A required, unbound input whose pin ignores default values — every data interface does — fails compilation with 'Required input X was not bound and could not be automatically bound'. Pass true only for function-script inputs you know every caller wires."))
 			.Optional(TEXT("can_auto_bind"), TEXT("bool"), TEXT("node_type=input: let the translator auto-bind this input to a matching system parameter or emitter attribute (default TRUE; the engine's own default is false). Never auto-binds to custom parameters."))
@@ -3200,6 +3359,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("convert_type"), TEXT("string"), TEXT("Type for convert_mode=break/make (e.g. vec3, vec4, quat, color)"))
 			.Optional(TEXT("swizzle"), TEXT("string"), TEXT("Component string for convert_mode=swizzle, 1-4 chars, e.g. 'xyz' or 'zx'"))
 			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("UEnum asset path when switch_type=enum"))
+			.Optional(TEXT("output_vars"), TEXT("array"), TEXT("For node_type=static_switch: [{name, type}] the variables this switch ROUTES — one case pin per variable per case, plus one output pin each. Omit and the switch is created with only an Add pin. THIS is how you get ParameterMap case pins ('parameter_map'): the Add pin cannot accept a parameter map at all, only value types. 'name' defaults to the type name, matching the engine's own 'NiagaraParameterMap if <case>' pins. Unknown types are refused, not silently turned into floats."))
+			.Optional(TEXT("option_count"), TEXT("integer"), TEXT("For node_type=static_switch with switch_type=integer: how many cases (>=2). Required alongside output_vars for integer switches — a new integer switch has no case count of its own, so its case pins would otherwise come out empty."))
 			.Optional(TEXT("position"), TEXT("array"), TEXT("Node position as [x, y] (default [0,0])"))
 			.Optional(TEXT("comment"), TEXT("string"), TEXT("Comment bubble text"))
 			.Build());
@@ -3920,12 +4081,12 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	// --- Phase 6B: Parameter Discovery (1 new) ---
-	Registry.RegisterAction(TEXT("niagara"), TEXT("get_available_parameters"), TEXT("List all parameters available for binding in a system (user, engine, particle, emitter, system attributes)"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_available_parameters"), TEXT("List all parameters available for binding in a system: the engine surface (user, engine, particle, emitter, system attributes) PLUS parameters written mid-stack by modules. Writer-derived entries carry writer_derived=true and written_by_module/owner/stage/stack_index, because such a parameter is only readable DOWNSTREAM of the module that writes it — a reader placed earlier gets the default (dead link). Entries with type 'unknown' are writer-derived: MapSet pin names carry no type, so confirm with get_module_graph if the type matters."),
 		FMonolithActionHandler::CreateStatic(&HandleGetAvailableParameters),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
-			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter name (to include particle/emitter-scoped attributes)"))
-			.Optional(TEXT("usage"), TEXT("string"), TEXT("Filter by context: user, engine, particle, emitter, system, or all (default: all)"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter name (to include particle/emitter-scoped attributes, and to restrict writer scanning to that emitter plus the system graph)"))
+			.Optional(TEXT("usage"), TEXT("string"), TEXT("Filter by context: user, engine, particle, emitter, system, or all (default: all). Writer-derived names outside those namespaces (Output.*, StackContext.*, Transient.*, Local.*) have scope 'other' and appear only under 'all'."))
 			.Build());
 
 	// --- Phase 6B: Preview (1 new, QoL params added Phase 9) ---
@@ -4209,7 +4370,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddEmitter(const TSharedPtr
 	{
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
+		SaveArgs.Error = GLog; // NOT GError — that is the FATAL device (see NA_SaveObjectPackage)
 		UPackage::SavePackage(SystemPkg, System, *PackageFilename, SaveArgs);
 	}
 
@@ -4509,7 +4670,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystem(const TSharedP
 	{
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
+		SaveArgs.Error = GLog; // NOT GError — that is the FATAL device (see NA_SaveObjectPackage)
 		UPackage::SavePackage(Pkg, NS, *PackageFilename, SaveArgs);
 	}
 
@@ -4562,7 +4723,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateStatelessEmitter(cons
 	{
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
+		SaveArgs.Error = GLog; // NOT GError — that is the FATAL device (see NA_SaveObjectPackage)
 		UPackage::SavePackage(Pkg, Emitter, *PackageFilename, SaveArgs);
 	}
 
@@ -6257,10 +6418,25 @@ static TArray<TSharedPtr<FJsonValue>> UsageBitmaskToStages(int32 Bitmask)
 // stacks, with writer attribution ("Owner/Usage/Module", "User", "engine_intrinsic").
 // Sources: module-script ParameterMapSet pins (alias-resolved per call), assignment
 // node targets, user parameters, engine intrinsics. Used by audit_stack_wiring,
-// list_stack_writers and trace_parameter_binding.
+// list_stack_writers, trace_parameter_binding and get_available_parameters.
+//
+// `ModuleWriters` carries the same information in structured form for the subset of
+// writers that are actual STACK MODULES — i.e. what gap #5 needs: which module wrote it,
+// in which owner/stage, and at what stack index. User parameters and engine intrinsics
+// deliberately do NOT appear there; they are not mid-stack writes.
+struct FMonolithModuleWriterRef
+{
+	FString Owner;       // "System" or the emitter name
+	FString Usage;       // ENiagaraScriptUsage name, e.g. "ParticleUpdateScript"
+	FString Module;      // the placed module's function name
+	int32   StackIndex = INDEX_NONE;  // 0-based position within that stage
+	FString Source;      // "Owner/Usage/Module" — matches the Writers attribution string
+};
+
 struct FMonolithStackWriterIndex
 {
 	TMap<FString, TArray<FString>> Writers;
+	TMap<FString, TArray<FMonolithModuleWriterRef>> ModuleWriters;
 	bool Contains(const FString& Name) const { return Writers.Contains(Name); }
 };
 
@@ -6269,6 +6445,18 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 	auto AddWriter = [&Out](const FString& Param, const FString& Source)
 	{
 		Out.Writers.FindOrAdd(Param).AddUnique(Source);
+	};
+
+	// Same attribution, plus the structured stack position. Used only on the module paths.
+	auto AddModuleWriter = [&Out, &AddWriter](const FString& Param, const FMonolithModuleWriterRef& Ref)
+	{
+		AddWriter(Param, Ref.Source);
+		TArray<FMonolithModuleWriterRef>& Refs = Out.ModuleWriters.FindOrAdd(Param);
+		for (const FMonolithModuleWriterRef& Existing : Refs)
+		{
+			if (Existing.Source == Ref.Source && Existing.StackIndex == Ref.StackIndex) return;
+		}
+		Refs.Add(Ref);
 	};
 
 	// User parameters
@@ -6332,11 +6520,21 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 
 			TArray<UNiagaraNodeFunctionCall*> Modules;
 			MonolithNiagaraHelpers::GetOrderedModuleNodes(*OutNode, Modules);
-			for (UNiagaraNodeFunctionCall* MNode : Modules)
+			// GetOrderedModuleNodes walks the map chain back from the Output node and Inserts at
+			// 0, so the array is already in stack order — the index IS the stack position.
+			for (int32 StackIndex = 0; StackIndex < Modules.Num(); ++StackIndex)
 			{
+				UNiagaraNodeFunctionCall* MNode = Modules[StackIndex];
 				if (!MNode) continue;
 				const FString CallName = MNode->GetFunctionName();
 				const FString Source = FString::Printf(TEXT("%s/%s/%s"), *GE.OwnerName, *UsageStr, *CallName);
+
+				FMonolithModuleWriterRef Ref;
+				Ref.Owner = GE.OwnerName;
+				Ref.Usage = UsageStr;
+				Ref.Module = CallName;
+				Ref.StackIndex = StackIndex;
+				Ref.Source = Source;
 
 				// Assignment nodes (Set Parameter): targets are full parameter names
 				if (MNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeAssignment")))
@@ -6351,7 +6549,7 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 								for (int32 i = 0; i < AH.Num(); ++i)
 								{
 									const FNiagaraVariableBase* Var = reinterpret_cast<const FNiagaraVariableBase*>(AH.GetRawPtr(i));
-									if (Var) AddWriter(Var->GetName().ToString(), Source);
+									if (Var) AddModuleWriter(Var->GetName().ToString(), Ref);
 								}
 							}
 						}
@@ -6375,7 +6573,7 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 
 						if (N.StartsWith(TEXT("Output.Module.")))
 						{
-							AddWriter(FString::Printf(TEXT("Output.%s.%s"), *CallName, *N.Mid(14)), Source);
+							AddModuleWriter(FString::Printf(TEXT("Output.%s.%s"), *CallName, *N.Mid(14)), Ref);
 						}
 						else if (N.StartsWith(TEXT("Module.")))
 						{
@@ -6383,13 +6581,13 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 						}
 						else if (N.StartsWith(TEXT("StackContext.")))
 						{
-							AddWriter(N, Source);
+							AddModuleWriter(N, Ref);
 							const TCHAR* Ctx = bSystemStage ? TEXT("System") : (bEmitterStage ? TEXT("Emitter") : TEXT("Particles"));
-							AddWriter(FString::Printf(TEXT("%s.%s"), Ctx, *N.Mid(13)), Source);
+							AddModuleWriter(FString::Printf(TEXT("%s.%s"), Ctx, *N.Mid(13)), Ref);
 						}
 						else
 						{
-							AddWriter(N, Source);
+							AddModuleWriter(N, Ref);
 						}
 					}
 				}
@@ -7035,16 +7233,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 
 	// === Register and save ===
 	FAssetRegistryModule::AssetCreated(Script);
-	Pkg->MarkPackageDirty();
-
-	FString PackageFilename;
-	if (FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
-	{
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
-		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
-	}
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
 
 	// === Build response ===
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -7064,6 +7253,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	if (StagesBitmask.IsSet())
 		Result->SetNumberField(TEXT("module_usage_bitmask"), StagesBitmask.GetValue());
 
+	NA_ReportSave(Result, SaveOutcome, Script->GetPathName());
 	return NA_SuccessObj(Result);
 }
 
@@ -13292,7 +13482,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateNPC(const TSharedPtr<
 	{
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
+		SaveArgs.Error = GLog; // NOT GError — that is the FATAL device (see NA_SaveObjectPackage)
 		UPackage::SavePackage(Pkg, NPC, *PackageFilename, SaveArgs);
 	}
 
@@ -13650,7 +13840,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateEffectType(const TSha
 	{
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
+		SaveArgs.Error = GLog; // NOT GError — that is the FATAL device (see NA_SaveObjectPackage)
 		UPackage::SavePackage(Pkg, ET, *PackageFilename, SaveArgs);
 	}
 
@@ -13989,8 +14179,101 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetAvailableParameters(cons
 		}
 	}
 
+	// --- Writer-derived parameters (gap #5) -------------------------------------
+	// The static tables above are the ENGINE's parameter surface. They say nothing about
+	// parameters a MODULE writes mid-stack (a scratch StepCounter's System.ExecuteGroup1-4,
+	// a Set-Parameter node's targets, any StackContext.* write). Historically this action
+	// listed only the static surface, so an agent that did not already know
+	// `list_stack_writers` exists would see a real parameter missing, conclude it does not
+	// exist, and either invent a duplicate or bind to a dead name — the I-4 dead-link trap.
+	//
+	// So: merge them in. STRICTLY ADDITIVE — the pre-existing entries above are neither
+	// dropped nor reordered, and every merged entry is tagged `writer_derived: true` plus
+	// the writing module and its stack position, so a caller can tell "the engine offers
+	// this here" from "some module in this system writes this somewhere".
+	// This whole block is read-only: BuildStackWriterIndex walks graphs and never mutates.
+	int32 MergedCount = 0;
+	{
+		FMonolithStackWriterIndex WriterIndex;
+		BuildStackWriterIndex(System, EmitterFilter, WriterIndex);
+
+		// Names already reported above win — do not disturb existing entries.
+		TSet<FString> ExistingNames;
+		for (const TSharedPtr<FJsonValue>& E : All)
+		{
+			if (E.IsValid() && E->AsObject().IsValid()) ExistingNames.Add(E->AsObject()->GetStringField(TEXT("name")));
+		}
+
+		// Namespace → the `scope`/`usage` bucket the caller filtered on. Anything outside the
+		// known namespaces (Output.*, StackContext.*, Transient.*, Local.*, …) is scope
+		// "other" and only surfaces under usage=all.
+		auto ScopeForName = [](const FString& N) -> FString
+		{
+			if (N.StartsWith(TEXT("User."))) return TEXT("user");
+			if (N.StartsWith(TEXT("Engine."))) return TEXT("engine");
+			if (N.StartsWith(TEXT("System."))) return TEXT("system");
+			if (N.StartsWith(TEXT("Emitter."))) return TEXT("emitter");
+			if (N.StartsWith(TEXT("Particles."))) return TEXT("particle");
+			return TEXT("other");
+		};
+
+		TArray<FString> WriterNames;
+		WriterIndex.ModuleWriters.GetKeys(WriterNames);
+		WriterNames.Sort();
+
+		for (const FString& Name : WriterNames)
+		{
+			if (ExistingNames.Contains(Name)) continue;
+
+			const FString Scope = ScopeForName(Name);
+			if (UsageFilter != TEXT("all") && UsageFilter != Scope) continue;
+
+			const TArray<FMonolithModuleWriterRef>& Refs = WriterIndex.ModuleWriters[Name];
+			if (Refs.Num() == 0) continue;
+
+			TSharedRef<FJsonObject> PO = MakeShared<FJsonObject>();
+			PO->SetStringField(TEXT("name"), Name);
+			// The writer index works from MapSet PIN NAMES, which carry no type information
+			// here, so be honest rather than guessing: read the type from the writing module's
+			// script with get_module_graph / get_module_script_inputs if it matters.
+			PO->SetStringField(TEXT("type"), TEXT("unknown"));
+			PO->SetStringField(TEXT("scope"), Scope);
+			PO->SetBoolField(TEXT("writer_derived"), true);
+
+			// Primary attribution on the entry itself, plus the full list for multi-writer
+			// parameters (which are worth noticing — two modules writing one name is usually
+			// either a deliberate override or a bug).
+			const FMonolithModuleWriterRef& First = Refs[0];
+			PO->SetStringField(TEXT("written_by_module"), First.Module);
+			PO->SetStringField(TEXT("written_by_owner"), First.Owner);
+			PO->SetStringField(TEXT("written_by_stage"), First.Usage);
+			PO->SetNumberField(TEXT("written_by_stack_index"), First.StackIndex);
+
+			TArray<TSharedPtr<FJsonValue>> WriterArr;
+			for (const FMonolithModuleWriterRef& Ref : Refs)
+			{
+				TSharedRef<FJsonObject> WO = MakeShared<FJsonObject>();
+				WO->SetStringField(TEXT("owner"), Ref.Owner);
+				WO->SetStringField(TEXT("stage"), Ref.Usage);
+				WO->SetStringField(TEXT("module"), Ref.Module);
+				WO->SetNumberField(TEXT("stack_index"), Ref.StackIndex);
+				WO->SetStringField(TEXT("source"), Ref.Source);
+				WriterArr.Add(MakeShared<FJsonValueObject>(WO));
+			}
+			PO->SetArrayField(TEXT("written_by"), WriterArr);
+
+			PO->SetStringField(TEXT("note"), FString::Printf(
+				TEXT("Written mid-stack by module '%s' at %s/%s index %d. It is only readable DOWNSTREAM of that module — a module placed before it reads the default, not this value (invariant I-1/I-4)."),
+				*First.Module, *First.Owner, *First.Usage, First.StackIndex));
+
+			All.Add(MakeShared<FJsonValueObject>(PO));
+			++MergedCount;
+		}
+	}
+
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetNumberField(TEXT("count"), All.Num());
+	R->SetNumberField(TEXT("writer_derived_count"), MergedCount);
 	R->SetArrayField(TEXT("parameters"), All);
 	return NA_SuccessObj(R);
 }
@@ -15252,6 +15535,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSaveEmitterAsTemplate(const
 
 	FSavePackageArgs SaveArgs;
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	SaveArgs.Error = GLog; // the default is GError, which is FATAL (see NA_SaveObjectPackage)
 	bool bSaved = UPackage::SavePackage(NewPackage, NewEmitter, *PackageFilename, SaveArgs);
 
 	if (!bSaved)
@@ -15455,16 +15739,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSaveSystem(const TSharedPtr
 		return NA_SuccessObj(ResultJson);
 	}
 
-	FString PackageFilename = FPackageName::LongPackageNameToFilename(Pkg->GetName(), FPackageName::GetAssetPackageExtension());
-	FSavePackageArgs SaveArgs;
-	SaveArgs.TopLevelFlags = RF_Standalone;
-	bool bSaved = UPackage::SavePackage(Pkg, LoadedAsset, *PackageFilename, SaveArgs);
+	// Shared tail: an embedded path (e.g. "NS_X.NS_X:ScratchModule") resolves to a SUBOBJECT,
+	// which the old code handed straight to SavePackage as InAsset — the engine's data-loss
+	// check then fired through GError and killed the editor. The helper substitutes the
+	// package's real top-level asset and never uses the fatal error device.
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(LoadedAsset);
 
-	auto ResultJson = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
-	ResultJson->SetBoolField(TEXT("saved"), bSaved);
 	ResultJson->SetBoolField(TEXT("was_dirty"), bWasDirty);
 	ResultJson->SetStringField(TEXT("asset_class"), LoadedAsset->GetClass()->GetName());
+	NA_ReportSave(ResultJson, SaveOutcome, AssetPath);
 	return NA_SuccessObj(ResultJson);
 }
 
@@ -17465,8 +17750,14 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptMetadata(const TSh
 	FVersionedNiagaraScriptData* SD = Script->GetLatestScriptData();
 	if (!SD) return FMonolithActionResult::Error(TEXT("Script has no versioned script data"));
 
+	// --- Phase 1: parse and validate EVERYTHING before touching the script.
+	// Ordering rule from gap #26b: a refusal must dirty nothing. The old code mutated first
+	// and saved afterwards, so a save-time failure left the change half-applied — and, on an
+	// embedded script path, took the editor (and all unsaved state) with it.
 	TArray<FString> Applied;
-	Script->Modify();
+	TOptional<int32> NewBitmask;
+	TOptional<FText> NewCategory, NewDescription, NewKeywords, NewDebugDrawMessage;
+	TOptional<bool> NewSuggested, NewExperimental, NewDeprecated;
 
 	if (Params->HasField(TEXT("stages")))
 	{
@@ -17477,74 +17768,91 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptMetadata(const TSh
 			FString StageError;
 			if (!ParseStagesToUsageBitmask(*StagesArr, Bitmask, StageError))
 				return FMonolithActionResult::Error(StageError);
-			SD->ModuleUsageBitmask = Bitmask;
+			NewBitmask = Bitmask;
 			Applied.Add(FString::Printf(TEXT("module_usage_bitmask=%d"), Bitmask));
 		}
 	}
 	else if (Params->HasField(TEXT("usage_bitmask")))
 	{
-		SD->ModuleUsageBitmask = static_cast<int32>(Params->GetNumberField(TEXT("usage_bitmask")));
-		Applied.Add(FString::Printf(TEXT("module_usage_bitmask=%d"), SD->ModuleUsageBitmask));
+		NewBitmask = static_cast<int32>(Params->GetNumberField(TEXT("usage_bitmask")));
+		Applied.Add(FString::Printf(TEXT("module_usage_bitmask=%d"), NewBitmask.GetValue()));
 	}
 
 	if (Params->HasField(TEXT("category")))
 	{
-		SD->Category = FText::FromString(Params->GetStringField(TEXT("category")));
+		NewCategory = FText::FromString(Params->GetStringField(TEXT("category")));
 		Applied.Add(TEXT("category"));
 	}
 	if (Params->HasField(TEXT("description")))
 	{
-		SD->Description = FText::FromString(Params->GetStringField(TEXT("description")));
+		NewDescription = FText::FromString(Params->GetStringField(TEXT("description")));
 		Applied.Add(TEXT("description"));
 	}
 	if (Params->HasField(TEXT("keywords")))
 	{
-		SD->Keywords = FText::FromString(Params->GetStringField(TEXT("keywords")));
+		NewKeywords = FText::FromString(Params->GetStringField(TEXT("keywords")));
 		Applied.Add(TEXT("keywords"));
 	}
 	if (Params->HasField(TEXT("debug_draw_message")))
 	{
 		// Tooltip shown on the stack's debug-visualization eye icon.
-		SD->DebugDrawMessage = FText::FromString(Params->GetStringField(TEXT("debug_draw_message")));
+		NewDebugDrawMessage = FText::FromString(Params->GetStringField(TEXT("debug_draw_message")));
 		Applied.Add(TEXT("debug_draw_message"));
 	}
 	if (Params->HasField(TEXT("suggested")))
 	{
-		SD->bSuggested = Params->GetBoolField(TEXT("suggested"));
+		NewSuggested = Params->GetBoolField(TEXT("suggested"));
 		Applied.Add(TEXT("suggested"));
 	}
 	if (Params->HasField(TEXT("experimental")))
 	{
-		SD->bExperimental = Params->GetBoolField(TEXT("experimental"));
+		NewExperimental = Params->GetBoolField(TEXT("experimental"));
 		Applied.Add(TEXT("experimental"));
 	}
 	if (Params->HasField(TEXT("deprecated")))
 	{
-		SD->bDeprecated = Params->GetBoolField(TEXT("deprecated"));
+		NewDeprecated = Params->GetBoolField(TEXT("deprecated"));
 		Applied.Add(TEXT("deprecated"));
 	}
 
 	if (Applied.Num() == 0)
 		return FMonolithActionResult::Error(TEXT("No metadata fields provided. Pass at least one of: stages, usage_bitmask, category, description, keywords, suggested, experimental, deprecated"));
 
-	Script->MarkPackageDirty();
-
-	// Save the package so the change survives without a manual save
-	FString PackageFilename;
-	UPackage* Pkg = Script->GetOutermost();
-	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	// Pre-flight the save target. Pure — nothing is dirtied. An embedded script (scratch pad,
+	// event script, sim-stage script) resolves to its OWNING asset here; a package with no
+	// savable top-level asset is refused now, while the script is still untouched.
 	{
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
-		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to edit '%s': the result could not be saved. %s"), *ScriptPath, *PreflightError));
+		}
 	}
+
+	// --- Phase 2: mutate.
+	Script->Modify();
+	if (NewBitmask.IsSet())           SD->ModuleUsageBitmask = NewBitmask.GetValue();
+	if (NewCategory.IsSet())          SD->Category = NewCategory.GetValue();
+	if (NewDescription.IsSet())       SD->Description = NewDescription.GetValue();
+	if (NewKeywords.IsSet())          SD->Keywords = NewKeywords.GetValue();
+	if (NewDebugDrawMessage.IsSet())  SD->DebugDrawMessage = NewDebugDrawMessage.GetValue();
+	if (NewSuggested.IsSet())         SD->bSuggested = NewSuggested.GetValue();
+	if (NewExperimental.IsSet())      SD->bExperimental = NewExperimental.GetValue();
+	if (NewDeprecated.IsSet())        SD->bDeprecated = NewDeprecated.GetValue();
+
+	// --- Phase 3: save (never fatal — see NA_SaveObjectPackage).
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("applied"), FString::Join(Applied, TEXT(", ")));
 	R->SetNumberField(TEXT("module_usage_bitmask"), SD->ModuleUsageBitmask);
 	R->SetArrayField(TEXT("stages"), UsageBitmaskToStages(SD->ModuleUsageBitmask));
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
 	return NA_SuccessObj(R);
 }
 
@@ -17854,6 +18162,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptVersion(const TSha
 	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
 
 	Script->CheckVersionDataAvailable();
+
+	// Pre-flight the save target before mutating (gap #26b ordering): a refusal dirties nothing.
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to version '%s': the result could not be saved. %s"), *ScriptPath, *PreflightError));
+		}
+	}
+
 	Script->Modify();
 	if (!Script->IsVersioningEnabled())
 	{
@@ -17882,16 +18204,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptVersion(const TSha
 		Script->ExposeVersion(NewGuid);
 	}
 
-	Script->MarkPackageDirty();
-	FString PackageFilename;
-	UPackage* Pkg = Script->GetOutermost();
-	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
-	{
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
-		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
-	}
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
@@ -17899,6 +18212,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddScriptVersion(const TSha
 	R->SetNumberField(TEXT("major"), Major);
 	R->SetNumberField(TEXT("minor"), Minor);
 	R->SetBoolField(TEXT("exposed"), bExpose);
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
 	return NA_SuccessObj(R);
 }
 
@@ -17936,6 +18250,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetExposedScriptVersion(con
 		return FMonolithActionResult::Error(TEXT("Provide either 'guid' or 'major'+'minor'"));
 	}
 
+	// Pre-flight the save target before mutating (gap #26b ordering): a refusal dirties nothing.
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to change the exposed version of '%s': the result could not be saved. %s"), *ScriptPath, *PreflightError));
+		}
+	}
+
 	Script->Modify();
 	Script->ExposeVersion(TargetGuid);
 
@@ -17945,21 +18272,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetExposedScriptVersion(con
 		return FMonolithActionResult::Error(TEXT("ExposeVersion had no effect — guid not found in the script's version data"));
 	}
 
-	Script->MarkPackageDirty();
-	FString PackageFilename;
-	UPackage* Pkg = Script->GetOutermost();
-	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
-	{
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
-		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
-	}
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("exposed_guid"), TargetGuid.ToString());
 	R->SetStringField(TEXT("exposed_version"), FString::Printf(TEXT("%d.%d"), NowExposed.MajorVersion, NowExposed.MinorVersion));
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
 	return NA_SuccessObj(R);
 }
 
@@ -17997,27 +18316,32 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNodeComment(const TShare
 		? Params->GetBoolField(TEXT("bubble_visible"))
 		: !Comment.IsEmpty();
 
+	// Pre-flight the save target before mutating (gap #26b ordering): a refusal dirties nothing.
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to edit '%s': the result could not be saved. %s"), *ScriptPath, *PreflightError));
+		}
+	}
+
 	Target->Modify();
 	Target->NodeComment = Comment;
 	Target->bCommentBubbleVisible = bVisible;
 	Target->bCommentBubblePinned = bVisible;
 
-	Script->MarkPackageDirty();
-	FString PackageFilename;
-	UPackage* Pkg = Script->GetOutermost();
-	if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
-	{
-		FSavePackageArgs SaveArgs;
-		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-		SaveArgs.Error = GError;
-		UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
-	}
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("node"), Target->GetName());
 	R->SetStringField(TEXT("comment"), Comment);
 	R->SetBoolField(TEXT("bubble_visible"), bVisible);
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
 	return NA_SuccessObj(R);
 }
 
@@ -18129,18 +18453,13 @@ namespace MonolithNiagaraGraphAuthoring
 		Node->AllocateDefaultPins();
 	}
 
-	static void SavePackageFor(UNiagaraScript* Script)
+	// Routed through the shared tail: picks the correct InAsset for embedded (scratch-pad /
+	// event / sim-stage) scripts and never uses GError, so a save problem is logged and
+	// reported rather than crashing the editor. Returns the outcome for callers that want
+	// to surface it; existing call sites may discard it.
+	static FMonolithSaveOutcome SavePackageFor(UNiagaraScript* Script)
 	{
-		Script->MarkPackageDirty();
-		FString PackageFilename;
-		UPackage* Pkg = Script->GetOutermost();
-		if (Pkg && FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
-		{
-			FSavePackageArgs SaveArgs;
-			SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-			SaveArgs.Error = GError;
-			UPackage::SavePackage(Pkg, Script, *PackageFilename, SaveArgs);
-		}
+		return NA_SaveObjectPackage(Script);
 	}
 
 	static TSharedRef<FJsonObject> DescribePin(const UEdGraphPin* Pin, int32 IndexInDirection)
@@ -18191,6 +18510,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 
 	UEdGraphNode* NewNode = nullptr;
 	FString CreateError;
+	// Non-fatal advisories collected during construction and echoed in the response.
+	TArray<FString> Warnings;
 
 	if (NodeType == TEXT("op"))
 	{
@@ -18284,6 +18605,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		InNode->ExposureOptions.bRequired    = GetOptionalBool(TEXT("required"), false) ? 1u : 0u;
 		InNode->ExposureOptions.bCanAutoBind = GetOptionalBool(TEXT("can_auto_bind"), true) ? 1u : 0u;
 		InNode->ExposureOptions.bHidden      = GetOptionalBool(TEXT("hidden"), false) ? 1u : 0u;
+
+		// Gap #25, remaining half — architecturally unfixable, so SAY SO rather than leave it
+		// in a doc nobody reads mid-task. The exposure flags above fix the hard compile failure
+		// ("Required input X was not bound…"), and that is as far as it goes: a stack function
+		// input is built from the called script's `Module.*` ParameterMapGet READS, never from
+		// UNiagaraNodeInput nodes, so no combination of exposure flags can make an Input-node DI
+		// visible to set_module_input_di. Verified 2026-08-08 on NM_Test_DIInput: 0 compile
+		// errors with the new defaults, yet set_module_input_di still answered
+		// "Input 'OptDI' not found … Valid inputs: [InScale]".
+		// WARN ONLY, never refuse: a DI wired entirely inside one module (its own DebugDraw,
+		// say) is a legitimate and common use.
+		if (TypeDef.IsDataInterface())
+		{
+			Warnings.Add(FString::Printf(
+				TEXT("'%s' is a DATA INTERFACE input node, so it will NOT be stack-assignable: set_module_input_di cannot see it, because stack function inputs come from `Module.*` ParameterMapGet reads, not from Input nodes. This is fine if the DI is wired entirely inside this script. If it must be assignable from the stack, delete this node and expose the DI through the parameter map instead — add_map_parameter_pin on a ParameterMapGet for `Module.%s` (the route the stock ShapeLocation uses for `Module.Lathe Profile`), then set_module_input_di works normally."),
+				*InName, *InName));
+		}
 
 		Creator.Finalize();
 		NewNode = InNode;
@@ -18471,6 +18809,193 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 			GEditor->EndTransaction();
 			return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown switch_type '%s' (bool | integer | enum)"), *SwitchType));
 		}
+
+		// --- option_count: an INTEGER switch has no cases at all without it ------------------
+		// GetOptionValues (NiagaraNodeStaticSwitch.cpp:226-244) derives an integer switch's case
+		// list from NumOptionsPerVariable, which is 0 on a fresh node — so a programmatically
+		// created integer switch produces zero case pins however many OutputVars it has, and
+		// set_static_switch_value cannot bound-check it either (gap #27). AllocateDefaultPins
+		// READS GetOptionValues() before overwriting NumOptionsPerVariable with its length
+		// (:520-521), so seeding the field here is what gives the node its cases.
+		// NumOptionsPerVariable is protected on UNiagaraNodeUsageSelector (:88) and the class is
+		// MinimalAPI, so it goes in by reflection — same technique the switch-value bound check
+		// already uses.
+		if (Params->HasField(TEXT("option_count")))
+		{
+			const int32 OptionCount = static_cast<int32>(Params->GetNumberField(TEXT("option_count")));
+			if (N->SwitchTypeData.SwitchType != ENiagaraStaticSwitchType::Integer)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT(
+					"'option_count' only applies to switch_type=integer — bool and enum switches derive "
+					"their cases from the type itself."));
+			}
+			if (OptionCount < 2)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT("'option_count' must be at least 2"));
+			}
+			if (FIntProperty* CountProp = CastField<FIntProperty>(N->GetClass()->FindPropertyByName(TEXT("NumOptionsPerVariable"))))
+			{
+				CountProp->SetPropertyValue_InContainer(N, OptionCount);
+			}
+			else
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT(
+					"UNiagaraNodeUsageSelector::NumOptionsPerVariable not found by reflection — engine layout changed."));
+			}
+		}
+
+		// --- output_vars: the variables this switch ROUTES, one case pin each (gap #24) ------
+		// A static switch's case pins are NOT grown through the Add pin.
+		// UNiagaraNodeStaticSwitch::AllocateDefaultPins (NiagaraNodeStaticSwitch.cpp:520-547)
+		// builds them as the cross product GetOptionValues() x OutputVars, and OutputVars is empty
+		// on a fresh node — which is why a switch created here comes up with nothing but an Add
+		// pin. For a ParameterMap case the Add-pin route is not merely unused but impossible: the
+		// add-pin CanConnect lambda ends with
+		//     && PinToTypeDefinition(DestPin) != FNiagaraTypeDefinition::GetParameterMapDef()
+		// (EdGraphSchema_Niagara.cpp:1233-1241), even though the node itself explicitly allows
+		// parameter maps (AllowNiagaraTypeForAddPin, NiagaraNodeStaticSwitch.cpp:555-559). That
+		// clause sits inside the PinCategoryMisc branch, i.e. it only ever fires when one side IS
+		// an Add pin — a real ParameterMap case pin, once allocated, connects through the ordinary
+		// PinCategoryType path like any other. (The editor's own UI reaches the same state the
+		// long way round: drop a value type on the Add pin, then change the pin's type via
+		// OnNewPinTypeRequested, NiagaraNodeUsageSelector.cpp:481-501.)
+		// OutputVars/OutputVarGuids are public UPROPERTYs (NiagaraNodeUsageSelector.h:14-18); the
+		// helper that fills them, UNiagaraNodeUsageSelector::AddOutput, is a non-exported member of
+		// a MinimalAPI class, so its two lines are inlined here (NiagaraNodeUsageSelector.cpp:503-510).
+		// Everything is set BEFORE FinalizeSpawnedNode so the engine's own AllocateDefaultPins
+		// allocates the pins; no reallocation call is needed.
+		if (Params->HasField(TEXT("output_vars")))
+		{
+			// Same MCP tolerance as the custom_hlsl pin arrays: the array itself may arrive
+			// string-serialized, and so may each element.
+			TArray<TSharedPtr<FJsonValue>> VarsArr;
+			{
+				const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
+				if (Params->TryGetArrayField(TEXT("output_vars"), ArrPtr) && ArrPtr)
+				{
+					VarsArr = *ArrPtr;
+				}
+				else
+				{
+					const FString Str = Params->GetStringField(TEXT("output_vars"));
+					if (!Str.IsEmpty())
+					{
+						TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Str);
+						FJsonSerializer::Deserialize(Reader, VarsArr);
+					}
+				}
+			}
+			if (VarsArr.Num() == 0)
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT(
+					"'output_vars' must be a non-empty array of {name, type} objects (a bare type string is also accepted)"));
+			}
+
+			// Refuse rather than silently produce a switch with zero case pins.
+			if (N->SwitchTypeData.SwitchType == ENiagaraStaticSwitchType::Integer
+				&& !Params->HasField(TEXT("option_count")))
+			{
+				Graph->RemoveNode(N);
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(TEXT(
+					"switch_type=integer with 'output_vars' also needs 'option_count' — an integer switch's "
+					"case count comes from NumOptionsPerVariable, which is 0 on a new node, so the case pins "
+					"would come out empty."));
+			}
+
+			TArray<FName> UsedNames;
+			for (const TSharedPtr<FJsonValue>& V : VarsArr)
+			{
+				FString TypeStr, NameStr;
+				// AsObjectOrParseString returns a VALID-but-EMPTY object for a plain string
+				// (AsObject() on FJsonValueString does that), so the emptiness check is what
+				// distinguishes a real {name,type} entry from a bare type string.
+				const TSharedPtr<FJsonObject> VO = AsObjectOrParseString(V);
+				if (VO.IsValid() && VO->Values.Num() > 0)
+				{
+					TypeStr = VO->HasField(TEXT("type")) ? VO->GetStringField(TEXT("type")) : FString();
+					NameStr = VO->HasField(TEXT("name")) ? VO->GetStringField(TEXT("name")) : FString();
+				}
+				else if (V.IsValid() && V->Type == EJson::String)
+				{
+					// A bare type string, e.g. "parameter_map".
+					TypeStr = V->AsString();
+				}
+
+				if (TypeStr.IsEmpty())
+				{
+					Graph->RemoveNode(N);
+					GEditor->EndTransaction();
+					return FMonolithActionResult::Error(TEXT(
+						"Every 'output_vars' entry needs a 'type' (e.g. 'parameter_map', 'float', 'vec3')"));
+				}
+
+				// ResolveNiagaraType knows nothing about parameter maps and would fall back to
+				// float — the one type this parameter exists for — so resolve that case here.
+				FNiagaraTypeDefinition VarType;
+				const FString TypeLower = TypeStr.ToLower();
+				if (TypeLower == TEXT("parameter_map") || TypeLower == TEXT("parametermap")
+					|| TypeLower == TEXT("niagaraparametermap") || TypeLower == TEXT("map"))
+				{
+					VarType = FNiagaraTypeDefinition::GetParameterMapDef();
+				}
+				else
+				{
+					bool bVarTypeFellBack = false;
+					VarType = ResolveNiagaraType(TypeStr, &bVarTypeFellBack);
+					if (bVarTypeFellBack)
+					{
+						Graph->RemoveNode(N);
+						GEditor->EndTransaction();
+						return FMonolithActionResult::Error(FString::Printf(TEXT(
+							"output_vars: unknown type '%s'. Refusing rather than silently creating float case pins."),
+							*TypeStr));
+					}
+				}
+
+				// Mirror of UNiagaraNodeStaticSwitch::AllowNiagaraTypeForAddPin
+				// (NiagaraNodeStaticSwitch.cpp:555-559) — the node's own admission rule, which
+				// deliberately DOES permit parameter maps. Re-derived inline rather than called:
+				// the class is MinimalAPI, so a devirtualized call would not link.
+				if (VarType.GetScriptStruct() == nullptr || VarType.IsInternalType())
+				{
+					Graph->RemoveNode(N);
+					GEditor->EndTransaction();
+					return FMonolithActionResult::Error(FString::Printf(TEXT(
+						"output_vars: type '%s' is not valid for a static switch case (the node rejects "
+						"internal and non-struct types)."), *TypeStr));
+				}
+
+				// The engine names an Add-pin-created output var after its type
+				// (NiagaraNodeUsageSelector.cpp:536), which is where the stock
+				// "NiagaraParameterMap if <case>" pin names come from. Match that default, and
+				// keep names unique inside this request so the case pins stay distinguishable.
+				FName VarName = NameStr.IsEmpty() ? VarType.GetFName() : FName(*NameStr);
+				if (UsedNames.Contains(VarName))
+				{
+					const FString Base = VarName.ToString();
+					for (int32 Suffix = 1; Suffix < 1000; ++Suffix)
+					{
+						const FName Candidate(*FString::Printf(TEXT("%s%03d"), *Base, Suffix));
+						if (!UsedNames.Contains(Candidate)) { VarName = Candidate; break; }
+					}
+				}
+				UsedNames.Add(VarName);
+
+				// Inline UNiagaraNodeUsageSelector::AddOutput (not exported).
+				N->OutputVars.Add(FNiagaraVariable(VarType, VarName));
+				N->OutputVarGuids.Add(FGuid::NewGuid());
+			}
+		}
+
 		FinalizeSpawnedNode(N);
 		NewNode = N;
 	}
@@ -18623,6 +19148,37 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 	R->SetStringField(TEXT("title"), NewNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 	R->SetNumberField(TEXT("pin_count"), PinsArr.Num());
 	R->SetArrayField(TEXT("pins"), PinsArr);
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		for (const FString& W : Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
+		R->SetArrayField(TEXT("warnings"), WarnArr);
+	}
+#if WITH_NIAGARA_WIZARD_PRIVATE
+	// Echo back what the switch actually ended up routing, read off the node rather than off the
+	// request, so "I asked for a ParameterMap case" and "the node has one" are separately checkable.
+	if (UNiagaraNodeStaticSwitch* SwitchNode = Cast<UNiagaraNodeStaticSwitch>(NewNode))
+	{
+		TArray<TSharedPtr<FJsonValue>> OutVarsArr;
+		for (const FNiagaraVariable& Var : SwitchNode->OutputVars)
+		{
+			TSharedRef<FJsonObject> VO = MakeShared<FJsonObject>();
+			VO->SetStringField(TEXT("name"), Var.GetName().ToString());
+			VO->SetStringField(TEXT("type"), Var.GetType().IsValid() ? Var.GetType().GetName() : TEXT("<unresolved>"));
+			OutVarsArr.Add(MakeShared<FJsonValueObject>(VO));
+		}
+		R->SetArrayField(TEXT("output_vars"), OutVarsArr);
+		// AllocateDefaultPins leaves NumOptionsPerVariable == GetOptionValues().Num()
+		// (NiagaraNodeStaticSwitch.cpp:520-521), so read the field rather than call the getter:
+		// it is a non-exported virtual on a MinimalAPI class, and a devirtualized call would not link.
+		if (FIntProperty* CountProp = CastField<FIntProperty>(SwitchNode->GetClass()->FindPropertyByName(TEXT("NumOptionsPerVariable"))))
+		{
+			const int32 CaseCount = CountProp->GetPropertyValue_InContainer(SwitchNode);
+			R->SetNumberField(TEXT("case_count"), CaseCount);
+			R->SetNumberField(TEXT("expected_case_pins"), CaseCount * SwitchNode->OutputVars.Num());
+		}
+	}
+#endif
 	return NA_SuccessObj(R);
 }
 
@@ -19104,6 +19660,24 @@ namespace MonolithNiagaraParamPins
 		return ToRemove.Num();
 	}
 
+	/**
+	 * The ONE type-mismatch refusal, shared by every path that finds an existing carrier of
+	 * the requested name — the script-variable registry (existing=true) or a live pin on the
+	 * node (the reuse short-circuit). Both are the same rule the editor enforces in
+	 * UNiagaraNodeParameterMapGet::VerifyEditablePinName (NiagaraNodeParameterMapGet.cpp:76-89):
+	 * a pin may only reference a parameter of the SAME type. Carrier says WHERE the existing
+	 * type was read from, so the caller knows what to go look at.
+	 */
+	static FString TypeMismatchError(const FString& ParamName, const FNiagaraTypeDefinition& ActualType,
+		const FNiagaraTypeDefinition& RequestedType, const FString& Carrier)
+	{
+		return FString::Printf(
+			TEXT("'%s' already exists with type '%s' (%s); you asked for '%s'. A pin of a different type cannot "
+			     "reference it — this is the same rule the editor enforces in "
+			     "UNiagaraNodeParameterMapGet::VerifyEditablePinName. NOTHING WAS CHANGED."),
+			*ParamName, *ActualType.GetName(), *Carrier, *RequestedType.GetName());
+	}
+
 	/** The advice string every dead-read refusal ends with (invariant I-16). */
 	static const TCHAR* ReadIdiomHint =
 		TEXT("Better idiom: wire from a ParameterMapGet output pin the graph ALREADY has — engine modules "
@@ -19148,18 +19722,31 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	// --- Case 1: this node already carries the pin. Hand it back, change nothing. ------
 	// Idempotent, and it is the answer the caller actually wants: that pin IS the
 	// parameter, whereas anything new would be a duplicate at best.
+	//
+	// The name match is NOT enough (gap #28): matching on name alone and echoing back the
+	// REQUESTED type reports a lie — asking for 'Module.Amount' as vec3 answered
+	// {"reused": true, "type": "Vector3f"} while the pin was still NiagaraFloat. Type-check
+	// first, and answer with the type read off the PIN, never off the request.
 	if (UEdGraphPin* Reused = FindPinByName(Node, ParamName, PinDir))
 	{
+		const FNiagaraTypeDefinition ReusedType = UEdGraphSchema_Niagara::PinToTypeDefinition(Reused);
+		if (ReusedType != TypeDef)
+		{
+			return FMonolithActionResult::Error(TypeMismatchError(ParamName, ReusedType, TypeDef,
+				FString::Printf(TEXT("on this node as the %s pin '%s'"), *Kind, *Reused->PinName.ToString())));
+		}
+
 		TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("script_path"), ScriptPath);
 		R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 		R->SetStringField(TEXT("kind"), Kind);
 		R->SetStringField(TEXT("pin"), Reused->PinName.ToString());
 		R->SetStringField(TEXT("direction"), Reused->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
-		R->SetStringField(TEXT("type"), TypeDef.GetName());
+		R->SetStringField(TEXT("type"), ReusedType.GetName());
 		R->SetBoolField(TEXT("created"), false);
 		R->SetBoolField(TEXT("reused"), true);
-		R->SetStringField(TEXT("note"), TEXT("This node already had that pin — nothing was added. Connect from it directly."));
+		R->SetStringField(TEXT("note"), TEXT("This node already had that pin — nothing was added. Connect from it directly. "
+		                                     "'type' is read off the pin, not off the request."));
 		return NA_SuccessObj(R);
 	}
 
@@ -19192,11 +19779,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 		}
 		if (ExistingVar->Variable.GetType() != TypeDef)
 		{
-			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("'%s' already exists with type '%s'; you asked for '%s'. A pin of a different type cannot "
-				     "reference it — this is the same rule the editor enforces in "
-				     "UNiagaraNodeParameterMapGet::VerifyEditablePinName."),
-				*ParamName, *ExistingVar->Variable.GetType().GetName(), *TypeDef.GetName()));
+			return FMonolithActionResult::Error(TypeMismatchError(ParamName, ExistingVar->Variable.GetType(), TypeDef,
+				TEXT("in this script's parameter registry")));
 		}
 	}
 	else if (bNameTaken)
@@ -19307,7 +19891,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	R->SetStringField(TEXT("kind"), Kind);
 	R->SetStringField(TEXT("pin"), NewPin->PinName.ToString());
 	R->SetStringField(TEXT("direction"), NewPin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
-	R->SetStringField(TEXT("type"), TypeDef.GetName());
+	// Read the type back off the pin the engine actually built, never off the request
+	// (gap #28) — the request is what we asked for, the pin is what we got.
+	const FNiagaraTypeDefinition CreatedType = UEdGraphSchema_Niagara::PinToTypeDefinition(NewPin);
+	R->SetStringField(TEXT("type"), CreatedType.GetName());
+	if (CreatedType != TypeDef)
+	{
+		// Should not happen — the wizard utility builds the pin from TypeDef — but if it ever
+		// does, say so rather than papering over it: the name is right and the type is not.
+		R->SetStringField(TEXT("requested_type"), TypeDef.GetName());
+		R->SetStringField(TEXT("type_warning"), FString::Printf(
+			TEXT("The pin was created as '%s' although '%s' was requested — inspect it with list_graph_node_pins "
+			     "before wiring anything to it."), *CreatedType.GetName(), *TypeDef.GetName()));
+	}
 	R->SetBoolField(TEXT("created"), true);
 	R->SetBoolField(TEXT("reused"), false);
 	R->SetBoolField(TEXT("references_existing_parameter"), bExisting);
