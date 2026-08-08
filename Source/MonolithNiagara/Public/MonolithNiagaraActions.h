@@ -118,6 +118,7 @@ public:
 
 	// --- Wave 5: Dynamic Inputs (3 new) ---
 	static FMonolithActionResult HandleAddDynamicInput(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleInsertDynamicInput(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetDynamicInputValue(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSearchDynamicInputs(const TSharedPtr<FJsonObject>& Params);
 

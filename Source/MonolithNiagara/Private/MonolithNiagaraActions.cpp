@@ -2273,6 +2273,221 @@ namespace MonolithNiagaraHelpers
 		return true;
 	}
 
+	// ========================================================================
+	// Gap #31-E — literal validation for ORDINARY (non-switch) stack inputs.
+	//
+	// Same class as gap #27, one family over: set_module_input_value and its
+	// delegate set_dynamic_input_value parked ANY string on the override pin.
+	// "not_a_number" on a NiagaraInt32 and "hello" on a NiagaraFloat were both
+	// stored verbatim, read back verbatim, and compiled 0 errors / 0 warnings —
+	// a wrong runtime value with no signal anywhere.
+	//
+	// SCOPE IS DELIBERATELY NARROW: bool, int32 and float only. Those are the
+	// three types whose pin encoding is unambiguous and verifiable in engine
+	// source (LexToString(bool) / bare decimal / LexToString(float) —
+	// NiagaraBoolTypeEditorUtilities.cpp:74, NiagaraIntegerTypeEditorUtilities.cpp:243,
+	// NiagaraFloatTypeEditorUtilities.cpp:245). Every other type passes through
+	// untouched. In particular vectors/colors/quats are NOT validated here: the
+	// engine's pin encoding for them is "(X=%3.3f, Y=%3.3f, Z=%3.3f)"
+	// (NiagaraVectorTypeEditorUtilities.cpp:204/…), which is NOT the comma-joined
+	// form set_module_input_value currently writes — validating against either
+	// spelling would encode a guess. That mismatch is a separate open question.
+	// ========================================================================
+
+	/**
+	 * Checks a caller-supplied literal against the pin's ACTUAL Niagara type.
+	 * Returns false with a caller-facing message naming the valid form (the caller
+	 * prefixes it with the input name); on success OutNormalizedValue carries the
+	 * canonical pin encoding (bool spellings and integer floats are normalised, float
+	 * spellings are left alone so read-back still returns exactly what the caller wrote).
+	 */
+	bool ValidateStackInputLiteral(const FNiagaraTypeDefinition& InputType, const FString& RequestedValue,
+		FString& OutNormalizedValue, FString& OutError)
+	{
+		OutNormalizedValue = RequestedValue;
+		OutError.Reset();
+
+		const FString TypeName = InputType.GetName();
+
+		if (InputType.IsSameBaseDefinition(FNiagaraTypeDefinition::GetBoolDef()))
+		{
+			FString Resolved;
+			if (!ResolveStaticSwitchBoolValue(RequestedValue, Resolved))
+			{
+				OutError = FString::Printf(
+					TEXT("is %s and does not accept value '%s'. Valid options: [%s]. ")
+					TEXT("The engine's bool parser cannot reject anything — LexTryParseString(bool&) is a bare ")
+					TEXT("'return true' (UnrealString.h.inl:2245-2249) over FToBoolHelper's Atoi fallback — so an ")
+					TEXT("unrecognised string would be stored verbatim, behave as false, and compile clean. ")
+					TEXT("NOTHING WAS CHANGED."),
+					*TypeName, *RequestedValue, DescribeStaticSwitchBoolOptions());
+				return false;
+			}
+			OutNormalizedValue = Resolved;
+			return true;
+		}
+
+		if (InputType.IsSameBaseDefinition(FNiagaraTypeDefinition::GetIntDef()))
+		{
+			int32 Parsed = 0;
+			if (!ResolveStaticSwitchIntValue(RequestedValue, Parsed))
+			{
+				OutError = FString::Printf(
+					TEXT("is %s and does not accept value '%s' — it is not a whole number. ")
+					TEXT("Expected a bare decimal integer (the pin encoding is ")
+					TEXT("FNiagaraEditorIntegerTypeUtilities::GetPinDefaultStringFromValue, ")
+					TEXT("NiagaraIntegerTypeEditorUtilities.cpp:243). NOTHING WAS CHANGED."),
+					*TypeName, *RequestedValue);
+				return false;
+			}
+			// "5.000000" (what a JSON number stringifies to) becomes "5" — an int pin
+			// carrying a fractional spelling is not what the editor ever writes.
+			OutNormalizedValue = FString::FromInt(Parsed);
+			return true;
+		}
+
+		if (InputType.IsSameBaseDefinition(FNiagaraTypeDefinition::GetFloatDef()))
+		{
+			double Number = 0.0;
+			if (!TryParseStaticSwitchNumericLiteral(RequestedValue.TrimStartAndEnd(), Number))
+			{
+				OutError = FString::Printf(
+					TEXT("is %s and does not accept value '%s' — it is not a number. ")
+					TEXT("Expected a decimal literal (the pin encoding is LexToString(float), ")
+					TEXT("NiagaraFloatTypeEditorUtilities.cpp:245). NOTHING WAS CHANGED."),
+					*TypeName, *RequestedValue);
+				return false;
+			}
+			// Spelling is left exactly as given: any plain decimal already satisfies the
+			// pin encoding, and rewriting it would change what get_module_input_value and
+			// get_dynamic_input_value read back.
+			return true;
+		}
+
+		return true;
+	}
+
+	// ========================================================================
+	// Gap #31-C / #31-G — pre-flight checks for a script about to be attached as a
+	// dynamic input. Both refuse BEFORE any mutation (the #26b abort-before-transaction
+	// rule), because both failure modes are silent: a type mismatch compiles with at
+	// worst a translator truncation warning, and a MODULE-usage script attaches, compiles
+	// clean, and then cannot be removed by guid at all ("Could not find the override pin
+	// connected to this dynamic input") because it never gets a data output pin to trace.
+	// ========================================================================
+
+	/** Engine spelling of a script usage, for error messages. */
+	FString DescribeScriptUsage(ENiagaraScriptUsage Usage)
+	{
+		if (const UEnum* UsageEnum = StaticEnum<ENiagaraScriptUsage>())
+		{
+			return UsageEnum->GetNameStringByValue(static_cast<int64>(Usage));
+		}
+		return FString::Printf(TEXT("%d"), static_cast<int32>(Usage));
+	}
+
+	/**
+	 * The dynamic input script's OUTPUT type, resolved the way the editor's own picker
+	 * resolves it (UNiagaraStackFunctionInput::GetAvailableDynamicInputs' MatchesInputType,
+	 * NiagaraStackFunctionInput.cpp:2134-2151): a dynamic input has exactly ONE output node,
+	 * and the non-ParameterMap input pin on it is what the node emits.
+	 *
+	 * Returns false when the script does not have that shape. Callers must treat that as
+	 * "could not determine", NOT as "mismatched" — a false refusal is worse than the silent
+	 * truncation we are fixing.
+	 */
+	bool TryGetDynamicInputOutputType(UNiagaraScript* Script, FNiagaraTypeDefinition& OutType)
+	{
+		if (!Script) return false;
+
+		UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Script->GetLatestSource());
+		if (!Source || !Source->NodeGraph) return false;
+
+		TArray<UNiagaraNodeOutput*> OutputNodes;
+		Source->NodeGraph->GetNodesOfClass<UNiagaraNodeOutput>(OutputNodes);
+		if (OutputNodes.Num() != 1 || OutputNodes[0] == nullptr) return false;
+
+		const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+		int32 ValuePinCount = 0;
+		FNiagaraTypeDefinition Found;
+		for (UEdGraphPin* Pin : OutputNodes[0]->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Input) continue;
+			const FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
+			if (PinType == MapDef) continue;
+			Found = PinType;
+			++ValuePinCount;
+		}
+
+		if (ValuePinCount != 1 || !Found.IsValid()) return false;
+
+		OutType = Found;
+		return true;
+	}
+
+	/**
+	 * The two guards add_dynamic_input / insert_dynamic_input share. TargetInputType is the
+	 * type of the pin the script is about to drive. Returns false with a caller-facing message.
+	 */
+	bool ValidateDynamicInputScript(UNiagaraScript* Script, const FString& ScriptPath,
+		const FNiagaraTypeDefinition& TargetInputType, const FString& TargetInputName,
+		FNiagaraTypeDefinition& OutScriptOutputType, bool& bOutOutputTypeKnown, FString& OutError)
+	{
+		OutError.Reset();
+		bOutOutputTypeKnown = false;
+
+		if (!Script)
+		{
+			OutError = FString::Printf(TEXT("Failed to load dynamic input script: %s"), *ScriptPath);
+			return false;
+		}
+
+		// --- #31-G: usage ---
+		const ENiagaraScriptUsage ScriptUsage = Script->GetUsage();
+		if (ScriptUsage != ENiagaraScriptUsage::DynamicInput)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' has usage %s, not %s — it cannot be attached as a dynamic input. ")
+				TEXT("Attaching it anyway produces a node that compiles clean and then CANNOT BE REMOVED by guid ")
+				TEXT("(remove_dynamic_input reports 'Could not find the override pin connected to this dynamic input'), ")
+				TEXT("because a non-DynamicInput script has no single value output pin to trace back to the override pin. ")
+				TEXT("%sNOTHING WAS CHANGED."),
+				*ScriptPath,
+				*DescribeScriptUsage(ScriptUsage),
+				*DescribeScriptUsage(ENiagaraScriptUsage::DynamicInput),
+				ScriptUsage == ENiagaraScriptUsage::Module
+					? TEXT("To place a module in the stack use add_module instead. ")
+					: TEXT(""));
+			return false;
+		}
+
+		// --- #31-C: output type ---
+		FNiagaraTypeDefinition ScriptOutputType;
+		if (!TryGetDynamicInputOutputType(Script, ScriptOutputType))
+		{
+			// Shape we do not recognise — say nothing rather than refuse wrongly.
+			return true;
+		}
+
+		OutScriptOutputType = ScriptOutputType;
+		bOutOutputTypeKnown = true;
+
+		if (TargetInputType.IsValid() && !FNiagaraEditorUtilities::AreTypesAssignable(ScriptOutputType, TargetInputType))
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' outputs %s, which is not assignable to input '%s' (%s). ")
+				TEXT("The editor's own dynamic input picker applies exactly this rule ")
+				TEXT("(FNiagaraEditorUtilities::AreTypesAssignable, NiagaraCommon.cpp:1715) and would not offer this script here. ")
+				TEXT("Attaching it anyway compiles — a wider type is silently truncated by the VM translator ")
+				TEXT("('implicit truncation from vec3 to float') and a narrower one is silently widened. ")
+				TEXT("NOTHING WAS CHANGED."),
+				*ScriptPath, *ScriptOutputType.GetName(), *TargetInputName, *TargetInputType.GetName());
+			return false;
+		}
+
+		return true;
+	}
+
 	/**
 	 * How many integer cases a static switch offers, or INDEX_NONE when it cannot be
 	 * determined. The bound the compiler actually applies is
@@ -3798,16 +4013,29 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	// --- Wave 5: Dynamic Inputs (3 new) ---
-	Registry.RegisterAction(TEXT("niagara"), TEXT("add_dynamic_input"), TEXT("Attach a dynamic input script to a module input pin"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_dynamic_input"),
+		TEXT("Attach a dynamic input script to a module input pin. To CHAIN, pass a previous call's dynamic_input_node_guid back as module_node — it resolves any function-call node, not only stack modules. If the input already has a value chain this REPLACES it (same as the editor); the displaced nodes are deleted, not orphaned, and reported as 'displaced_chain'. Use insert_dynamic_input to wrap an existing chain instead of discarding it. Refuses a script whose usage is not DynamicInput, and a script whose output type is not assignable to the target input."),
 		FMonolithActionHandler::CreateStatic(&HandleAddDynamicInput),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID or name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID or name, or the GUID of a dynamic input node to nest under"))
 			.Required(TEXT("input"), TEXT("string"), TEXT("Target module input name"))
-			.Required(TEXT("dynamic_input_script"), TEXT("string"), TEXT("Asset path to the dynamic input script"))
+			.Required(TEXT("dynamic_input_script"), TEXT("string"), TEXT("Asset path to the dynamic input script (must have DynamicInput usage)"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("set_dynamic_input_value"), TEXT("Set an input value on a dynamic input node"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("insert_dynamic_input"),
+		TEXT("DISABLED — always refuses. Insert a dynamic input IN FRONT of the chain already on a module input. The move-based implementation spliced a cycle into the parameter map and killed the editor with EXCEPTION_STACK_OVERFLOW on its first real call, so this action now refuses and tells you the workaround: get_dynamic_input_tree, remove_dynamic_input, then add_dynamic_input outside-in. A capture -> remove -> recreate replacement exists behind an opt-in flag but has never been run; do not use it outside validation."),
+		FMonolithActionHandler::CreateStatic(&HandleInsertDynamicInput),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
+			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID or name, or the GUID of a dynamic input node"))
+			.Required(TEXT("input"), TEXT("string"), TEXT("Target input name — must already have a dynamic input attached"))
+			.Required(TEXT("dynamic_input_script"), TEXT("string"), TEXT("Asset path to the dynamic input script to insert (must have DynamicInput usage)"))
+			.Required(TEXT("into_input"), TEXT("string"), TEXT("Input on the NEW dynamic input that receives the existing chain"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_dynamic_input_value"),
+		TEXT("Set an input value on a dynamic input node, at any depth in a chain. Bool/int32/float values are validated against the pin's real type and refused if they do not parse — an unparseable literal used to be stored verbatim and compile clean."),
 		FMonolithActionHandler::CreateStatic(&HandleSetDynamicInputValue),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
@@ -3816,11 +4044,12 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("input"), TEXT("string"), TEXT("Input name on the dynamic input"))
 			.Required(TEXT("value"), TEXT("string"), TEXT("Value to set"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("search_dynamic_inputs"), TEXT("Browse available dynamic input scripts with optional type filtering"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("search_dynamic_inputs"),
+		TEXT("Browse available dynamic input scripts with optional type filtering. Finds every script with DynamicInput usage anywhere in the project or engine, including non-library ones — it is not restricted to /DynamicInputs/ folders. output_type is read off the script's output node, not guessed from its name."),
 		FMonolithActionHandler::CreateStatic(&HandleSearchDynamicInputs),
 		FParamSchemaBuilder()
 			.Optional(TEXT("query"), TEXT("string"), TEXT("Keyword search"))
-			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Filter by compatible output type (float, LinearColor, Vector)"))
+			.Optional(TEXT("input_type"), TEXT("string"), TEXT("Filter by output type; matched loosely against the engine spelling (float -> NiagaraFloat, vector -> Vector3f)"))
 			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max results (default: 20)"))
 			.Build());
 
@@ -3896,7 +4125,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("dynamic_input_node"), TEXT("string"), TEXT("GUID of the dynamic input node"))
 			.Required(TEXT("input"), TEXT("string"), TEXT("Input name on the dynamic input"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("get_dynamic_input_inputs"), TEXT("Discover inputs on an unattached dynamic input script"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_dynamic_input_inputs"),
+		TEXT("Discover the inputs, static switches, usage and output type of an unattached dynamic input script, without placing it."),
 		FMonolithActionHandler::CreateStatic(&HandleGetDynamicInputInputs),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Asset path to the dynamic input script"))
@@ -5780,50 +6010,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 		}
 	}
 
-	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModIn", "Set Module Input"));
-	System->Modify();
-
-	UEdGraphPin* TargetPin = nullptr;
-	if (bCustomHlslFallback)
-	{
-		// CustomHlsl fallback: set DefaultValue directly on the FunctionCall's typed input pin.
-		// No ParameterMapSet override node exists for these modules.
-		for (UEdGraphPin* Pin : MN->Pins)
-		{
-			if (Pin->Direction == EGPD_Input && Pin->PinName == MatchedFullName)
-			{
-				TargetPin = Pin;
-				break;
-			}
-		}
-		if (!TargetPin)
-		{
-			GEditor->EndTransaction();
-			return FMonolithActionResult::Error(TEXT("Failed to find pin on FunctionCall node"));
-		}
-		if (TargetPin->LinkedTo.Num() > 0)
-		{
-			TargetPin->BreakAllPinLinks();
-		}
-	}
-	else
-	{
-		// Standard path: use the ParameterMap override pin system
-		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-			FNiagaraParameterHandle(MatchedFullName), MN);
-
-		// UE 5.7 FIX: 5-param version of GetOrCreateStackFunctionInputOverridePin
-		UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
-			*MN, AH, InputType, FGuid(), FGuid());
-
-		// Guard: break existing links so the literal DefaultValue actually takes effect
-		if (OverridePin.LinkedTo.Num() > 0)
-		{
-			OverridePin.BreakAllPinLinks();
-		}
-		TargetPin = &OverridePin;
-	}
-
+	// ------------------------------------------------------------------------
+	// Resolve the literal and check it against the pin's real type BEFORE the
+	// transaction opens, so a rejected value cannot leave one open and cannot
+	// half-write (gap #26b's abort-before-transaction rule).
+	// Gap #31-E: this used to happen AFTER BeginTransaction and with no checking at
+	// all, so "hello" landed on a NiagaraFloat pin and compiled 0 errors / 0 warnings.
+	// ------------------------------------------------------------------------
 	FString ValStr;
 	if (JV->Type == EJson::Number) ValStr = FString::SanitizeFloat(JV->AsNumber());
 	else if (JV->Type == EJson::Boolean) ValStr = JV->AsBool() ? TEXT("true") : TEXT("false");
@@ -5877,6 +6070,61 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 		}
 	}
 	else ValStr = JsonValueToString(JV);
+
+	{
+		FString NormalizedValue;
+		FString ValueError;
+		if (!MonolithNiagaraHelpers::ValidateStackInputLiteral(InputType, ValStr, NormalizedValue, ValueError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' %s"), *InputName, *ValueError));
+		}
+		ValStr = NormalizedValue;
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModIn", "Set Module Input"));
+	System->Modify();
+
+	UEdGraphPin* TargetPin = nullptr;
+	if (bCustomHlslFallback)
+	{
+		// CustomHlsl fallback: set DefaultValue directly on the FunctionCall's typed input pin.
+		// No ParameterMapSet override node exists for these modules.
+		for (UEdGraphPin* Pin : MN->Pins)
+		{
+			if (Pin->Direction == EGPD_Input && Pin->PinName == MatchedFullName)
+			{
+				TargetPin = Pin;
+				break;
+			}
+		}
+		if (!TargetPin)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("Failed to find pin on FunctionCall node"));
+		}
+		if (TargetPin->LinkedTo.Num() > 0)
+		{
+			TargetPin->BreakAllPinLinks();
+		}
+	}
+	else
+	{
+		// Standard path: use the ParameterMap override pin system
+		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+			FNiagaraParameterHandle(MatchedFullName), MN);
+
+		// UE 5.7 FIX: 5-param version of GetOrCreateStackFunctionInputOverridePin
+		UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+			*MN, AH, InputType, FGuid(), FGuid());
+
+		// Guard: break existing links so the literal DefaultValue actually takes effect
+		if (OverridePin.LinkedTo.Num() > 0)
+		{
+			OverridePin.BreakAllPinLinks();
+		}
+		TargetPin = &OverridePin;
+	}
 
 	TargetPin->DefaultValue = ValStr;
 	GEditor->EndTransaction();
@@ -8445,6 +8693,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		else if (OpName == TEXT("export_system_spec")) SubResult = HandleExportSystemSpec(SubParams);
 		// Wave 5
 		else if (OpName == TEXT("add_dynamic_input")) SubResult = HandleAddDynamicInput(SubParams);
+		else if (OpName == TEXT("insert_dynamic_input")) SubResult = HandleInsertDynamicInput(SubParams);
 		else if (OpName == TEXT("set_dynamic_input_value")) SubResult = HandleSetDynamicInputValue(SubParams);
 		else if (OpName == TEXT("search_dynamic_inputs")) SubResult = HandleSearchDynamicInputs(SubParams);
 		// Phase 3: Dynamic Input Features
@@ -11078,6 +11327,610 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 // Wave 5: Dynamic Input Actions (3 new)
 // ============================================================================
 
+namespace
+{
+	// Both live further down this TU next to the actions they were written for; the
+	// add/insert path needs them, and the unnamed namespace is one namespace per TU.
+	void RemoveDynamicInputFromPin(UEdGraphPin& OverridePin, UEdGraph* Graph);
+	TSharedPtr<FJsonObject> BuildInputTreeNode(UNiagaraNodeFunctionCall* FuncNode, UNiagaraSystem* System,
+		int32 EmitterIdx, ENiagaraScriptUsage Usage, int32 Depth, int32 MaxDepth);
+
+	/**
+	 * Resolve a module input by the name the caller gave, tolerating the space-stripped
+	 * spelling. Shared by add_dynamic_input and insert_dynamic_input so their "input not
+	 * found" behaviour cannot drift apart.
+	 */
+	bool ResolveStackFunctionInput(UNiagaraNodeFunctionCall& FuncNode, UNiagaraSystem* System,
+		int32 EmitterIdx, ENiagaraScriptUsage Usage, const FString& InputName,
+		FNiagaraTypeDefinition& OutType, FName& OutFullName, FString& OutError)
+	{
+		TArray<FNiagaraVariable> Inputs;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+			FCompileConstantResolver Resolver(VE, Usage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(FuncNode, Inputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+		else
+		{
+			FCompileConstantResolver Resolver(System, Usage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(FuncNode, Inputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+
+		const FName InputFName(*InputName);
+		FString InputNoSpaces = InputName;
+		InputNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+
+		TArray<FString> ValidNames;
+		for (const FNiagaraVariable& In : Inputs)
+		{
+			const FName Short = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
+			ValidNames.Add(Short.ToString());
+
+			bool bMatch = (Short == InputFName || In.GetName() == InputFName);
+			if (!bMatch)
+			{
+				FString S = Short.ToString();
+				S.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+				bMatch = S.Equals(InputNoSpaces, ESearchCase::IgnoreCase);
+			}
+			if (bMatch)
+			{
+				OutType = In.GetType();
+				OutFullName = In.GetName();
+				return true;
+			}
+		}
+
+		OutError = FString::Printf(TEXT("Input '%s' not found. Valid inputs: [%s]"),
+			*InputName, *FString::Join(ValidNames, TEXT(", ")));
+		return false;
+	}
+
+	/**
+	 * Gap #31 / Group 2 — describe what an override pin is currently driven by, BEFORE it is
+	 * torn down. add_dynamic_input replaces (correct parity with the editor, and mandatory:
+	 * SetDynamicInputForFunctionInput opens with a checkf that the pin has no links,
+	 * NiagaraStackGraphUtilities.cpp:2259), but it used to do so in complete silence.
+	 */
+	TSharedPtr<FJsonObject> DescribeDisplacedChain(UEdGraphPin& OverridePin, UNiagaraSystem* System,
+		int32 EmitterIdx, ENiagaraScriptUsage Usage)
+	{
+		if (OverridePin.LinkedTo.Num() == 0 || OverridePin.LinkedTo[0] == nullptr) return nullptr;
+
+		UEdGraphNode* LinkedNode = OverridePin.LinkedTo[0]->GetOwningNode();
+		if (!LinkedNode) return nullptr;
+
+		TSharedRef<FJsonObject> Displaced = MakeShared<FJsonObject>();
+
+		if (UNiagaraNodeFunctionCall* DynNode = Cast<UNiagaraNodeFunctionCall>(LinkedNode))
+		{
+			Displaced->SetStringField(TEXT("kind"), TEXT("dynamic_input"));
+			Displaced->SetStringField(TEXT("function_name"), DynNode->GetFunctionName());
+			Displaced->SetStringField(TEXT("node_guid"), DynNode->NodeGuid.ToString());
+			if (DynNode->FunctionScript)
+			{
+				Displaced->SetStringField(TEXT("script_path"), DynNode->FunctionScript->GetPathName());
+			}
+			// The whole subtree, so a caller can rebuild what it just lost.
+			if (TSharedPtr<FJsonObject> Tree = BuildInputTreeNode(DynNode, System, EmitterIdx, Usage, 0, 10))
+			{
+				Displaced->SetObjectField(TEXT("tree"), Tree);
+			}
+		}
+		else if (UNiagaraNodeInput* InputNode = Cast<UNiagaraNodeInput>(LinkedNode))
+		{
+			Displaced->SetStringField(TEXT("kind"), TEXT("input_node"));
+			Displaced->SetStringField(TEXT("linked_parameter"), InputNode->Input.GetName().ToString());
+			Displaced->SetStringField(TEXT("node_guid"), InputNode->NodeGuid.ToString());
+		}
+		else
+		{
+			Displaced->SetStringField(TEXT("kind"), TEXT("linked"));
+			Displaced->SetStringField(TEXT("linked_node_class"), LinkedNode->GetClass()->GetName());
+			Displaced->SetStringField(TEXT("linked_pin"), OverridePin.LinkedTo[0]->PinName.ToString());
+			Displaced->SetStringField(TEXT("node_guid"), LinkedNode->NodeGuid.ToString());
+		}
+
+		return Displaced;
+	}
+
+	// ========================================================================
+	// Post-mutation cycle guard.
+	//
+	// The engine's parameter-map walks (FNiagaraParameterMapHistoryBuilder and the stack
+	// view-model refresh that consumes it) are plainly recursive over node links, with no
+	// visited set and no depth cap. A graph containing a link cycle therefore does NOT
+	// produce a translator error — it produces EXCEPTION_STACK_OVERFLOW, which is
+	// unrecoverable and takes every unsaved asset in the editor with it.
+	//
+	// Measured, not assumed: crash UECC-Windows-187C4AB44D4DF0E941135C8CC5284C24_0000,
+	// ~8250 stack frames, every frame after the first two the same return address inside
+	// UnrealEditor-NiagaraEditor.dll — one function recursing on itself until the stack
+	// was gone. No Monolith frames: we spliced the cycle, the engine walked it.
+	//
+	// So every action that re-points links in an override chain checks for a cycle BEFORE
+	// returning control to the engine. The detector is an ITERATIVE three-colour DFS —
+	// explicitly not recursive, since a recursive detector would overflow on exactly the
+	// graphs it exists to catch. Stage graphs are tens of nodes; the cost is irrelevant
+	// next to what it prevents.
+	// ========================================================================
+
+	/**
+	 * Find one directed cycle over ALL pin links (not just ParameterMap links — the crash
+	 * cycle ran a value-output edge one way and a map edge the other). Returns the back
+	 * edge From->To that closes it, plus a readable node-class path for the error message.
+	 */
+	bool FindGraphLinkCycle(UEdGraph* Graph, UEdGraphNode*& OutFrom, UEdGraphNode*& OutTo, FString& OutPath)
+	{
+		OutFrom = nullptr;
+		OutTo = nullptr;
+		OutPath.Reset();
+		if (!Graph) return false;
+
+		TMap<UEdGraphNode*, TArray<UEdGraphNode*>> Successors;
+		Successors.Reserve(Graph->Nodes.Num());
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			TArray<UEdGraphNode*>& Out = Successors.Add(Node);
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Output) continue;
+				for (UEdGraphPin* Linked : Pin->LinkedTo)
+				{
+					if (!Linked) continue;
+					if (UEdGraphNode* Owner = Linked->GetOwningNode())
+					{
+						// Owner == Node is a self-loop and is itself a cycle; keep it.
+						Out.AddUnique(Owner);
+					}
+				}
+			}
+		}
+
+		// 0 = unvisited, 1 = on the current path (grey), 2 = fully explored (black).
+		TMap<UEdGraphNode*, uint8> Colour;
+		Colour.Reserve(Graph->Nodes.Num());
+
+		struct FFrame { UEdGraphNode* Node; int32 NextEdge; };
+
+		for (UEdGraphNode* Root : Graph->Nodes)
+		{
+			if (!Root || Colour.FindRef(Root) != 0) continue;
+
+			TArray<FFrame> Stack;
+			TArray<UEdGraphNode*> Path;
+			Stack.Push(FFrame{ Root, 0 });
+			Path.Add(Root);
+			Colour.Add(Root, 1);
+
+			while (Stack.Num() > 0)
+			{
+				const int32 TopIdx = Stack.Num() - 1;
+				UEdGraphNode* Node = Stack[TopIdx].Node;
+				const TArray<UEdGraphNode*>* Succ = Successors.Find(Node);
+
+				if (Succ != nullptr && Stack[TopIdx].NextEdge < Succ->Num())
+				{
+					UEdGraphNode* Next = (*Succ)[Stack[TopIdx].NextEdge++];
+					const uint8 C = Colour.FindRef(Next);
+					if (C == 1)
+					{
+						OutFrom = Node;
+						OutTo = Next;
+
+						TArray<FString> Names;
+						bool bInLoop = false;
+						for (UEdGraphNode* P : Path)
+						{
+							if (P == Next) bInLoop = true;
+							if (bInLoop && P) Names.Add(P->GetClass()->GetName());
+						}
+						Names.Add(Next->GetClass()->GetName());
+						OutPath = FString::Join(Names, TEXT(" -> "));
+						return true;
+					}
+					if (C == 0)
+					{
+						Colour.Add(Next, 1);
+						Path.Add(Next);
+						// NOTE: never hold a reference into Stack across this Push.
+						Stack.Push(FFrame{ Next, 0 });
+					}
+				}
+				else
+				{
+					Colour.Add(Node, 2);
+					Stack.Pop();
+					Path.Pop();
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Returns true when the graph is provably cycle-free. When it is not, the back edge is
+	 * CUT before returning — a disconnected graph is a compile error the caller can see and
+	 * fix, a cyclic graph is a dead editor. OutDiagnostic describes what was cut.
+	 *
+	 * Deliberately does NOT rely on GEditor->CancelTransaction to roll the mutation back:
+	 * UTransBuffer::Cancel (EditorTransaction.cpp:1411-1459) pops the transaction off the
+	 * undo buffer and calls FTransaction::EndOperation — it never calls FTransaction::Apply,
+	 * so it discards the undo RECORD rather than reverting the objects. Cutting the edge is
+	 * the only remediation here that is guaranteed to terminate.
+	 */
+	bool EnsureGraphAcyclic(UEdGraph* Graph, FString& OutDiagnostic)
+	{
+		OutDiagnostic.Reset();
+		if (!Graph) return true;
+
+		TArray<FString> Cuts;
+		for (int32 Attempt = 0; Attempt < 16; ++Attempt)
+		{
+			UEdGraphNode* From = nullptr;
+			UEdGraphNode* To = nullptr;
+			FString PathText;
+			if (!FindGraphLinkCycle(Graph, From, To, PathText))
+			{
+				if (Cuts.Num() == 0) return true;
+				OutDiagnostic = FString::Printf(
+					TEXT("A link cycle was created and had to be cut to keep the editor alive: %s. ")
+					TEXT("The graph is no longer cyclic but it IS damaged — undo, or close the editor without saving."),
+					*FString::Join(Cuts, TEXT(" | ")));
+				return false;
+			}
+
+			int32 Broken = 0;
+			if (From != nullptr && To != nullptr)
+			{
+				for (UEdGraphPin* OutPin : From->Pins)
+				{
+					if (!OutPin || OutPin->Direction != EGPD_Output) continue;
+					TArray<UEdGraphPin*> LinkedCopy = OutPin->LinkedTo;
+					for (UEdGraphPin* L : LinkedCopy)
+					{
+						if (L != nullptr && L->GetOwningNode() == To)
+						{
+							OutPin->BreakLinkTo(L);
+							++Broken;
+						}
+					}
+				}
+			}
+
+			Cuts.Add(FString::Printf(TEXT("%s (%d link(s) cut)"), *PathText, Broken));
+
+			if (Broken == 0)
+			{
+				OutDiagnostic = FString::Printf(
+					TEXT("A link cycle was created and could NOT be cut (%s). ")
+					TEXT("DO NOT SAVE and DO NOT open this asset's stack — close the editor without saving."),
+					*PathText);
+				return false;
+			}
+		}
+
+		OutDiagnostic = TEXT("A link cycle was created and could not be cleared in 16 passes. ")
+			TEXT("DO NOT SAVE and DO NOT open this asset's stack — close the editor without saving.");
+		return false;
+	}
+
+	// ========================================================================
+	// Capture-as-data / rebuild for insert_dynamic_input.
+	//
+	// The editor's own insert is clipboard-based: cut (which REMOVES the nodes), add the new
+	// dynamic input, paste (which RECREATES nodes from serialised data). The engine never
+	// moves live nodes between override chains, and that is exactly why it is safe — see the
+	// header comment on HandleInsertDynamicInput for what moving them cost us.
+	//
+	// These structures are the "clipboard": everything a chain of plain-script dynamic inputs
+	// carries, and nothing else. Capture REFUSES anything it cannot round-trip, so the failure
+	// mode is an error before any mutation rather than a silent rebuild that dropped data.
+	// ========================================================================
+
+	struct FCapturedDynamicInput;
+
+	struct FCapturedInputValue
+	{
+		/** Script-relative ("Module.A"), so it survives the node being recreated under a new name. */
+		FName FullName;
+		FNiagaraTypeDefinition Type;
+		/** false: the input has no override pin at all — it is on the script default, replay nothing. */
+		bool bHasOverridePin = false;
+		/** The pin's DefaultValue string VERBATIM. Never re-encoded (see ReplayCapturedDynamicInput). */
+		FString LiteralValue;
+		TSharedPtr<FCapturedDynamicInput> Nested;
+	};
+
+	struct FCapturedDynamicInput
+	{
+		UNiagaraScript* Script = nullptr;
+		FGuid ScriptVersion;
+		FString FunctionName;
+		FString ScriptPath;
+		TArray<FCapturedInputValue> Inputs;
+	};
+
+	static const int32 GMaxCapturedChainDepth = 16;
+
+	/**
+	 * Read a dynamic input chain into plain data. Same traversal get_dynamic_input_tree uses
+	 * (BuildInputTreeNode), but it refuses instead of describing whenever it meets something a
+	 * rebuild would silently drop. Everything it accepts is replayable through
+	 * GetOrCreateStackFunctionInputOverridePin + SetDynamicInputForFunctionInput alone.
+	 *
+	 * Recursion is depth-capped so an already-damaged (cyclic) graph cannot overflow the stack
+	 * here — the guard must never be the thing that crashes.
+	 */
+	bool CaptureDynamicInputChain(UNiagaraNodeFunctionCall& Node, UNiagaraSystem* System, int32 EmitterIdx,
+		ENiagaraScriptUsage Usage, int32 Depth, FCapturedDynamicInput& Out, FString& OutError)
+	{
+		if (Depth > GMaxCapturedChainDepth)
+		{
+			OutError = FString::Printf(TEXT("the chain is deeper than %d levels (or the graph already contains a loop)"),
+				GMaxCapturedChainDepth);
+			return false;
+		}
+
+		// UNiagaraNodeCustomHlsl derives from UNiagaraNodeFunctionCall, so a Cast<> to the base
+		// happily accepts one. Its expression body is not in FunctionScript and is not captured
+		// anywhere below — rebuilding would produce an empty node.
+		if (Node.IsA<UNiagaraNodeCustomHlsl>())
+		{
+			OutError = FString::Printf(
+				TEXT("node '%s' is a custom HLSL dynamic input, whose expression body cannot be captured"),
+				*Node.GetFunctionName());
+			return false;
+		}
+		if (Node.FunctionScript == nullptr)
+		{
+			OutError = FString::Printf(TEXT("node '%s' has no function script to rebuild from"), *Node.GetFunctionName());
+			return false;
+		}
+		if (Node.PropagatedStaticSwitchParameters.Num() > 0)
+		{
+			OutError = FString::Printf(
+				TEXT("node '%s' propagates %d static switch parameter(s) to its caller, which a rebuilt node would not"),
+				*Node.GetFunctionName(), Node.PropagatedStaticSwitchParameters.Num());
+			return false;
+		}
+
+		Out.Script = Node.FunctionScript;
+		Out.ScriptVersion = Node.SelectedScriptVersion;
+		Out.FunctionName = Node.GetFunctionName();
+		Out.ScriptPath = Node.FunctionScript->GetPathName();
+
+		// Static switch selections live on pins of the FUNCTION CALL node itself
+		// (UNiagaraNodeFunctionCall::FindStaticSwitchInputPin) and are NOT part of
+		// GetStackFunctionInputs(ModuleInputsOnly) — that enumerates map-driven module inputs,
+		// static switches come from GetStackFunctionStaticSwitchPins. A recreated node gets the
+		// script's defaults, so a non-default selection would vanish; and because a switch
+		// decides which inputs even exist, that is not a cosmetic loss. Refuse.
+		// A selection still sitting on AutogeneratedDefaultValue needs no replay by definition.
+		{
+			TArray<UEdGraphPin*> SwitchPins;
+			TSet<UEdGraphPin*> HiddenSwitchPins;
+			if (EmitterIdx != INDEX_NONE)
+			{
+				FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+				FCompileConstantResolver SwitchResolver(VE, Usage);
+				FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(Node, SwitchPins, HiddenSwitchPins, SwitchResolver);
+			}
+			else
+			{
+				FCompileConstantResolver SwitchResolver(System, Usage);
+				FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(Node, SwitchPins, HiddenSwitchPins, SwitchResolver);
+			}
+
+			for (UEdGraphPin* SP : SwitchPins)
+			{
+				if (!SP) continue;
+				if (SP->DefaultValue != SP->AutogeneratedDefaultValue)
+				{
+					OutError = FString::Printf(
+						TEXT("node '%s' has static switch '%s' set to '%s' (script default '%s'); a rebuilt node would ")
+						TEXT("silently fall back to the default and change which inputs exist"),
+						*Node.GetFunctionName(), *SP->PinName.ToString(), *SP->DefaultValue, *SP->AutogeneratedDefaultValue);
+					return false;
+				}
+			}
+		}
+
+		TArray<FNiagaraVariable> Inputs;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+			FCompileConstantResolver Resolver(VE, Usage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(Node, Inputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+		else
+		{
+			FCompileConstantResolver Resolver(System, Usage);
+			FNiagaraStackGraphUtilities::GetStackFunctionInputs(Node, Inputs, Resolver,
+				FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+		}
+
+		// A dynamic input with genuinely zero module inputs is legal (a constant provider).
+		// An enumeration that returns nothing while the node carries typed input pins is not —
+		// that is the CustomHlsl-shaped case BuildInputTreeNode papers over with a raw-pin
+		// fallback, and rebuilding from an empty list would drop every value on the node.
+		if (Inputs.Num() == 0)
+		{
+			const UEdGraphSchema_Niagara* Schema = GetDefault<UEdGraphSchema_Niagara>();
+			for (UEdGraphPin* Pin : Node.Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Input || Pin->bHidden) continue;
+				if (Pin->PinName.IsNone() || Pin->PinName == TEXT("Add")) continue;
+				if (Schema->PinToTypeDefinition(Pin) == FNiagaraTypeDefinition::GetParameterMapDef()) continue;
+				OutError = FString::Printf(
+					TEXT("node '%s' has input pins the stack enumeration does not report (first: '%s'), so its values ")
+					TEXT("cannot be captured"),
+					*Node.GetFunctionName(), *Pin->PinName.ToString());
+				return false;
+			}
+		}
+
+		for (const FNiagaraVariable& In : Inputs)
+		{
+			FCapturedInputValue V;
+			V.FullName = In.GetName();
+			V.Type = In.GetType();
+
+			FNiagaraParameterHandle InAH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+				FNiagaraParameterHandle(In.GetName()), &Node);
+			UEdGraphPin* OP = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(Node, InAH);
+
+			if (OP == nullptr)
+			{
+				// Never overridden — the script default applies and a fresh node gets it for free.
+				V.bHasOverridePin = false;
+			}
+			else if (OP->LinkedTo.Num() == 0)
+			{
+				V.bHasOverridePin = true;
+				V.LiteralValue = OP->DefaultValue;
+			}
+			else
+			{
+				UEdGraphNode* LinkedNode = OP->LinkedTo[0] ? OP->LinkedTo[0]->GetOwningNode() : nullptr;
+				UNiagaraNodeFunctionCall* SubDyn = Cast<UNiagaraNodeFunctionCall>(LinkedNode);
+				if (SubDyn == nullptr)
+				{
+					OutError = FString::Printf(
+						TEXT("input '%s' on '%s' is driven by a %s — a parameter binding, data interface or object asset. ")
+						TEXT("Only the parameter NAME is visible to this traversal, not the object behind it, so a rebuild ")
+						TEXT("would default-construct it"),
+						*MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString(), *Node.GetFunctionName(),
+						LinkedNode ? *LinkedNode->GetClass()->GetName() : TEXT("dangling link"));
+					return false;
+				}
+
+				V.bHasOverridePin = true;
+				V.Nested = MakeShared<FCapturedDynamicInput>();
+				if (!CaptureDynamicInputChain(*SubDyn, System, EmitterIdx, Usage, Depth + 1, *V.Nested, OutError))
+				{
+					return false;
+				}
+			}
+
+			Out.Inputs.Add(MoveTemp(V));
+		}
+
+		return true;
+	}
+
+	int32 CountCapturedNodes(const FCapturedDynamicInput& C)
+	{
+		int32 N = 1;
+		for (const FCapturedInputValue& V : C.Inputs)
+		{
+			if (V.Nested.IsValid()) N += CountCapturedNodes(*V.Nested);
+		}
+		return N;
+	}
+
+	TSharedRef<FJsonObject> CapturedChainToJson(const FCapturedDynamicInput& C)
+	{
+		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+		O->SetStringField(TEXT("function_name"), C.FunctionName);
+		O->SetStringField(TEXT("script_path"), C.ScriptPath);
+
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		for (const FCapturedInputValue& V : C.Inputs)
+		{
+			TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+			IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(V.FullName).ToString());
+			IO->SetStringField(TEXT("type"), V.Type.GetName());
+			if (V.Nested.IsValid())
+			{
+				IO->SetStringField(TEXT("source"), TEXT("dynamic_input"));
+				IO->SetObjectField(TEXT("dynamic_input"), CapturedChainToJson(*V.Nested));
+			}
+			else if (V.bHasOverridePin)
+			{
+				IO->SetStringField(TEXT("source"), TEXT("literal"));
+				IO->SetStringField(TEXT("value"), V.LiteralValue);
+			}
+			else
+			{
+				IO->SetStringField(TEXT("source"), TEXT("script_default"));
+			}
+			Arr.Add(MakeShared<FJsonValueObject>(IO));
+		}
+		O->SetArrayField(TEXT("inputs"), Arr);
+		return O;
+	}
+
+	/**
+	 * Recreate a captured chain under TargetNode's TargetInputFullName, using ONLY the two
+	 * primitives the ordinary add_dynamic_input path uses. No link is made by hand, so the
+	 * resulting topology is byte-for-byte the one a human building the same chain outside-in
+	 * through the editor would get — which is the entire point of the rewrite.
+	 */
+	bool ReplayCapturedDynamicInput(const FCapturedDynamicInput& C, UNiagaraNodeFunctionCall& TargetNode,
+		FName TargetInputFullName, const FNiagaraTypeDefinition& TargetInputType, UEdGraph* Graph,
+		UNiagaraNodeFunctionCall*& OutNode, FString& OutError)
+	{
+		FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+			FNiagaraParameterHandle(TargetInputFullName), &TargetNode);
+		UEdGraphPin& OP = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+			TargetNode, AH, TargetInputType, FGuid(), FGuid());
+
+		// SetDynamicInputForFunctionInput opens with checkf(OverridePin.LinkedTo.Num() == 0)
+		// (NiagaraStackGraphUtilities.cpp:2259) — fatal, not an error return. If the script
+		// shipped its own chain on this input, tear it down properly rather than orphaning it.
+		if (OP.LinkedTo.Num() > 0)
+		{
+			RemoveDynamicInputFromPin(OP, Graph);
+			if (OP.LinkedTo.Num() > 0) OP.BreakAllPinLinks();
+		}
+
+		UNiagaraNodeFunctionCall* NewNode = nullptr;
+		FNiagaraStackGraphUtilities::SetDynamicInputForFunctionInput(OP, C.Script, NewNode,
+			FGuid(), C.FunctionName, C.ScriptVersion);
+		if (NewNode == nullptr)
+		{
+			OutError = FString::Printf(TEXT("SetDynamicInputForFunctionInput returned null for '%s'"), *C.ScriptPath);
+			return false;
+		}
+		OutNode = NewNode;
+
+		for (const FCapturedInputValue& V : C.Inputs)
+		{
+			if (V.Nested.IsValid())
+			{
+				UNiagaraNodeFunctionCall* Sub = nullptr;
+				if (!ReplayCapturedDynamicInput(*V.Nested, *NewNode, V.FullName, V.Type, Graph, Sub, OutError))
+				{
+					return false;
+				}
+			}
+			else if (V.bHasOverridePin)
+			{
+				FNiagaraParameterHandle SubAH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+					FNiagaraParameterHandle(V.FullName), NewNode);
+				UEdGraphPin& SubPin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+					*NewNode, SubAH, V.Type, FGuid(), FGuid());
+				if (SubPin.LinkedTo.Num() > 0) SubPin.BreakAllPinLinks();
+
+				// VERBATIM, deliberately. The captured string is whatever the engine's own type
+				// utilities wrote into the pin. Round-tripping it through set_module_input_value's
+				// parser would re-encode it, and that encoder is under suspicion for vectors
+				// (gap #31 C6: it writes "%f,%f,%f" where FNiagaraEditorVector*TypeUtilities emits
+				// "(X=..., Y=...)"). Copying the string cannot be wrong for any type.
+				SubPin.DefaultValue = V.LiteralValue;
+			}
+		}
+
+		return true;
+	}
+} // anonymous namespace
+
 FMonolithActionResult FMonolithNiagaraActions::HandleAddDynamicInput(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SystemPath = NA_GetAssetPath(Params);
@@ -11096,45 +11949,55 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddDynamicInput(const TShar
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
 
 	// Resolve input
-	TArray<FNiagaraVariable> Inputs;
 	int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
-	if (EmitterIdx != INDEX_NONE)
-	{
-		FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
-		FCompileConstantResolver Resolver(VE, FoundUsage);
-		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
-			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
-	}
-	else
-	{
-		FCompileConstantResolver Resolver(System, FoundUsage);
-		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
-			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
-	}
-
-	FName InputFName(*InputName);
-	FString InputNoSpaces = InputName;
-	InputNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
 	FNiagaraTypeDefinition InputType;
 	FName MatchedFullName;
-	bool bInputFound = false;
-	for (const FNiagaraVariable& In : Inputs)
 	{
-		FName Short = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
-		bool bMatch = (Short == InputFName || In.GetName() == InputFName);
-		if (!bMatch)
+		FString InputError;
+		if (!ResolveStackFunctionInput(*MN, System, EmitterIdx, FoundUsage, InputName, InputType, MatchedFullName, InputError))
 		{
-			FString S = Short.ToString();
-			S.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
-			bMatch = S.Equals(InputNoSpaces, ESearchCase::IgnoreCase);
+			return FMonolithActionResult::Error(InputError);
 		}
-		if (bMatch) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
 	}
-	if (!bInputFound) return FMonolithActionResult::Error(FString::Printf(TEXT("Input '%s' not found"), *InputName));
 
 	// Load the dynamic input script
 	UNiagaraScript* DynScript = LoadObject<UNiagaraScript>(nullptr, *DynInputPath);
-	if (!DynScript) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load dynamic input script: %s"), *DynInputPath));
+
+	// ------------------------------------------------------------------------
+	// Gap #31-G / #31-C — refuse a wrong-usage or wrong-typed script BEFORE anything
+	// is created. Both used to succeed silently: a MODULE script attached, compiled
+	// clean and then could not be removed by guid at all; a Vector3f script on a float
+	// input compiled with only a VM 'implicit truncation from vec3 to float' warning.
+	// ------------------------------------------------------------------------
+	FNiagaraTypeDefinition ScriptOutputType;
+	bool bScriptOutputTypeKnown = false;
+	{
+		FString ScriptError;
+		if (!MonolithNiagaraHelpers::ValidateDynamicInputScript(DynScript, DynInputPath, InputType, InputName,
+			ScriptOutputType, bScriptOutputTypeKnown, ScriptError))
+		{
+			return FMonolithActionResult::Error(ScriptError);
+		}
+	}
+
+	// Baseline for the cycle guard below. Reading it BEFORE the transaction is what makes the
+	// guard's remediation safe: a cycle seen afterwards is then provably one we created, so
+	// cutting it cannot destroy a link that was legitimately there. A graph that arrives
+	// already cyclic is refused instead — it is a crasher in its own right and this action is
+	// not the right place to repair it.
+	{
+		UEdGraphNode* PreFrom = nullptr;
+		UEdGraphNode* PreTo = nullptr;
+		FString PrePath;
+		if (FindGraphLinkCycle(MN->GetGraph(), PreFrom, PreTo, PrePath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("This graph ALREADY contains a link cycle (%s) before any change. The engine's parameter-map ")
+				TEXT("walk is recursive and unguarded, so opening this emitter's stack will stack-overflow the ")
+				TEXT("editor. Refusing to touch it. NOTHING WAS CHANGED. Run audit_stack_wiring, and do not save."),
+				*PrePath));
+		}
+	}
 
 	// Get or create override pin
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
@@ -11146,8 +12009,63 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddDynamicInput(const TShar
 	UEdGraphPin& OP = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
 		*MN, AH, InputType, FGuid(), FGuid());
 
-	// Clean up existing links
-	if (OP.LinkedTo.Num() > 0) OP.BreakAllPinLinks();
+	// Invariant I-15: SetDynamicInputForFunctionInput below reads
+	// OverrideNodeInputPin->LinkedTo[0] with no bounds check
+	// (NiagaraStackGraphUtilities.cpp:2289-2294) — a hard editor crash on a damaged chain.
+	if (UNiagaraNode* OverrideNN = Cast<UNiagaraNode>(OP.GetOwningNode()))
+	{
+		UEdGraphPin* OverrideNodeMapIn = MonolithNiagaraHelpers::GetParameterMapPin(*OverrideNN, EGPD_Input);
+		if (!OverrideNodeMapIn || OverrideNodeMapIn->LinkedTo.Num() == 0)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(
+				TEXT("The override node for this input is not connected to the stack's ParameterMap chain. ")
+				TEXT("Proceeding would dereference an empty pin array inside the engine and crash the editor. ")
+				TEXT("Run audit_stack_wiring on this emitter."));
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// Gap #31 / Group 2 — the replace LEAKED. Breaking the top link detaches only the
+	// displaced chain's ROOT; every node below it stayed wired into the stage's map
+	// chain and remained in the engine's compiled traversal, computing into override
+	// parameters nothing reads. Node count grew on every replace and neither
+	// audit_stack_wiring nor clean_stack_orphans could see it.
+	//
+	// The editor never had this problem because UNiagaraStackFunctionInput::SetDynamicInput
+	// calls RemoveNodesForOverridePin FIRST (NiagaraStackFunctionInput.cpp:2179). Its engine
+	// implementation, FNiagaraStackGraphUtilities::RemoveNodesForStackFunctionInputOverridePin,
+	// is declared WITHOUT NIAGARAEDITOR_API (NiagaraStackGraphUtilities.h:222-224) so we
+	// cannot link to it — but remove_dynamic_input's RemoveDynamicInputFromPin is the same
+	// recursive teardown and is already proven clean, so the replace now reuses that.
+	//
+	// The replace semantics themselves are unchanged: this is parity with the editor, and
+	// the pin MUST be cleared or SetDynamicInputForFunctionInput's checkf fires.
+	// ------------------------------------------------------------------------
+	TSharedPtr<FJsonObject> DisplacedChain;
+	int32 DisplacedNodesRemoved = 0;
+	if (OP.LinkedTo.Num() > 0)
+	{
+		UEdGraph* OverrideGraph = OP.GetOwningNode() ? OP.GetOwningNode()->GetGraph() : MN->GetGraph();
+		DisplacedChain = DescribeDisplacedChain(OP, System, EmitterIdx, FoundUsage);
+
+		const int32 NodeCountBefore = OverrideGraph ? OverrideGraph->Nodes.Num() : 0;
+		RemoveDynamicInputFromPin(OP, OverrideGraph);
+		DisplacedNodesRemoved = OverrideGraph ? FMath::Max(0, NodeCountBefore - OverrideGraph->Nodes.Num()) : 0;
+
+		// RemoveDynamicInputFromPin always ends in BreakAllPinLinks, but the engine's checkf
+		// is fatal — never reach SetDynamicInputForFunctionInput on a still-linked pin.
+		if (OP.LinkedTo.Num() > 0) OP.BreakAllPinLinks();
+
+		if (DisplacedChain.IsValid())
+		{
+			DisplacedChain->SetNumberField(TEXT("nodes_removed"), DisplacedNodesRemoved);
+			DisplacedChain->SetStringField(TEXT("note"),
+				TEXT("This input already had a value chain. Attaching a dynamic input REPLACES it — same as the editor — "
+				     "and the displaced nodes were deleted, not orphaned. Rebuild from 'tree' if you needed it, "
+				     "or use insert_dynamic_input to wrap the existing chain instead of discarding it."));
+		}
+	}
 
 	// Set the dynamic input
 	UNiagaraNodeFunctionCall* OutDynNode = nullptr;
@@ -11157,6 +12075,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddDynamicInput(const TShar
 	{
 		GEditor->EndTransaction();
 		return FMonolithActionResult::Error(TEXT("SetDynamicInputForFunctionInput returned null node"));
+	}
+
+	// Cycle guard. Nothing here is expected to produce one — every link above is made by the
+	// engine's own routines — but the replace path's teardown re-points map links, and the
+	// engine's recursive map walk turns any cycle into EXCEPTION_STACK_OVERFLOW rather than a
+	// compile error. Checking costs a DFS over a few dozen nodes; not checking cost an editor.
+	{
+		FString CycleDiag;
+		if (!EnsureGraphAcyclic(MN->GetGraph(), CycleDiag))
+		{
+			GEditor->EndTransaction();
+			// Deliberately no RequestCompile: compiling a damaged graph walks it.
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("add_dynamic_input produced a cyclic graph and the cycle guard intervened. %s ")
+				TEXT("This is a bug in the action, not in your call — please report it."), *CycleDiag));
+		}
 	}
 
 	GEditor->EndTransaction();
@@ -11212,7 +12146,393 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddDynamicInput(const TShar
 	R->SetBoolField(TEXT("success"), true);
 	R->SetStringField(TEXT("dynamic_input_node_guid"), OutDynNode->NodeGuid.ToString());
 	R->SetStringField(TEXT("dynamic_input_name"), OutDynNode->GetFunctionName());
+	if (bScriptOutputTypeKnown) R->SetStringField(TEXT("output_type"), ScriptOutputType.GetName());
+	R->SetStringField(TEXT("target_input_type"), InputType.GetName());
 	R->SetArrayField(TEXT("inputs"), DynInputsArr);
+	// Additive: absent when the input was previously a plain literal.
+	R->SetBoolField(TEXT("replaced"), DisplacedChain.IsValid());
+	if (DisplacedChain.IsValid()) R->SetObjectField(TEXT("displaced_chain"), DisplacedChain);
+	return NA_SuccessObj(R);
+}
+
+// ----------------------------------------------------------------------------
+// Gap #31 / Group 3 — insert_dynamic_input.  DISABLED BY DEFAULT. See the refusal below.
+//
+// WHAT WENT WRONG (root cause, traced against engine source after the crash)
+//
+// The first implementation MOVED the live chain: break the module's override pin, add the
+// new dynamic input, then re-point links so the old chain hung off the new node's
+// into_input. It stack-overflowed the editor on its first invocation, on the simplest
+// possible case — SpawnRate -> Multiply_Float(A=2, B=3), inserting Add_Float into A.
+//
+// The cycle did NOT come from GetOrCreateStackFunctionOverrideNode's link theft, which is
+// what the previous round of repair was aimed at. It came from
+// GetStackFunctionOverrideNode (NiagaraStackGraphUtilities.cpp:1918-1926), which answers
+// "what is this function call's override node?" with "whatever ParameterMapSet my map input
+// happens to be linked to". Trace the failing case:
+//
+//   start        EmitterState -> MS_M -> { Multiply_Float(M), MS_module }
+//                MS_module.SpawnRate.SpawnRate  <- M.ValueOut
+//   break pin    M.ValueOut dangling
+//   SetDynamic-  Add.MapIn <- MS_module.MapIn.LinkedTo[0]  ==  MS_M.MapOut   (:2289-2299)
+//   ForFunction  Add.ValueOut -> MS_module.SpawnRate.SpawnRate
+//   GetOrCreate  GetStackFunctionOverrideNode(Add) follows Add.MapIn to MS_M, which IS a
+//   OverridePin  UNiagaraNodeParameterMapSet -> returns it. No new override node is made;
+//                the pin "Add_Float.A" is created ON MS_M.
+//   relink       M.ValueOut -> MS_M."Add_Float.A"
+//
+// M reads its own overrides from MS_M and now also feeds MS_M. Two-node cycle. The engine's
+// next recursive map walk followed it for ~8250 frames and died.
+//
+// Sharing an override node like that is NORMAL and harmless when the engine builds the
+// graph, because SetDynamicInputForFunctionInput always attaches a value node to the
+// override node's UPSTREAM pin (:2293). It is only fatal when we take a node that is
+// already DOWNSTREAM of that MapSet and wire its output back into it. Which is precisely
+// what "move the existing chain" means. There is no small fix: any move has to reason about
+// a topology GetOrCreateStackFunctionOverrideNode is rearranging underneath it.
+//
+// WHAT REPLACES IT
+//
+// The editor never moves live nodes — its insert is cut (remove) -> add -> paste (recreate
+// from serialised data). So: capture the chain as data, REMOVE it with remove_dynamic_input's
+// proven teardown, add the new dynamic input through the ordinary path, then RECREATE the
+// captured chain under into_input with the same add-primitives. Every link is made by the
+// engine, in the order the engine makes them, so the result is the topology a human would
+// have produced building the same chain outside-in. Traced by hand on the failing case:
+//
+//   EmitterState -> MS_M2 -> { M2, MS_Add }; MS_Add -> { Add, MS_module }; MS_module -> MN
+//
+// which is exactly what add Add_Float / add Multiply_Float / set A / set B produces from
+// scratch. No cycle is reachable.
+//
+// The cost is node GUIDs (invariant I-19) and anything the capture cannot model. Capture
+// therefore REFUSES rather than guesses: custom HLSL bodies, parameter bindings, data
+// interfaces, object assets, propagated or non-default static switches, and any node whose
+// inputs the stack enumeration cannot see. See CaptureDynamicInputChain.
+//
+// NONE OF THIS HAS BEEN COMPILED OR RUN. Hence the refusal below.
+// ----------------------------------------------------------------------------
+FMonolithActionResult FMonolithNiagaraActions::HandleInsertDynamicInput(const TSharedPtr<FJsonObject>& Params)
+{
+	// ------------------------------------------------------------------------
+	// PRIORITY 1 — refuse. This stands on its own: with no opt-in flag present, not one
+	// line of graph code below runs, so this action cannot crash the editor whatever is
+	// wrong with the rewrite. A stack overflow is unrecoverable and destroys every unsaved
+	// asset in the session, which is strictly worse than the documented "no insert, build
+	// outside-in" ceiling.
+	//
+	// The opt-in flag is deliberately NOT named in the message: a caller that reads this
+	// error should take the workaround, not reach for a switch. It is documented in
+	// CHANGELOG.md for the validator, and should be removed once the rewrite has passed.
+	// ------------------------------------------------------------------------
+	const bool bRebuildOptIn =
+		Params->HasTypedField<EJson::Boolean>(TEXT("allow_unvalidated_rebuild")) &&
+		Params->GetBoolField(TEXT("allow_unvalidated_rebuild"));
+
+	if (!bRebuildOptIn)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("insert_dynamic_input is DISABLED pending a correctness fix, and NOTHING WAS CHANGED. ")
+			TEXT("The implementation moved live nodes between override chains; on its first real call it ")
+			TEXT("spliced a cycle into the parameter map and the engine's recursive map walk followed the ")
+			TEXT("loop until the stack ran out (EXCEPTION_STACK_OVERFLOW), taking the editor and all unsaved ")
+			TEXT("work with it. Refusing is strictly safer than the crash. ")
+			TEXT("WORKAROUND — rebuild the chain outside-in, which is what the editor does internally: ")
+			TEXT("(1) get_dynamic_input_tree on the module_node and keep the result; ")
+			TEXT("(2) remove_dynamic_input on the target input; ")
+			TEXT("(3) add_dynamic_input the NEW outer dynamic input onto that input; ")
+			TEXT("(4) add_dynamic_input the recorded chain onto the new node's chosen input, then ")
+			TEXT("set_dynamic_input_value down the tree to restore the literals from step 1. ")
+			TEXT("Node GUIDs change, so re-read with get_dynamic_input_tree afterwards."));
+	}
+
+	FString SystemPath = NA_GetAssetPath(Params);
+	FString EmitterHandleId = Params->GetStringField(TEXT("emitter"));
+	FString ModuleNodeGuid = Params->GetStringField(TEXT("module_node"));
+	FString InputName = Params->GetStringField(TEXT("input"));
+	FString DynInputPath = Params->GetStringField(TEXT("dynamic_input_script"));
+	FString IntoInputName = Params->GetStringField(TEXT("into_input"));
+
+	if (DynInputPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required field: dynamic_input_script"));
+	if (IntoInputName.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: into_input — name the input on the NEW dynamic input that should receive the existing chain."));
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+
+	ENiagaraScriptUsage FoundUsage;
+	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage);
+	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
+
+	const int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
+
+	FNiagaraTypeDefinition InputType;
+	FName MatchedFullName;
+	{
+		FString InputError;
+		if (!ResolveStackFunctionInput(*MN, System, EmitterIdx, FoundUsage, InputName, InputType, MatchedFullName, InputError))
+		{
+			return FMonolithActionResult::Error(InputError);
+		}
+	}
+
+	UNiagaraScript* DynScript = LoadObject<UNiagaraScript>(nullptr, *DynInputPath);
+
+	FNiagaraTypeDefinition ScriptOutputType;
+	bool bScriptOutputTypeKnown = false;
+	{
+		FString ScriptError;
+		if (!MonolithNiagaraHelpers::ValidateDynamicInputScript(DynScript, DynInputPath, InputType, InputName,
+			ScriptOutputType, bScriptOutputTypeKnown, ScriptError))
+		{
+			return FMonolithActionResult::Error(ScriptError);
+		}
+	}
+
+	// --- Everything that can refuse, refuses before the transaction opens (#26b rule) ---
+
+	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+		FNiagaraParameterHandle(MatchedFullName), MN);
+	UEdGraphPin* ExistingOverridePin = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(*MN, AH);
+
+	if (!ExistingOverridePin || ExistingOverridePin->LinkedTo.Num() == 0 || ExistingOverridePin->LinkedTo[0] == nullptr)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' has no existing dynamic input to insert in front of — there is nothing to wrap. ")
+			TEXT("Use add_dynamic_input to attach the first one. NOTHING WAS CHANGED."), *InputName));
+	}
+
+	UEdGraphPin* CapturedOutputPin = ExistingOverridePin->LinkedTo[0];
+	UNiagaraNodeFunctionCall* CapturedRoot = Cast<UNiagaraNodeFunctionCall>(CapturedOutputPin->GetOwningNode());
+	if (!CapturedRoot)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' is driven by a %s, not by a dynamic input. Only a dynamic input chain can be captured ")
+			TEXT("and recreated; wrapping a parameter binding or data interface is not supported. NOTHING WAS CHANGED."),
+			*InputName, *CapturedOutputPin->GetOwningNode()->GetClass()->GetName()));
+	}
+
+	// The captured chain's output has to be acceptable to the new node's into_input. We can
+	// only check that once the new node exists, but its own script output type is knowable now.
+	const FNiagaraTypeDefinition CapturedOutputType = UEdGraphSchema_Niagara::PinToTypeDefinition(CapturedOutputPin);
+
+	// Invariant I-15: SetDynamicInputForFunctionInput reads OverrideNodeInputPin->LinkedTo[0]
+	// with no bounds check (NiagaraStackGraphUtilities.cpp:2289-2294). On a damaged stack chain
+	// that is a hard crash inside the editor, taking unsaved state with it — so check here,
+	// before the transaction, and refuse instead.
+	if (UNiagaraNode* ExistingOverrideNN = Cast<UNiagaraNode>(ExistingOverridePin->GetOwningNode()))
+	{
+		UEdGraphPin* OverrideNodeMapIn = MonolithNiagaraHelpers::GetParameterMapPin(*ExistingOverrideNN, EGPD_Input);
+		if (!OverrideNodeMapIn || OverrideNodeMapIn->LinkedTo.Num() == 0)
+		{
+			return FMonolithActionResult::Error(
+				TEXT("The override node for this input is not connected to the stack's ParameterMap chain. ")
+				TEXT("Proceeding would dereference an empty pin array inside the engine and crash the editor. ")
+				TEXT("Run audit_stack_wiring on this emitter. NOTHING WAS CHANGED."));
+		}
+	}
+
+	UEdGraph* Graph = MN->GetGraph();
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(TEXT("The module node has no graph. NOTHING WAS CHANGED."));
+	}
+
+	// Baseline for the cycle guard. See the identical block in HandleAddDynamicInput: this is
+	// what licenses EnsureGraphAcyclic to CUT a back edge later — any cycle found after the
+	// mutation is provably ours, because there was none before it.
+	{
+		UEdGraphNode* PreFrom = nullptr;
+		UEdGraphNode* PreTo = nullptr;
+		FString PrePath;
+		if (FindGraphLinkCycle(Graph, PreFrom, PreTo, PrePath))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("This graph ALREADY contains a link cycle (%s) before any change — probably left by an earlier ")
+				TEXT("run of this action. Opening this emitter's stack will stack-overflow the editor. Refusing to ")
+				TEXT("touch it. NOTHING WAS CHANGED. Do not save; close the editor without saving."),
+				*PrePath));
+		}
+	}
+
+	// ------------------------------------------------------------------------
+	// CAPTURE — before anything is touched, and it refuses rather than guesses. A rebuild
+	// that silently drops a data interface or a static switch selection would trade a crash
+	// for data loss, which is not obviously better. Everything that survives this call is
+	// replayable from the two add-primitives alone.
+	// ------------------------------------------------------------------------
+	FCapturedDynamicInput Capture;
+	{
+		FString CaptureError;
+		if (!CaptureDynamicInputChain(*CapturedRoot, System, EmitterIdx, FoundUsage, 0, Capture, CaptureError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("insert_dynamic_input recreates the existing chain from captured data (the editor does the same ")
+				TEXT("thing through cut/paste), and this chain cannot be captured losslessly: %s. ")
+				TEXT("Refusing rather than rebuilding something different from what is there. NOTHING WAS CHANGED. ")
+				TEXT("Restructure by hand instead: get_dynamic_input_tree, remove_dynamic_input, then ")
+				TEXT("add_dynamic_input outside-in."),
+				*CaptureError));
+		}
+	}
+
+	TSharedRef<FJsonObject> CaptureJson = CapturedChainToJson(Capture);
+	const int32 CapturedNodeCount = CountCapturedNodes(Capture);
+
+	// Carried verbatim into every post-mutation error message: if a rebuild dies half way,
+	// this is the only remaining description of what the caller had.
+	FString CaptureJsonText;
+	{
+		TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&CaptureJsonText);
+		FJsonSerializer::Serialize(CaptureJson, Writer);
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "InsertDynInput", "Insert Dynamic Input"));
+	System->Modify();
+
+	// Rebuild the captured chain back onto the ORIGINAL input. Used on every failure path
+	// after the removal, so a bad into_input costs the caller nothing. It is the same replay
+	// used for the success path, so it has no independent failure mode.
+	auto RestoreCapturedChain = [&]() -> bool
+	{
+		UNiagaraNodeFunctionCall* Restored = nullptr;
+		FString RestoreError;
+		return ReplayCapturedDynamicInput(Capture, *MN, MatchedFullName, InputType, Graph, Restored, RestoreError);
+	};
+
+	// Every post-mutation exit runs the cycle guard before it returns — see EnsureGraphAcyclic.
+	// The engine gets control back the moment we return, and it is the engine's unguarded
+	// recursion that turns a bad graph into a dead editor.
+	auto FinishWithError = [&](const FString& Message) -> FMonolithActionResult
+	{
+		FString CycleDiag;
+		const bool bAcyclic = EnsureGraphAcyclic(Graph, CycleDiag);
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(bAcyclic
+			? Message
+			: FString::Printf(TEXT("%s  CYCLE GUARD: %s"), *Message, *CycleDiag));
+	};
+
+	// 1. REMOVE. remove_dynamic_input's own recursive teardown, validated clean: it deletes
+	//    the chain's nodes AND splices their override MapSets out of the map chain.
+	RemoveDynamicInputFromPin(*ExistingOverridePin, Graph);
+
+	// The teardown can delete the override node that owned the pin we are holding, so
+	// re-resolve rather than reusing a possibly dangling pointer.
+	ExistingOverridePin = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(*MN, AH);
+	if (ExistingOverridePin == nullptr)
+	{
+		return FinishWithError(FString::Printf(
+			TEXT("The existing chain was removed but the override pin for '%s' no longer exists, so nothing could be ")
+			TEXT("rebuilt. Undo in the editor. The chain that was there: %s"),
+			*InputName, *CaptureJsonText));
+	}
+	if (ExistingOverridePin->LinkedTo.Num() > 0) ExistingOverridePin->BreakAllPinLinks();
+
+	// 2. ADD the new outer dynamic input — the ordinary add_dynamic_input path, nothing special.
+	UNiagaraNodeFunctionCall* NewDynNode = nullptr;
+	FNiagaraStackGraphUtilities::SetDynamicInputForFunctionInput(*ExistingOverridePin, DynScript, NewDynNode);
+	if (NewDynNode == nullptr)
+	{
+		const bool bRestored = RestoreCapturedChain();
+		return FinishWithError(FString::Printf(
+			TEXT("SetDynamicInputForFunctionInput returned null for '%s'. %s"),
+			*DynInputPath,
+			bRestored
+				? TEXT("The original chain was rebuilt in place, so nothing was lost (node GUIDs changed).")
+				: *FString::Printf(TEXT("THE ORIGINAL CHAIN COULD NOT BE REBUILT — undo in the editor. It was: %s"),
+					*CaptureJsonText)));
+	}
+
+	// 3. Resolve into_input on the NEW node. Only knowable once the node exists, which is why
+	//    this refusal lands after a mutation — but the mutation is fully reversible from the
+	//    capture, so "NOTHING WAS CHANGED" still holds for the caller.
+	FNiagaraTypeDefinition IntoType;
+	FName IntoFullName;
+	{
+		FString IntoError;
+		if (!ResolveStackFunctionInput(*NewDynNode, System, EmitterIdx, FoundUsage, IntoInputName, IntoType, IntoFullName, IntoError))
+		{
+			const bool bRestored = RestoreCapturedChain();
+			return FinishWithError(FString::Printf(
+				TEXT("'%s' is not an input on the new dynamic input, so the existing chain has nowhere to go. %s %s"),
+				*IntoInputName, *IntoError,
+				bRestored
+					? TEXT("The original chain was rebuilt in place — retry with a valid into_input. NOTHING WAS LOST, ")
+					  TEXT("but the chain's node GUIDs changed; re-read with get_dynamic_input_tree.")
+					: *FString::Printf(TEXT("THE ORIGINAL CHAIN COULD NOT BE REBUILT — undo in the editor. It was: %s"),
+						*CaptureJsonText)));
+		}
+	}
+
+	if (!FNiagaraEditorUtilities::AreTypesAssignable(CapturedOutputType, IntoType))
+	{
+		const bool bRestored = RestoreCapturedChain();
+		return FinishWithError(FString::Printf(
+			TEXT("The existing chain outputs %s, which is not assignable to '%s' (%s) on the new dynamic input. %s"),
+			*CapturedOutputType.GetName(), *IntoInputName, *IntoType.GetName(),
+			bRestored
+				? TEXT("The original chain was rebuilt in place — retry with a compatible into_input. NOTHING WAS LOST, ")
+				  TEXT("but the chain's node GUIDs changed; re-read with get_dynamic_input_tree.")
+				: *FString::Printf(TEXT("THE ORIGINAL CHAIN COULD NOT BE REBUILT — undo in the editor. It was: %s"),
+					*CaptureJsonText)));
+	}
+
+	// 4. RECREATE the captured chain under into_input.
+	UNiagaraNodeFunctionCall* RebuiltRoot = nullptr;
+	{
+		FString ReplayError;
+		if (!ReplayCapturedDynamicInput(Capture, *NewDynNode, IntoFullName, IntoType, Graph, RebuiltRoot, ReplayError))
+		{
+			return FinishWithError(FString::Printf(
+				TEXT("The new dynamic input was added but the existing chain could not be recreated under '%s': %s. ")
+				TEXT("The graph is partially built — undo in the editor. The chain that was there: %s"),
+				*IntoInputName, *ReplayError, *CaptureJsonText));
+		}
+	}
+
+	// 5. Prove there is no cycle before the engine gets control back. This is the check that
+	//    would have turned the original crash into an error message.
+	FString CycleDiag;
+	const bool bAcyclic = EnsureGraphAcyclic(Graph, CycleDiag);
+
+	GEditor->EndTransaction();
+
+	if (!bAcyclic)
+	{
+		// Deliberately no RequestCompile: the graph is damaged and compiling it walks it.
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("insert_dynamic_input produced a cyclic graph and the cycle guard intervened. %s ")
+			TEXT("This is a bug in the action, not in your call — please report it. The chain that was there: %s"),
+			*CycleDiag, *CaptureJsonText));
+	}
+
+	System->RequestCompile(false);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetBoolField(TEXT("success"), true);
+	R->SetStringField(TEXT("dynamic_input_node_guid"), NewDynNode->NodeGuid.ToString());
+	R->SetStringField(TEXT("dynamic_input_name"), NewDynNode->GetFunctionName());
+	R->SetStringField(TEXT("into_input"), MonolithNiagaraHelpers::StripModulePrefix(IntoFullName).ToString());
+	R->SetStringField(TEXT("into_input_type"), IntoType.GetName());
+	if (bScriptOutputTypeKnown) R->SetStringField(TEXT("output_type"), ScriptOutputType.GetName());
+	R->SetStringField(TEXT("target_input_type"), InputType.GetName());
+
+	TSharedRef<FJsonObject> Rebuilt = MakeShared<FJsonObject>();
+	Rebuilt->SetStringField(TEXT("disposition"), TEXT("captured, removed, recreated"));
+	Rebuilt->SetNumberField(TEXT("nodes"), CapturedNodeCount);
+	if (RebuiltRoot) Rebuilt->SetStringField(TEXT("root_node_guid"), RebuiltRoot->NodeGuid.ToString());
+	Rebuilt->SetObjectField(TEXT("tree"), CaptureJson);
+	Rebuilt->SetStringField(TEXT("note"),
+		TEXT("The chain was NOT moved — it was read into data, deleted, and recreated with the same add primitives ")
+		TEXT("the editor's paste uses. EVERY NODE GUID IN IT CHANGED (invariant I-19): any guid you were holding for ")
+		TEXT("a node in this chain is stale. Re-read with get_dynamic_input_tree."));
+	R->SetObjectField(TEXT("rebuilt_chain"), Rebuilt);
+
+	R->SetStringField(TEXT("cycle_guard"), TEXT("passed"));
+	R->SetStringField(TEXT("verify_with"),
+		TEXT("get_dynamic_input_tree on the module_node, then get_stage_graph — the traversal must visit every node ")
+		TEXT("exactly once, and request_compile must report 0 errors."));
 	return NA_SuccessObj(R);
 }
 
@@ -11249,57 +12569,76 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSearchDynamicInputs(const T
 	FString InputType = Params->HasField(TEXT("input_type")) ? Params->GetStringField(TEXT("input_type")).ToLower() : TEXT("");
 	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 20;
 
-	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-
-	FARFilter Filter;
-	Filter.ClassPaths.Add(UNiagaraScript::StaticClass()->GetClassPathName());
-	Filter.bRecursiveClasses = true;
-	Filter.bRecursivePaths = true;
+	// ------------------------------------------------------------------------
+	// Gap #31-B — discovery used to be a FOLDER-NAME heuristic: every candidate whose
+	// package path did not contain "/DynamicInputs/" was skipped. A byte-identical copy of
+	// Multiply_Float saved to /Game/FX/_Probes/ returned 0 hits against 15 for the engine
+	// originals, while working perfectly when passed by direct path — so anything we author
+	// ourselves was invisible to search but usable everywhere else.
+	//
+	// This now asks the same question the editor's own dynamic input picker asks:
+	// FNiagaraEditorUtilities::GetFilteredScriptAssets with ScriptUsageToInclude =
+	// ENiagaraScriptUsage::DynamicInput (NiagaraStackFunctionInput.cpp:2126-2130), which
+	// filters on the UNiagaraScript::Usage asset-registry tag (NiagaraEditorUtilities.cpp:1396-1401).
+	// bIncludeNonLibraryScripts is ON deliberately: a script we just authored is not in the
+	// library, and hiding it would reintroduce the same blind spot from the other side.
+	// ------------------------------------------------------------------------
+	FNiagaraEditorUtilities::FGetFilteredScriptAssetsOptions FilterOptions;
+	FilterOptions.ScriptUsageToInclude = ENiagaraScriptUsage::DynamicInput;
+	FilterOptions.bIncludeNonLibraryScripts = true;
 
 	TArray<FAssetData> Assets;
-	AR.GetAssets(Filter, Assets);
+	FNiagaraEditorUtilities::GetFilteredScriptAssets(FilterOptions, Assets);
+
+	TArray<FString> Tokens;
+	if (!Query.IsEmpty()) Query.ParseIntoArray(Tokens, TEXT(" "), true);
 
 	TArray<TSharedPtr<FJsonValue>> Results;
 	for (const FAssetData& Asset : Assets)
 	{
 		FString Path = Asset.GetSoftObjectPath().ToString();
-		if (!Path.Contains(TEXT("/DynamicInputs/"))) continue;
-
 		FString AssetName = Asset.AssetName.ToString();
 
-		// Keyword filter
-		if (!Query.IsEmpty())
+		// Keyword filter first — it is free, and it keeps the load below off most assets.
+		bool bAllMatch = true;
+		for (const FString& Token : Tokens)
 		{
-			TArray<FString> Tokens;
-			Query.ParseIntoArray(Tokens, TEXT(" "), true);
-			bool bAllMatch = true;
-			for (const FString& Token : Tokens)
+			if (!AssetName.Contains(Token, ESearchCase::IgnoreCase) && !Path.Contains(Token, ESearchCase::IgnoreCase))
 			{
-				if (!AssetName.Contains(Token, ESearchCase::IgnoreCase) && !Path.Contains(Token, ESearchCase::IgnoreCase))
-				{
-					bAllMatch = false; break;
-				}
+				bAllMatch = false; break;
 			}
-			if (!bAllMatch) continue;
 		}
+		if (!bAllMatch) continue;
 
 		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
 		Entry->SetStringField(TEXT("display_name"), AssetName);
 		Entry->SetStringField(TEXT("script_path"), Path);
 
-		// Infer output type from name patterns (lightweight — avoids loading the script)
-		FString LowerName = AssetName.ToLower();
-		FString InferredType = TEXT("unknown");
-		if (LowerName.Contains(TEXT("float"))) InferredType = TEXT("float");
-		else if (LowerName.Contains(TEXT("color"))) InferredType = TEXT("LinearColor");
-		else if (LowerName.Contains(TEXT("vector"))) InferredType = TEXT("Vector");
-		else if (LowerName.Contains(TEXT("int"))) InferredType = TEXT("int32");
-		else if (LowerName.Contains(TEXT("bool"))) InferredType = TEXT("bool");
-		Entry->SetStringField(TEXT("inferred_output_type"), InferredType);
+		// The REAL output type, read off the script's output node the way the editor reads it,
+		// instead of guessing from the asset name (which reported SetBoolByFloatComparison as
+		// "float"). Costs a load per surviving candidate; the keyword filter above is what
+		// keeps that bounded.
+		FString OutputTypeName = TEXT("unknown");
+		FNiagaraTypeDefinition ScriptOutputType;
+		if (UNiagaraScript* Script = Cast<UNiagaraScript>(Asset.GetAsset()))
+		{
+			if (MonolithNiagaraHelpers::TryGetDynamicInputOutputType(Script, ScriptOutputType))
+			{
+				OutputTypeName = ScriptOutputType.GetName();
+			}
+		}
+		Entry->SetStringField(TEXT("output_type"), OutputTypeName);
+		// Kept for callers written against the old field name; same value now that it is real.
+		Entry->SetStringField(TEXT("inferred_output_type"), OutputTypeName);
 
-		// Type filter — exclude unknowns and non-matching types when filter is specified
-		if (!InputType.IsEmpty() && (InferredType == TEXT("unknown") || !InferredType.Equals(InputType, ESearchCase::IgnoreCase)))
-			continue;
+		// Type filter. The caller's spelling ("float", "Vector") is matched loosely against the
+		// engine's ("NiagaraFloat", "Vector3f") so the documented filter values keep working.
+		if (!InputType.IsEmpty())
+		{
+			if (OutputTypeName == TEXT("unknown")) continue;
+			const FString LowerOutput = OutputTypeName.ToLower();
+			if (!LowerOutput.Equals(InputType) && !LowerOutput.Contains(InputType)) continue;
+		}
 
 		Results.Add(MakeShared<FJsonValueObject>(Entry));
 		if (Results.Num() >= Limit) break;
@@ -11308,6 +12647,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSearchDynamicInputs(const T
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetNumberField(TEXT("count"), Results.Num());
 	R->SetArrayField(TEXT("dynamic_inputs"), Results);
+	R->SetStringField(TEXT("discovery"),
+		TEXT("Filtered on ENiagaraScriptUsage::DynamicInput (the editor's own rule), not on a /DynamicInputs/ folder name."));
 	return NA_SuccessObj(R);
 }
 
@@ -12522,6 +13863,18 @@ namespace
 			InputNode->BreakAllNodeLinks();
 			Graph->RemoveNode(InputNode);
 		}
+		else if (UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(LinkedNode))
+		{
+			// A linked-parameter binding (set_module_input_binding). The engine tears this
+			// down the same way — RemoveNodesForStackFunctionInputOverridePin removes a
+			// UNiagaraNodeParameterMapGet unconditionally (NiagaraStackGraphUtilities.cpp:2045-2053)
+			// — and it is safe because SetLinkedParameterValueForFunctionInput creates a FRESH
+			// MapGet per binding (NiagaraStackGraphUtilities.cpp:2158-2160), so no other input
+			// shares this node. Without this branch, replacing a binding with a dynamic input
+			// left the MapGet behind as an orphan.
+			GetNode->BreakAllNodeLinks();
+			Graph->RemoveNode(GetNode);
+		}
 
 		// Clean the override pin link
 		OverridePin.BreakAllPinLinks();
@@ -12805,49 +14158,140 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetDynamicInputInputs(const
 
 	UNiagaraGraph* Graph = Src->NodeGraph;
 
-	// Find input nodes (parameters)
+	// ------------------------------------------------------------------------
+	// Gap #31-F — this action used to enumerate UNiagaraNodeInput nodes only, and report
+	// whatever it found. For the stock Multiply_Float that is a SINGLE node: the graph's
+	// ParameterMap input, named "NewInput" — so it answered input_count 1 / NiagaraParameterMap
+	// where the real answer is A and B. A dynamic input's inputs are not input nodes at all;
+	// they are Module.* parameters read out of the parameter map, which is why
+	// get_dynamic_input_tree (which runs GetStackFunctionInputs on a PLACED node) got it right.
+	//
+	// There is no placed node here, so the inputs are collected from the two places that
+	// carry them on an unattached script, unioned and deduped:
+	//   1. the graph's script-variable registry (UNiagaraGraph::GetAllMetaData, the exported
+	//      accessor for VariableToScriptVariable — NiagaraGraph.h:367-368), which is what the
+	//      script editor's Parameters panel lists; and
+	//   2. the Module.* output pins on the graph's ParameterMap Get nodes, which is where the
+	//      values are physically read.
+	// ParameterMap-typed entries are excluded — the map is plumbing, never an input.
+	// ------------------------------------------------------------------------
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+
+	struct FDiscoveredInput
+	{
+		FName FullName;
+		FNiagaraTypeDefinition Type;
+		FString Source;
+	};
+	TArray<FDiscoveredInput> Discovered;
+	TSet<FName> SeenNames;
+
+	// Switch selectors are enumerated separately below and must not also show up as
+	// ordinary inputs — they are registered as script variables like everything else.
+	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+	MonolithNiagaraHelpers::CollectStaticSwitchInputs(Graph, SwitchInputs);
+	TSet<FName> SwitchNames;
+	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
+	{
+		SwitchNames.Add(SwitchInput.Variable.GetName());
+	}
+
+	auto AddInput = [&](const FName& FullName, const FNiagaraTypeDefinition& Type, const TCHAR* Source)
+	{
+		if (FullName.IsNone() || !Type.IsValid()) return;
+		if (Type == MapDef) return;
+		const FString FullNameStr = FullName.ToString();
+		if (!FullNameStr.StartsWith(TEXT("Module."))) return;   // Engine./Particles./System. are reads, not inputs
+		if (SwitchNames.Contains(FullName)) return;
+		if (SeenNames.Contains(FullName)) return;
+		SeenNames.Add(FullName);
+		Discovered.Add({ FullName, Type, FString(Source) });
+	};
+
+	for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& Pair : Graph->GetAllMetaData())
+	{
+		AddInput(Pair.Key.GetName(), Pair.Key.GetType(), TEXT("script_variable"));
+	}
+
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
+		if (!GetNode) continue;
+		for (UEdGraphPin* Pin : GetNode->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output) continue;
+			if (Pin->PinName.IsNone() || Pin->PinName == TEXT("Add")) continue;
+			AddInput(Pin->PinName, UEdGraphSchema_Niagara::PinToTypeDefinition(Pin), TEXT("parameter_map_get"));
+		}
+	}
+
+	// Scripts that DO use input nodes (older or hand-built ones) still get read, minus the map.
 	TArray<UNiagaraNodeInput*> InputNodes;
 	Graph->GetNodesOfClass<UNiagaraNodeInput>(InputNodes);
-
-	TArray<TSharedPtr<FJsonValue>> InputsArr;
 	for (UNiagaraNodeInput* InputNode : InputNodes)
 	{
 		if (!InputNode) continue;
 		if (InputNode->Usage != ENiagaraInputNodeUsage::Parameter) continue;
+		AddInput(InputNode->Input.GetName(), InputNode->Input.GetType(), TEXT("input_node"));
+	}
 
+	TArray<TSharedPtr<FJsonValue>> InputsArr;
+	for (const FDiscoveredInput& In : Discovered)
+	{
 		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
-		FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(InputNode->Input.GetName());
-		IO->SetStringField(TEXT("name"), ShortName.ToString());
-		IO->SetStringField(TEXT("full_name"), InputNode->Input.GetName().ToString());
-		IO->SetStringField(TEXT("type"), InputNode->Input.GetType().GetName());
-		IO->SetBoolField(TEXT("is_data_interface"), InputNode->Input.GetType().IsDataInterface());
+		IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(In.FullName).ToString());
+		IO->SetStringField(TEXT("full_name"), In.FullName.ToString());
+		IO->SetStringField(TEXT("type"), In.Type.GetName());
+		IO->SetBoolField(TEXT("is_data_interface"), In.Type.IsDataInterface());
+		IO->SetBoolField(TEXT("is_static_switch"), false);
+		IO->SetStringField(TEXT("discovered_from"), In.Source);
 		InputsArr.Add(MakeShared<FJsonValueObject>(IO));
 	}
 
-	// Find output type from the output node
-	FString OutputType;
-	TArray<UNiagaraNodeOutput*> OutputNodes;
-	Graph->GetNodesOfClass<UNiagaraNodeOutput>(OutputNodes);
-	for (UNiagaraNodeOutput* OutNode : OutputNodes)
+	// Static switches, via the same shared enumeration get_module_script_inputs uses (gap #18),
+	// so the two actions agree about what a script exposes.
+	int32 StaticSwitchCount = 0;
+	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
 	{
-		if (!OutNode) continue;
-		for (UEdGraphPin* Pin : OutNode->Pins)
-		{
-			if (Pin->Direction != EGPD_Input) continue;
-			FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
-			if (PinType == FNiagaraTypeDefinition::GetParameterMapDef()) continue;
-			OutputType = PinType.GetName();
-			break;
-		}
-		if (!OutputType.IsEmpty()) break;
+		const FName FullName = SwitchInput.Variable.GetName();
+		if (SeenNames.Contains(FullName)) continue;
+		SeenNames.Add(FullName);
+
+		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+		IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(FullName).ToString());
+		IO->SetStringField(TEXT("full_name"), FullName.ToString());
+		IO->SetStringField(TEXT("type"), SwitchInput.Variable.GetType().GetName());
+		IO->SetBoolField(TEXT("is_data_interface"), false);
+		IO->SetBoolField(TEXT("is_static_switch"), true);
+		IO->SetStringField(TEXT("discovered_from"), TEXT("static_switch"));
+		InputsArr.Add(MakeShared<FJsonValueObject>(IO));
+		++StaticSwitchCount;
 	}
+
+	// Output type, resolved by the same helper add_dynamic_input type-checks against.
+	FString OutputType;
+	FNiagaraTypeDefinition ScriptOutputType;
+	if (MonolithNiagaraHelpers::TryGetDynamicInputOutputType(Script, ScriptOutputType))
+	{
+		OutputType = ScriptOutputType.GetName();
+	}
+
+	const ENiagaraScriptUsage ScriptUsage = Script->GetUsage();
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("script_name"), Script->GetName());
+	R->SetStringField(TEXT("usage"), MonolithNiagaraHelpers::DescribeScriptUsage(ScriptUsage));
+	R->SetBoolField(TEXT("is_dynamic_input"), ScriptUsage == ENiagaraScriptUsage::DynamicInput);
 	R->SetStringField(TEXT("output_type"), OutputType);
 	R->SetNumberField(TEXT("input_count"), InputsArr.Num());
+	R->SetNumberField(TEXT("static_switch_count"), StaticSwitchCount);
 	R->SetArrayField(TEXT("inputs"), InputsArr);
+	if (ScriptUsage != ENiagaraScriptUsage::DynamicInput)
+	{
+		R->SetStringField(TEXT("warning"),
+			TEXT("This script's usage is not DynamicInput — add_dynamic_input will refuse it. Use get_module_script_inputs for module scripts."));
+	}
 	return NA_SuccessObj(R);
 }
 
@@ -18023,7 +19467,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	}
 
 	// --- Orphan nodes: fully disconnected nodes, and MapGets with no consumed outputs ---
+	// Every stack module, so the dead-dynamic-input test below cannot mistake one for a
+	// leaked chain node (a module has no value output pin, but the exclusion is explicit).
+	TSet<const UEdGraphNode*> StackModuleNodes;
+	for (const FStageInfo& SI : Stages)
+	{
+		for (UNiagaraNodeFunctionCall* MNode : SI.Modules)
+		{
+			if (MNode) StackModuleNodes.Add(MNode);
+		}
+	}
+
 	TArray<TSharedPtr<FJsonValue>> Orphans;
+	int32 DeadDynamicInputCount = 0;
 	for (const FAuditGraph& AG : Graphs)
 	{
 		for (UEdGraphNode* Node : AG.Graph->Nodes)
@@ -18035,6 +19491,65 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 			for (UEdGraphPin* P : Node->Pins)
 			{
 				if (P->LinkedTo.Num() > 0) { bAnyLink = true; break; }
+			}
+
+			// ----------------------------------------------------------------
+			// Gap #31 / Group 2 — DEAD BUT TRAVERSED dynamic inputs.
+			//
+			// The two tests above only catch nodes that are fully disconnected or feed
+			// nothing at all. A displaced dynamic input chain is neither: every node below
+			// the chain root keeps its ParameterMap links, so it stays inside the engine's
+			// compiled traversal (confirmed with get_stage_graph's BuildTraversal) while
+			// computing into an override parameter nothing reads. Two replaces left three
+			// such nodes behind and this action still reported orphan_count 0.
+			//
+			// The signature is precise: a UNiagaraNodeFunctionCall that is NOT a stack
+			// module, has a value (non-ParameterMap) output pin, and that pin is linked to
+			// nothing. A live dynamic input always has its value pin linked to the override
+			// pin it drives; a stack module has no value output pin at all.
+			// Detection only — removal is deliberately NOT wired into clean_stack_orphans,
+			// because deleting a chain node also has to splice its override MapSet out of
+			// the map chain, and that is remove_dynamic_input's job, not a sweeper's.
+			// ----------------------------------------------------------------
+			bool bDeadDynamicInput = false;
+			if (bAnyLink && !StackModuleNodes.Contains(Node))
+			{
+				if (UNiagaraNodeFunctionCall* FuncNode = Cast<UNiagaraNodeFunctionCall>(Node))
+				{
+					int32 ValueOutputCount = 0;
+					int32 LinkedValueOutputCount = 0;
+					for (UEdGraphPin* P : FuncNode->Pins)
+					{
+						if (P->Direction != EGPD_Output || IsMapPin(P)) continue;
+						++ValueOutputCount;
+						if (P->LinkedTo.Num() > 0) ++LinkedValueOutputCount;
+					}
+					bDeadDynamicInput = ValueOutputCount > 0 && LinkedValueOutputCount == 0;
+				}
+			}
+
+			if (bDeadDynamicInput)
+			{
+				++DeadDynamicInputCount;
+				TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+				O->SetStringField(TEXT("graph"), AG.OwnerName);
+				O->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+				O->SetStringField(TEXT("node"), Node->GetName());
+				O->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+				O->SetStringField(TEXT("kind"), TEXT("dead_dynamic_input"));
+				if (UNiagaraNodeFunctionCall* FuncNode = Cast<UNiagaraNodeFunctionCall>(Node))
+				{
+					O->SetStringField(TEXT("function_name"), FuncNode->GetFunctionName());
+					if (FuncNode->FunctionScript)
+					{
+						O->SetStringField(TEXT("script_path"), FuncNode->FunctionScript->GetPathName());
+					}
+				}
+				O->SetStringField(TEXT("reason"),
+					TEXT("dynamic input node whose value output feeds nothing, but whose ParameterMap links keep it in the compiled traversal — "
+					     "a displaced chain node. Remove it with remove_dynamic_input (dynamic_input_node = node_guid); it is invisible to clean_stack_orphans."));
+				Orphans.Add(MakeShared<FJsonValueObject>(O));
+				continue;
 			}
 
 			bool bDanglingFeeder = false;
@@ -18078,6 +19593,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	R->SetArrayField(TEXT("problem_links"), DeadLinks);
 	R->SetNumberField(TEXT("orphan_count"), Orphans.Num());
 	R->SetArrayField(TEXT("orphan_nodes"), Orphans);
+	R->SetNumberField(TEXT("dead_dynamic_input_count"), DeadDynamicInputCount);
 	R->SetNumberField(TEXT("writer_count"), WriterIndex.Writers.Num());
 	R->SetBoolField(TEXT("has_issues"), DeadLinks.Num() > 0 || Orphans.Num() > 0);
 	return NA_SuccessObj(R);
