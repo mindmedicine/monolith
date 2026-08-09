@@ -36,6 +36,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "UObject/UnrealType.h"
+#include "Misc/StringOutputDevice.h"
 #include "MaterialShared.h"
 #include "RHIShaderPlatform.h"
 #include "Misc/Base64.h"
@@ -211,7 +212,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Material asset path"))
 			.Required(TEXT("code"), TEXT("string"), TEXT("HLSL code for the custom node"))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Node description"))
-			.Optional(TEXT("output_type"), TEXT("string"), TEXT("Output type (float, float2, float3, float4)"))
+			.Optional(TEXT("output_type"), TEXT("string"), TEXT("Output type: float/Float1, float2/Float2, float3/Float3, float4/Float4 (CMOT_ prefix also accepted, case-insensitive). Unknown values are REFUSED, not defaulted to Float1."), TEXT("Float1"))
 			.Optional(TEXT("pos_x"), TEXT("integer"), TEXT("Node X position in graph"))
 			.Optional(TEXT("pos_y"), TEXT("integer"), TEXT("Node Y position in graph"))
 			.Optional(TEXT("inputs"), TEXT("array"), TEXT("Array of input pin definitions"))
@@ -329,13 +330,13 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("set_expression_property"),
-		TEXT("Set a property value on an existing material expression node"),
+		TEXT("Set a property value on an existing material expression node. Values are parsed against the property's real type and REFUSED (before any write) if they do not fit; the response reports the value re-read off the property, not the request."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetExpressionProperty),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Material asset path"))
 			.Required(TEXT("expression_name"), TEXT("string"), TEXT("Name of the expression node"))
 			.Required(TEXT("property_name"), TEXT("string"), TEXT("Property to set (e.g. R, ParameterName, SamplerType, Texture)"))
-			.Required(TEXT("value"), TEXT("string"), TEXT("Value as string (parsed via ImportText for complex types) or number"))
+			.Required(TEXT("value"), TEXT("string"), TEXT("Value as a JSON string, number or boolean. Numeric properties need a number or a numeric string; bools accept true/false, 1/0, \"yes\"/\"no\", \"on\"/\"off\"; object properties need a resolvable asset path (or \"None\" to clear); structs/enums go through ImportText. Unparseable values are refused, never coerced to 0/false."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("connect_expressions"),
@@ -460,7 +461,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("expression_name"), TEXT("string"), TEXT("Name of the UMaterialExpressionCustom node"))
 			.Optional(TEXT("code"), TEXT("string"), TEXT("New HLSL code"))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("New description/label"))
-			.Optional(TEXT("output_type"), TEXT("string"), TEXT("Output type: Float1, Float2, Float3, Float4"))
+			.Optional(TEXT("output_type"), TEXT("string"), TEXT("Output type: float/Float1, float2/Float2, float3/Float3, float4/Float4 (CMOT_ prefix also accepted, case-insensitive). Unknown values are REFUSED, not defaulted to Float1."))
 			.Optional(TEXT("inputs"), TEXT("array"), TEXT("Array of {name, type?} input pin definitions (replaces all inputs)"))
 			.Optional(TEXT("additional_outputs"), TEXT("array"), TEXT("Array of {name, type} output pin definitions (replaces all additional outputs)"))
 			.Optional(TEXT("include_file_paths"), TEXT("array"), TEXT("Array of HLSL include file paths"))
@@ -842,14 +843,43 @@ static EMaterialProperty ParseMaterialProperty(const FString& PropName)
 	return Found ? *Found : MP_MAX;
 }
 
-/** Map string to ECustomMaterialOutputType. */
-static ECustomMaterialOutputType ParseCustomOutputType(const FString& TypeName)
+/** Every spelling the output-type parser accepts, phrased for an error message. */
+static const TCHAR* DescribeCustomOutputTypeOptions()
 {
-	if (TypeName == TEXT("CMOT_Float1") || TypeName == TEXT("Float1")) return CMOT_Float1;
-	if (TypeName == TEXT("CMOT_Float2") || TypeName == TEXT("Float2")) return CMOT_Float2;
-	if (TypeName == TEXT("CMOT_Float3") || TypeName == TEXT("Float3")) return CMOT_Float3;
-	if (TypeName == TEXT("CMOT_Float4") || TypeName == TEXT("Float4")) return CMOT_Float4;
-	return CMOT_Float1;
+	return TEXT("float/float1/Float1/CMOT_Float1, float2/Float2/CMOT_Float2, ")
+	       TEXT("float3/Float3/CMOT_Float3, float4/Float4/CMOT_Float4 (case-insensitive)");
+}
+
+/**
+ * Map a string to ECustomMaterialOutputType.
+ *
+ * Gap M5: this used to `return CMOT_Float1;` for anything unrecognised, so `output_type:
+ * "banana"` produced a silently-Float1 node with no error. It now refuses instead.
+ *
+ * `float` is in the table on purpose. describe_query has always advertised
+ * "(float, float2, float3, float4)" while the table only held Float1..Float4 — `float`
+ * fell through to the CMOT_Float1 fallback and was therefore right by coincidence, not by
+ * design. Documenting it and implementing it now agree.
+ *
+ * Case is NOT a problem and no case handling is needed here: FString::operator== forwards
+ * to Equals(..., ESearchCase::IgnoreCase), so "float4" and "FLOAT4" already matched. An
+ * earlier source reading claiming this parser was case-sensitive was measured false —
+ * do not "fix" it.
+ */
+static bool TryParseCustomOutputType(const FString& TypeName, ECustomMaterialOutputType& OutType, FString& OutError)
+{
+	const FString Trimmed = TypeName.TrimStartAndEnd();
+
+	if (Trimmed == TEXT("CMOT_Float1") || Trimmed == TEXT("Float1") || Trimmed == TEXT("float")) { OutType = CMOT_Float1; return true; }
+	if (Trimmed == TEXT("CMOT_Float2") || Trimmed == TEXT("Float2")) { OutType = CMOT_Float2; return true; }
+	if (Trimmed == TEXT("CMOT_Float3") || Trimmed == TEXT("Float3")) { OutType = CMOT_Float3; return true; }
+	if (Trimmed == TEXT("CMOT_Float4") || Trimmed == TEXT("Float4")) { OutType = CMOT_Float4; return true; }
+
+	OutError = FString::Printf(
+		TEXT("Unknown output_type '%s'. Valid values: %s. Refused rather than defaulting to Float1 — ")
+		TEXT("a silently-Float1 node compiles clean and produces the wrong shader."),
+		*TypeName, DescribeCustomOutputTypeOptions());
+	return false;
 }
 
 /** Map ECustomMaterialOutputType to string. */
@@ -2356,6 +2386,42 @@ FMonolithActionResult FMonolithMaterialActions::CreateCustomHLSLNode(const TShar
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
 	}
 
+	// Gap M5 — resolve every output type BEFORE the transaction opens. CancelTransaction is
+	// proven not to roll back (gap #36), so a refusal after the node exists would leave a
+	// half-built node behind. Parsed values are carried forward so the type that was
+	// validated is the exact type that gets shipped (recurring defect #1).
+	ECustomMaterialOutputType ParsedOutputType = CMOT_Float1;
+	if (!OutputType.IsEmpty())
+	{
+		FString OutputTypeError;
+		if (!TryParseCustomOutputType(OutputType, ParsedOutputType, OutputTypeError))
+		{
+			return FMonolithActionResult::Error(OutputTypeError);
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
+	TMap<int32, ECustomMaterialOutputType> ParsedAdditionalOutputTypes;
+	if (Params->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
+	{
+		for (int32 OutIdx = 0; OutIdx < AddOutputsArray->Num(); ++OutIdx)
+		{
+			const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
+			if ((*AddOutputsArray)[OutIdx] && (*AddOutputsArray)[OutIdx]->TryGetObject(OutObjPtr) && OutObjPtr
+				&& (*OutObjPtr)->HasField(TEXT("type")))
+			{
+				ECustomMaterialOutputType ParsedAddType = CMOT_Float1;
+				FString AddTypeError;
+				if (!TryParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")), ParsedAddType, AddTypeError))
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("additional_outputs[%d]: %s"), OutIdx, *AddTypeError));
+				}
+				ParsedAdditionalOutputTypes.Add(OutIdx, ParsedAddType);
+			}
+		}
+	}
+
 	GEditor->BeginTransaction(FText::FromString(TEXT("CreateCustomHLSLNode")));
 	Mat->Modify();
 
@@ -2374,7 +2440,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateCustomHLSLNode(const TShar
 
 	if (!OutputType.IsEmpty())
 	{
-		CustomExpr->OutputType = ParseCustomOutputType(OutputType);
+		CustomExpr->OutputType = ParsedOutputType;
 	}
 
 	// Set inputs from JSON array
@@ -2394,21 +2460,20 @@ FMonolithActionResult FMonolithMaterialActions::CreateCustomHLSLNode(const TShar
 		}
 	}
 
-	// Set additional outputs from JSON array
-	const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
-	if (Params->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
+	// Set additional outputs from JSON array (types already validated above)
+	if (AddOutputsArray)
 	{
 		CustomExpr->AdditionalOutputs.Empty();
-		for (const TSharedPtr<FJsonValue>& OutVal : *AddOutputsArray)
+		for (int32 OutIdx = 0; OutIdx < AddOutputsArray->Num(); ++OutIdx)
 		{
 			const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
-			if (OutVal && OutVal->TryGetObject(OutObjPtr) && OutObjPtr)
+			if ((*AddOutputsArray)[OutIdx] && (*AddOutputsArray)[OutIdx]->TryGetObject(OutObjPtr) && OutObjPtr)
 			{
 				FCustomOutput NewOutput;
 				NewOutput.OutputName = *(*OutObjPtr)->GetStringField(TEXT("name"));
-				if ((*OutObjPtr)->HasField(TEXT("type")))
+				if (const ECustomMaterialOutputType* ParsedAddType = ParsedAdditionalOutputTypes.Find(OutIdx))
 				{
-					NewOutput.OutputType = ParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")));
+					NewOutput.OutputType = *ParsedAddType;
 				}
 				CustomExpr->AdditionalOutputs.Add(NewOutput);
 			}
@@ -3478,6 +3543,449 @@ FMonolithActionResult FMonolithMaterialActions::GetCompilationStats(const TShare
 }
 
 // ============================================================================
+// set_expression_property — value handling (gaps M2 / M3 / M4)
+//
+// The old path stringified every JSON value up front (FString::SanitizeFloat for numbers)
+// and then re-parsed that string with Atof / Atoi / an `== "1"` comparison. One decision,
+// three silent bugs, all measured on /Game/FX/_Probes/M_Test_Census3:
+//
+//   M2  a JSON number 1 became "1.0", which is neither "true" nor "1", so a bool property
+//       that was True was set to FALSE — the OPPOSITE of the request — and reported as
+//       success. The string "1" set True. Two spellings, opposite results.
+//   M3  "banana" on a float Atof'd to 0.0 and OVERWROTE an existing 4.0, reported success,
+//       and echoed "banana" back. A typo silently destroyed data.
+//   M4  the response's `value` field was the caller's own stringified input, emitted
+//       without ever reading the object, so M2 and M3 were both invisible from it.
+//
+// The rule broken is recurring-defect #1: whatever you checked must be the exact thing you
+// ship. Values are now resolved FROM THEIR ACTUAL JSON TYPE against the actual FProperty
+// type, refused before anything is touched, and read back off the property afterwards.
+//
+// Refusal happens BEFORE GEditor->BeginTransaction deliberately: CancelTransaction is
+// proven not to roll back (gap #36, measured 0 -> 17 -> 17), so validating after opening a
+// transaction and cancelling would leave the damage in place. Validate first is the only
+// pattern that actually protects the asset.
+// ============================================================================
+
+namespace MonolithMaterialValue
+{
+	/**
+	 * Strict decimal literal: optional sign, digits with at most one dot, optional
+	 * exponent, at least one mantissa digit, nothing trailing. Hand-written on purpose:
+	 *  - FCString::Atof answers 0.0 for "banana" and cannot report that it failed — that
+	 *    is the whole of M3;
+	 *  - TCString::IsNumeric (Core/Public/Misc/CString.h:148) lets a bare "-", "+" or "."
+	 *    through and rejects exponent notation.
+	 */
+	static bool TryParseNumber(const FString& InValue, double& OutNumber)
+	{
+		const FString Trimmed = InValue.TrimStartAndEnd();
+		const TCHAR* Cursor = *Trimmed;
+
+		if (*Cursor == TEXT('+') || *Cursor == TEXT('-'))
+		{
+			++Cursor;
+		}
+
+		int32 MantissaDigits = 0;
+		bool bSeenDot = false;
+		while (*Cursor != TEXT('\0'))
+		{
+			if (FChar::IsDigit(*Cursor)) { ++MantissaDigits; ++Cursor; continue; }
+			if (*Cursor == TEXT('.') && !bSeenDot) { bSeenDot = true; ++Cursor; continue; }
+			break;
+		}
+		if (MantissaDigits == 0)
+		{
+			return false;
+		}
+
+		if (*Cursor == TEXT('e') || *Cursor == TEXT('E'))
+		{
+			++Cursor;
+			if (*Cursor == TEXT('+') || *Cursor == TEXT('-')) { ++Cursor; }
+			int32 ExponentDigits = 0;
+			while (FChar::IsDigit(*Cursor)) { ++ExponentDigits; ++Cursor; }
+			if (ExponentDigits == 0)
+			{
+				return false;
+			}
+		}
+
+		if (*Cursor != TEXT('\0'))
+		{
+			return false;   // trailing junk: "4banana", "1.0f", "1 2"
+		}
+
+		OutNumber = FCString::Atod(*Trimmed);
+		return true;
+	}
+
+	/**
+	 * A JSON number as text. FString::SanitizeFloat(1.0) gives "1.0", which the old bool
+	 * comparison could not recognise (M2) and which an integer/enum ImportText stops
+	 * parsing at the dot — so integral values go out as plain integers.
+	 */
+	static FString NumberToDisplayString(double Number)
+	{
+		if (FMath::IsFinite(Number) && Number == FMath::TruncToDouble(Number) && FMath::Abs(Number) < 1.0e15)
+		{
+			return FString::Printf(TEXT("%lld"), static_cast<int64>(Number));
+		}
+		return FString::SanitizeFloat(Number);
+	}
+
+	/** The caller's value as text — for echoing back and for the ImportText fallback. */
+	static FString JsonValueToDisplayString(const TSharedPtr<FJsonValue>& JsonValue)
+	{
+		if (!JsonValue.IsValid())
+		{
+			return FString();
+		}
+		switch (JsonValue->Type)
+		{
+			case EJson::Number:  return NumberToDisplayString(JsonValue->AsNumber());
+			case EJson::Boolean: return JsonValue->AsBool() ? TEXT("true") : TEXT("false");
+			case EJson::String:  return JsonValue->AsString();
+			default:             return FString();
+		}
+	}
+
+	/** JSON type name, so the response can say which spelling arrived. */
+	static const TCHAR* JsonTypeName(EJson Type)
+	{
+		switch (Type)
+		{
+			case EJson::Number:  return TEXT("number");
+			case EJson::Boolean: return TEXT("boolean");
+			case EJson::String:  return TEXT("string");
+			case EJson::Array:   return TEXT("array");
+			case EJson::Object:  return TEXT("object");
+			case EJson::Null:    return TEXT("null");
+			default:             return TEXT("none");
+		}
+	}
+
+	/** Property name + C++ type, for error messages. */
+	static FString DescribeProperty(FProperty* Prop)
+	{
+		return FString::Printf(TEXT("'%s' (%s)"), *Prop->GetName(), *Prop->GetCPPType());
+	}
+
+	static const TCHAR* DescribeBoolSpellings()
+	{
+		return TEXT("JSON true/false, the numbers 1/0, or the strings \"true\"/\"false\", ")
+		       TEXT("\"yes\"/\"no\", \"on\"/\"off\", \"1\"/\"0\" (case-insensitive)");
+	}
+
+	/**
+	 * Resolve a boolean from the JSON value's ACTUAL type — the fix for M2. A JSON number
+	 * is tested as a number, never as the string SanitizeFloat would have produced.
+	 * The accepted string spellings deliberately match MonolithNiagara's
+	 * ResolveStaticSwitchBoolValue so the two subsystems agree about what "true" means.
+	 */
+	static bool TryResolveBool(const TSharedPtr<FJsonValue>& JsonValue, bool& OutBool)
+	{
+		switch (JsonValue->Type)
+		{
+			case EJson::Boolean:
+				OutBool = JsonValue->AsBool();
+				return true;
+			case EJson::Number:
+				OutBool = !FMath::IsNearlyZero(JsonValue->AsNumber());
+				return true;
+			case EJson::String:
+				break;
+			default:
+				return false;
+		}
+
+		const FString Trimmed = JsonValue->AsString().TrimStartAndEnd();
+		static const TCHAR* TrueSpellings[]  = { TEXT("true"),  TEXT("yes"), TEXT("on")  };
+		static const TCHAR* FalseSpellings[] = { TEXT("false"), TEXT("no"),  TEXT("off") };
+		for (const TCHAR* Spelling : TrueSpellings)
+		{
+			if (Trimmed.Equals(Spelling, ESearchCase::IgnoreCase)) { OutBool = true; return true; }
+		}
+		for (const TCHAR* Spelling : FalseSpellings)
+		{
+			if (Trimmed.Equals(Spelling, ESearchCase::IgnoreCase)) { OutBool = false; return true; }
+		}
+
+		double Number = 0.0;
+		if (TryParseNumber(Trimmed, Number))
+		{
+			OutBool = !FMath::IsNearlyZero(Number);
+			return true;
+		}
+		return false;
+	}
+
+	/** A request resolved against the property's real type, before any write happens. */
+	struct FParsedValue
+	{
+		enum class EKind : uint8 { Float, Double, Int, Bool, NameValue, StringValue, Imported };
+
+		EKind   Kind = EKind::StringValue;
+		double  Number = 0.0;
+		int32   Integer = 0;
+		bool    Bool = false;
+		FString Text;
+
+		/**
+		 * Everything reached through ImportText is imported into THIS temporary element
+		 * first. A parse failure therefore never touches the live object (M3), and the
+		 * verification below compares the object against the exact bytes that were shipped
+		 * rather than against a re-stringified guess (recurring defect #1).
+		 */
+		FDefaultConstructedPropertyElement Imported;
+	};
+
+	/** Resolve `value` for `Prop`, or explain why it cannot be. Never mutates anything. */
+	static bool ParseForProperty(FProperty* Prop, const TSharedPtr<FJsonValue>& JsonValue,
+		UObject* Owner, FParsedValue& Out, FString& OutError)
+	{
+		static const TCHAR* IntactSuffix =
+			TEXT(" Refused before the transaction opened — the property still holds its previous value.");
+
+		if (!JsonValue.IsValid() || JsonValue->Type == EJson::Null
+			|| JsonValue->Type == EJson::Array || JsonValue->Type == EJson::Object)
+		{
+			OutError = FString::Printf(
+				TEXT("'value' must be a string, a number or a boolean (got %s).%s"),
+				JsonTypeName(JsonValue.IsValid() ? JsonValue->Type : EJson::None), IntactSuffix);
+			return false;
+		}
+
+		const FString ValueStr = JsonValueToDisplayString(JsonValue);
+
+		// --- Floating point -------------------------------------------------------
+		const bool bIsFloat  = CastField<FFloatProperty>(Prop) != nullptr;
+		const bool bIsDouble = CastField<FDoubleProperty>(Prop) != nullptr;
+		if (bIsFloat || bIsDouble)
+		{
+			double Number = 0.0;
+			bool bHaveNumber = false;
+			if (JsonValue->Type == EJson::Number)      { Number = JsonValue->AsNumber(); bHaveNumber = true; }
+			else if (JsonValue->Type == EJson::String) { bHaveNumber = TryParseNumber(ValueStr, Number); }
+
+			if (!bHaveNumber)
+			{
+				OutError = FString::Printf(
+					TEXT("%s is a floating-point property and '%s' is not a number. ")
+					TEXT("Send a JSON number (4.0) or a numeric string (\"4.0\").%s"),
+					*DescribeProperty(Prop), *ValueStr, IntactSuffix);
+				return false;
+			}
+			Out.Kind = bIsFloat ? FParsedValue::EKind::Float : FParsedValue::EKind::Double;
+			Out.Number = Number;
+			return true;
+		}
+
+		// --- Integer --------------------------------------------------------------
+		if (CastField<FIntProperty>(Prop))
+		{
+			double Number = 0.0;
+			bool bHaveNumber = false;
+			if (JsonValue->Type == EJson::Number)      { Number = JsonValue->AsNumber(); bHaveNumber = true; }
+			else if (JsonValue->Type == EJson::String) { bHaveNumber = TryParseNumber(ValueStr, Number); }
+
+			if (!bHaveNumber)
+			{
+				OutError = FString::Printf(
+					TEXT("%s is an integer property and '%s' is not a number.%s"),
+					*DescribeProperty(Prop), *ValueStr, IntactSuffix);
+				return false;
+			}
+			if (Number != FMath::TruncToDouble(Number))
+			{
+				OutError = FString::Printf(
+					TEXT("%s is an integer property and '%s' is fractional. Atoi used to ")
+					TEXT("truncate this silently; send a whole number.%s"),
+					*DescribeProperty(Prop), *ValueStr, IntactSuffix);
+				return false;
+			}
+			if (Number < static_cast<double>(MIN_int32) || Number > static_cast<double>(MAX_int32))
+			{
+				OutError = FString::Printf(
+					TEXT("%s is a 32-bit integer property and '%s' is out of range.%s"),
+					*DescribeProperty(Prop), *ValueStr, IntactSuffix);
+				return false;
+			}
+			Out.Kind = FParsedValue::EKind::Int;
+			Out.Integer = static_cast<int32>(Number);
+			return true;
+		}
+
+		// --- Bool -----------------------------------------------------------------
+		if (CastField<FBoolProperty>(Prop))
+		{
+			bool bValue = false;
+			if (!TryResolveBool(JsonValue, bValue))
+			{
+				OutError = FString::Printf(
+					TEXT("%s is a bool property and '%s' is not a recognised boolean. Accepted: %s.%s"),
+					*DescribeProperty(Prop), *ValueStr, DescribeBoolSpellings(), IntactSuffix);
+				return false;
+			}
+			Out.Kind = FParsedValue::EKind::Bool;
+			Out.Bool = bValue;
+			return true;
+		}
+
+		// --- Name / String --------------------------------------------------------
+		if (CastField<FNameProperty>(Prop))
+		{
+			Out.Kind = FParsedValue::EKind::NameValue;
+			Out.Text = ValueStr;
+			return true;
+		}
+		if (CastField<FStrProperty>(Prop))
+		{
+			Out.Kind = FParsedValue::EKind::StringValue;
+			Out.Text = ValueStr;
+			return true;
+		}
+
+		// --- Everything else: structs, enums, object refs, arrays -----------------
+		// ImportText, but into a TEMPORARY element. On failure the live property is never
+		// touched; on success the validated bytes are the bytes copied in.
+		Out.Kind = FParsedValue::EKind::Imported;
+		Out.Text = ValueStr;
+		Out.Imported = FDefaultConstructedPropertyElement(Prop);
+
+		FStringOutputDevice ImportErrors;
+		ImportErrors.SetAutoEmitLineTerminator(false);
+		const TCHAR* Consumed = Prop->ImportText_Direct(*ValueStr, Out.Imported.GetObjAddress(), Owner, PPF_None, &ImportErrors);
+
+		if (!Consumed)
+		{
+			FString ParserDetail;
+			if (!ImportErrors.IsEmpty())
+			{
+				ParserDetail = FString::Printf(TEXT(" Parser said: %s"), *ImportErrors);
+			}
+			OutError = FString::Printf(
+				TEXT("Could not parse '%s' as a value for %s.%s%s"),
+				*ValueStr, *DescribeProperty(Prop), *ParserDetail, IntactSuffix);
+			return false;
+		}
+
+		// A partially-consumed buffer means the parser stopped early and kept whatever it
+		// had understood so far — "4banana" on a numeric byte property is a 4 the caller
+		// never asked for. Same class as M3, so refuse it too.
+		while (*Consumed != TEXT('\0') && FChar::IsWhitespace(*Consumed))
+		{
+			++Consumed;
+		}
+		if (*Consumed != TEXT('\0'))
+		{
+			OutError = FString::Printf(
+				TEXT("Only part of '%s' was understood as a value for %s — the parser stopped at '%s'.%s"),
+				*ValueStr, *DescribeProperty(Prop), Consumed, IntactSuffix);
+			return false;
+		}
+
+		// FObjectPropertyBase::ImportText_Internal (CoreUObject/Private/UObject/
+		// PropertyBaseObject.cpp:415-473) SETS THE PROPERTY TO NULL and still returns the
+		// buffer when the path does not resolve — a success that silently clears a live
+		// asset reference. Only hard object refs are checked here: soft/weak pointers
+		// legitimately read back null while their target is unloaded.
+		if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
+		{
+			const bool bClearRequested =
+				ValueStr.IsEmpty()
+				|| ValueStr.Equals(TEXT("None"), ESearchCase::IgnoreCase)
+				|| ValueStr.Equals(TEXT("null"), ESearchCase::IgnoreCase)
+				|| ValueStr.Equals(TEXT("nullptr"), ESearchCase::IgnoreCase);
+
+			if (!bClearRequested && ObjProp->GetObjectPropertyValue(Out.Imported.GetObjAddress()) == nullptr)
+			{
+				OutError = FString::Printf(
+					TEXT("'%s' did not resolve to a %s asset. Pass a full object path (e.g. ")
+					TEXT("/Game/Path/T_Foo.T_Foo), or \"None\" to clear the reference on purpose.%s"),
+					*ValueStr, ObjProp->PropertyClass ? *ObjProp->PropertyClass->GetName() : TEXT("<unknown>"),
+					IntactSuffix);
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	/** Write the already-validated value. Cannot fail — everything failable ran earlier. */
+	static void ApplyToProperty(FProperty* Prop, UObject* Container, const FParsedValue& Parsed)
+	{
+		switch (Parsed.Kind)
+		{
+			case FParsedValue::EKind::Float:
+				CastFieldChecked<FFloatProperty>(Prop)->SetPropertyValue_InContainer(Container, static_cast<float>(Parsed.Number));
+				break;
+			case FParsedValue::EKind::Double:
+				CastFieldChecked<FDoubleProperty>(Prop)->SetPropertyValue_InContainer(Container, Parsed.Number);
+				break;
+			case FParsedValue::EKind::Int:
+				CastFieldChecked<FIntProperty>(Prop)->SetPropertyValue_InContainer(Container, Parsed.Integer);
+				break;
+			case FParsedValue::EKind::Bool:
+				CastFieldChecked<FBoolProperty>(Prop)->SetPropertyValue_InContainer(Container, Parsed.Bool);
+				break;
+			case FParsedValue::EKind::NameValue:
+				CastFieldChecked<FNameProperty>(Prop)->SetPropertyValue_InContainer(Container, FName(*Parsed.Text));
+				break;
+			case FParsedValue::EKind::StringValue:
+				CastFieldChecked<FStrProperty>(Prop)->SetPropertyValue_InContainer(Container, Parsed.Text);
+				break;
+			case FParsedValue::EKind::Imported:
+				Prop->CopySingleValue(Prop->ContainerPtrToValuePtr<void>(Container), Parsed.Imported.GetObjAddress());
+				break;
+		}
+	}
+
+	/**
+	 * Does the object NOW hold what was asked for? Compared against the parsed request at
+	 * engine level — not against a string we produced — and read after PostEditChange, so
+	 * an engine-side normalisation (ValidateParameterNameInternal renaming a colliding
+	 * parameter, MaterialExpressions.cpp:594) shows up as a mismatch instead of hiding.
+	 */
+	static bool MatchesRequest(FProperty* Prop, UObject* Container, const FParsedValue& Parsed)
+	{
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Container);
+		switch (Parsed.Kind)
+		{
+			case FParsedValue::EKind::Float:
+				return CastFieldChecked<FFloatProperty>(Prop)->GetPropertyValue(ValuePtr) == static_cast<float>(Parsed.Number);
+			case FParsedValue::EKind::Double:
+				return CastFieldChecked<FDoubleProperty>(Prop)->GetPropertyValue(ValuePtr) == Parsed.Number;
+			case FParsedValue::EKind::Int:
+				return CastFieldChecked<FIntProperty>(Prop)->GetPropertyValue(ValuePtr) == Parsed.Integer;
+			case FParsedValue::EKind::Bool:
+				return CastFieldChecked<FBoolProperty>(Prop)->GetPropertyValue(ValuePtr) == Parsed.Bool;
+			case FParsedValue::EKind::NameValue:
+				return CastFieldChecked<FNameProperty>(Prop)->GetPropertyValue(ValuePtr) == FName(*Parsed.Text);
+			case FParsedValue::EKind::StringValue:
+				return CastFieldChecked<FStrProperty>(Prop)->GetPropertyValue(ValuePtr).Equals(Parsed.Text, ESearchCase::CaseSensitive);
+			case FParsedValue::EKind::Imported:
+				return Prop->Identical(ValuePtr, Parsed.Imported.GetObjAddress(), PPF_None);
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Re-read the property as text. Deliberately the same export call
+	 * get_expression_details uses, so the write action and the read action cannot
+	 * disagree about spelling for the same stored value.
+	 */
+	static FString ExportCurrentValue(FProperty* Prop, UObject* Container)
+	{
+		FString Exported;
+		Prop->ExportTextItem_Direct(Exported, Prop->ContainerPtrToValuePtr<void>(Container), nullptr, nullptr, PPF_None);
+		return Exported;
+	}
+}
+
+// ============================================================================
 // Action: set_expression_property
 // Params: { "asset_path": "...", "expression_name": "...", "property_name": "...", "value": "..." }
 // ============================================================================
@@ -3488,29 +3996,21 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 	FString ExprName = Params->GetStringField(TEXT("expression_name"));
 	FString PropName = Params->GetStringField(TEXT("property_name"));
 
-	// Extract value as string regardless of JSON type — GetStringField returns ""
-	// for JSON numbers, which then gets Atof'd to 0.0 (Bug #6).
-	FString ValueStr;
+	// The JSON value is kept AS A JSON VALUE all the way to the type-aware parser below.
+	// Stringifying it here is exactly what produced M2 ("1" -> "1.0" -> false).
+	TSharedPtr<FJsonValue> ValueField;
 	{
-		const TSharedPtr<FJsonValue>* ValueField = Params->Values.Find(TEXT("value"));
-		if (ValueField && ValueField->IsValid())
+		const TSharedPtr<FJsonValue>* Found = Params->Values.Find(TEXT("value"));
+		if (Found)
 		{
-			switch ((*ValueField)->Type)
-			{
-				case EJson::Number:
-					ValueStr = FString::SanitizeFloat((*ValueField)->AsNumber());
-					break;
-				case EJson::Boolean:
-					ValueStr = (*ValueField)->AsBool() ? TEXT("true") : TEXT("false");
-					break;
-				case EJson::String:
-					ValueStr = (*ValueField)->AsString();
-					break;
-				default:
-					break;
-			}
+			ValueField = *Found;
 		}
 	}
+	if (!ValueField.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required field: value"));
+	}
+	const FString RequestedValue = MonolithMaterialValue::JsonValueToDisplayString(ValueField);
 
 	// Try UMaterial first, then fall back to UMaterialFunction
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -3566,81 +4066,51 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 			*FString::Join(AvailableProps, TEXT(", "))));
 	}
 
+	// M2 / M3 — resolve the request against the property's real type and REFUSE here, before
+	// the transaction exists. Everything past this point is guaranteed writable, so there is
+	// no failure path left that could half-write the property.
+	MonolithMaterialValue::FParsedValue Parsed;
+	{
+		FString ParseError;
+		if (!MonolithMaterialValue::ParseForProperty(Prop, ValueField, TargetExpr, Parsed, ParseError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("set_expression_property on '%s'.%s: %s"), *ExprName, *PropName, *ParseError));
+		}
+	}
+
+	const FString PreviousValue = MonolithMaterialValue::ExportCurrentValue(Prop, TargetExpr);
+
 	GEditor->BeginTransaction(FText::FromString(TEXT("SetExpressionProperty")));
 	TargetExpr->Modify();
 
-	// Handle numeric types directly, everything else via ImportText
-	bool bSuccess = false;
+	MonolithMaterialValue::ApplyToProperty(Prop, TargetExpr, Parsed);
 
-	if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
-	{
-		float Val = FCString::Atof(*ValueStr);
-		FloatProp->SetPropertyValue_InContainer(TargetExpr, Val);
-		bSuccess = true;
-	}
-	else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
-	{
-		double Val = FCString::Atod(*ValueStr);
-		DoubleProp->SetPropertyValue_InContainer(TargetExpr, Val);
-		bSuccess = true;
-	}
-	else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
-	{
-		int32 Val = FCString::Atoi(*ValueStr);
-		IntProp->SetPropertyValue_InContainer(TargetExpr, Val);
-		bSuccess = true;
-	}
-	else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
-	{
-		bool Val = ValueStr.Equals(TEXT("true"), ESearchCase::IgnoreCase) || ValueStr == TEXT("1");
-		BoolProp->SetPropertyValue_InContainer(TargetExpr, Val);
-		bSuccess = true;
-	}
-	else if (FNameProperty* NameProp = CastField<FNameProperty>(Prop))
-	{
-		NameProp->SetPropertyValue_InContainer(TargetExpr, FName(*ValueStr));
-		bSuccess = true;
-	}
-	else if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
-	{
-		StrProp->SetPropertyValue_InContainer(TargetExpr, ValueStr);
-		bSuccess = true;
-	}
-	else
-	{
-		// Generic ImportText for structs, enums, object references, etc.
-		void* PropAddr = Prop->ContainerPtrToValuePtr<void>(TargetExpr);
-		bSuccess = Prop->ImportText_Direct(*ValueStr, PropAddr, TargetExpr, PPF_None) != nullptr;
-	}
+	// Fire PostEditChangeProperty on the expression first (matches editor behavior).
+	// This triggers AutoSetSampleType() for texture expressions.
+	FPropertyChangedEvent ExprChangeEvent(Prop);
+	TargetExpr->PostEditChangeProperty(ExprChangeEvent);
 
-	if (bSuccess)
+	// Pass the actual property so PostEditChangePropertyInternal calls
+	// MaterialGraph->RebuildGraph() and the editor display updates correctly.
+	FPropertyChangedEvent ChangeEvent(Prop);
+	if (Mat)
 	{
-		// Fire PostEditChangeProperty on the expression first (matches editor behavior).
-		// This triggers AutoSetSampleType() for texture expressions.
-		FPropertyChangedEvent ExprChangeEvent(Prop);
-		TargetExpr->PostEditChangeProperty(ExprChangeEvent);
-
-		// Pass the actual property so PostEditChangePropertyInternal calls
-		// MaterialGraph->RebuildGraph() and the editor display updates correctly.
-		FPropertyChangedEvent ChangeEvent(Prop);
-		if (Mat)
-		{
-			Mat->PreEditChange(Prop);
-			Mat->PostEditChangeProperty(ChangeEvent);
-		}
-		else if (MatFunc)
-		{
-			MatFunc->PreEditChange(Prop);
-			MatFunc->PostEditChangeProperty(ChangeEvent);
-		}
+		Mat->PreEditChange(Prop);
+		Mat->PostEditChangeProperty(ChangeEvent);
+	}
+	else if (MatFunc)
+	{
+		MatFunc->PreEditChange(Prop);
+		MatFunc->PostEditChangeProperty(ChangeEvent);
 	}
 
 	GEditor->EndTransaction();
 
-	if (!bSuccess)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to set property '%s' to '%s' on expression '%s'"), *PropName, *ValueStr, *ExprName));
-	}
+	// M4 — read the property back AFTER PostEditChange. The response no longer echoes the
+	// request; `value` below is what the object actually holds.
+	const FString StoredValue = MonolithMaterialValue::ExportCurrentValue(Prop, TargetExpr);
+	const bool bMatchesRequest = MonolithMaterialValue::MatchesRequest(Prop, TargetExpr, Parsed);
 
 	// VT compatibility check — warn on texture/sampler mismatch
 	TArray<FString> Warnings;
@@ -3670,11 +4140,36 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 		}
 	}
 
+	// M4 — a mismatch here can no longer mean "we wrote garbage": bad input was refused
+	// before the transaction. It means the ENGINE changed the value during PostEditChange
+	// (the parameter-name collision rename is the common legitimate case), so say so
+	// loudly rather than reporting a clean success the caller would misread.
+	if (!bMatchesRequest)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("Requested '%s' but the property reads back as '%s' after PostEditChangeProperty. ")
+			TEXT("The write was applied and is NOT rolled back; the engine normalised it ")
+			TEXT("(e.g. parameter names are made unique on collision). Trust 'value', not 'requested_value'."),
+			*RequestedValue, *StoredValue));
+	}
+
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
 	ResultJson->SetStringField(TEXT("expression_name"), ExprName);
 	ResultJson->SetStringField(TEXT("property_name"), PropName);
-	ResultJson->SetStringField(TEXT("value"), ValueStr);
+	ResultJson->SetStringField(TEXT("property_type"), Prop->GetCPPType());
+	// `value` is the property RE-READ off the object, not the request (gap M4).
+	ResultJson->SetStringField(TEXT("value"), StoredValue);
+	ResultJson->SetStringField(TEXT("previous_value"), PreviousValue);
+	ResultJson->SetStringField(TEXT("requested_value"), RequestedValue);
+	ResultJson->SetStringField(TEXT("requested_json_type"), MonolithMaterialValue::JsonTypeName(ValueField->Type));
+	ResultJson->SetBoolField(TEXT("verified"), bMatchesRequest);
+	ResultJson->SetStringField(TEXT("verification"),
+		TEXT("'value' and 'previous_value' are read off the property with the same export ")
+		TEXT("get_expression_details uses; 'verified' compares the live property against the ")
+		TEXT("parsed request at engine level. This proves STORED STATE ONLY — it is not ")
+		TEXT("behavioural proof. To prove the change does anything, recompile ")
+		TEXT("(get_compilation_stats) or render it (get_thumbnail)."));
 
 	if (Warnings.Num() > 0)
 	{
@@ -5113,6 +5608,41 @@ FMonolithActionResult FMonolithMaterialActions::UpdateCustomHlslNode(const TShar
 			*ExprName, *FString::Join(AvailableNames, TEXT(", "))));
 	}
 
+	// Gap M5 — resolve every output type BEFORE the transaction. Refusing afterwards would
+	// leave the other updated fields written (CancelTransaction does not roll back, gap #36),
+	// and the parsed values below are the ones actually shipped (recurring defect #1).
+	ECustomMaterialOutputType ParsedOutputType = CMOT_Float1;
+	if (Params->HasField(TEXT("output_type")))
+	{
+		FString OutputTypeError;
+		if (!TryParseCustomOutputType(Params->GetStringField(TEXT("output_type")), ParsedOutputType, OutputTypeError))
+		{
+			return FMonolithActionResult::Error(OutputTypeError);
+		}
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
+	TMap<int32, ECustomMaterialOutputType> ParsedAdditionalOutputTypes;
+	if (Params->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
+	{
+		for (int32 OutIdx = 0; OutIdx < AddOutputsArray->Num(); ++OutIdx)
+		{
+			const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
+			if ((*AddOutputsArray)[OutIdx] && (*AddOutputsArray)[OutIdx]->TryGetObject(OutObjPtr) && OutObjPtr
+				&& (*OutObjPtr)->HasField(TEXT("type")))
+			{
+				ECustomMaterialOutputType ParsedAddType = CMOT_Float1;
+				FString AddTypeError;
+				if (!TryParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")), ParsedAddType, AddTypeError))
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("additional_outputs[%d]: %s"), OutIdx, *AddTypeError));
+				}
+				ParsedAdditionalOutputTypes.Add(OutIdx, ParsedAddType);
+			}
+		}
+	}
+
 	GEditor->BeginTransaction(FText::FromString(TEXT("UpdateCustomHlslNode")));
 	Mat->Modify();
 	CustomExpr->Modify();
@@ -5133,7 +5663,7 @@ FMonolithActionResult FMonolithMaterialActions::UpdateCustomHlslNode(const TShar
 
 	if (Params->HasField(TEXT("output_type")))
 	{
-		CustomExpr->OutputType = ParseCustomOutputType(Params->GetStringField(TEXT("output_type")));
+		CustomExpr->OutputType = ParsedOutputType;
 		UpdatedFields.Add(TEXT("output_type"));
 	}
 
@@ -5154,20 +5684,19 @@ FMonolithActionResult FMonolithMaterialActions::UpdateCustomHlslNode(const TShar
 		UpdatedFields.Add(TEXT("inputs"));
 	}
 
-	const TArray<TSharedPtr<FJsonValue>>* AddOutputsArray = nullptr;
-	if (Params->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
+	if (AddOutputsArray)
 	{
 		CustomExpr->AdditionalOutputs.Empty();
-		for (const TSharedPtr<FJsonValue>& OutVal : *AddOutputsArray)
+		for (int32 OutIdx = 0; OutIdx < AddOutputsArray->Num(); ++OutIdx)
 		{
 			const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
-			if (OutVal && OutVal->TryGetObject(OutObjPtr) && OutObjPtr)
+			if ((*AddOutputsArray)[OutIdx] && (*AddOutputsArray)[OutIdx]->TryGetObject(OutObjPtr) && OutObjPtr)
 			{
 				FCustomOutput NewOutput;
 				NewOutput.OutputName = *(*OutObjPtr)->GetStringField(TEXT("name"));
-				if ((*OutObjPtr)->HasField(TEXT("type")))
+				if (const ECustomMaterialOutputType* ParsedAddType = ParsedAdditionalOutputTypes.Find(OutIdx))
 				{
-					NewOutput.OutputType = ParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")));
+					NewOutput.OutputType = *ParsedAddType;
 				}
 				CustomExpr->AdditionalOutputs.Add(NewOutput);
 			}
@@ -6009,7 +6538,21 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 					}
 					else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
 					{
-						bool bVal = ValueStr.Equals(TEXT("true"), ESearchCase::IgnoreCase) || ValueStr == TEXT("1");
+						// Gap M2's twin, in the graph builder: this used to compare the
+						// SanitizeFloat'd string against "1", so props {"Flag": 1} (a JSON
+						// number, stringified to "1.0") set FALSE. Resolve from the JSON
+						// value's real type instead, and refuse rather than guess.
+						bool bVal = false;
+						if (!MonolithMaterialValue::TryResolveBool(Pair.Value, bVal))
+						{
+							auto ErrJson = MakeShared<FJsonObject>();
+							ErrJson->SetStringField(TEXT("node_id"), Id);
+							ErrJson->SetStringField(TEXT("warning"), FString::Printf(
+								TEXT("Property '%s' on '%s' is a bool and '%s' is not a recognised boolean (accepted: %s) — left at its default."),
+								*Pair.Key, *FullClassName, *ValueStr, MonolithMaterialValue::DescribeBoolSpellings()));
+							OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+							continue;
+						}
 						BoolProp->SetPropertyValue(ValuePtr, bVal);
 					}
 					else if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
@@ -6133,6 +6676,55 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 				PosY = static_cast<int32>((*PosArray)[1]->AsNumber());
 			}
 
+			// Gap M5 — resolve output types BEFORE the node is created, so an unknown
+			// spelling reports an error and creates nothing rather than silently producing
+			// a Float1 node. Per-node, not per-spec: the rest of the graph still builds.
+			ECustomMaterialOutputType ParsedOutputType = CMOT_Float1;
+			TMap<int32, ECustomMaterialOutputType> ParsedAdditionalOutputTypes;
+			{
+				FString OutputTypeError;
+				if (CustomObj->HasField(TEXT("output_type"))
+					&& !TryParseCustomOutputType(CustomObj->GetStringField(TEXT("output_type")), ParsedOutputType, OutputTypeError))
+				{
+					auto ErrJson = MakeShared<FJsonObject>();
+					ErrJson->SetStringField(TEXT("node_id"), Id);
+					ErrJson->SetStringField(TEXT("error"), OutputTypeError);
+					OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+					continue;
+				}
+
+				const TArray<TSharedPtr<FJsonValue>>* PreAddOutputs = nullptr;
+				bool bAddOutputTypeRejected = false;
+				if (CustomObj->TryGetArrayField(TEXT("additional_outputs"), PreAddOutputs))
+				{
+					for (int32 OutIdx = 0; OutIdx < PreAddOutputs->Num(); ++OutIdx)
+					{
+						const TSharedPtr<FJsonObject>* PreOutObjPtr = nullptr;
+						if ((*PreAddOutputs)[OutIdx] && (*PreAddOutputs)[OutIdx]->TryGetObject(PreOutObjPtr) && PreOutObjPtr
+							&& (*PreOutObjPtr)->HasField(TEXT("type")))
+						{
+							ECustomMaterialOutputType ParsedAddType = CMOT_Float1;
+							FString AddTypeError;
+							if (!TryParseCustomOutputType((*PreOutObjPtr)->GetStringField(TEXT("type")), ParsedAddType, AddTypeError))
+							{
+								auto ErrJson = MakeShared<FJsonObject>();
+								ErrJson->SetStringField(TEXT("node_id"), Id);
+								ErrJson->SetStringField(TEXT("error"), FString::Printf(
+									TEXT("additional_outputs[%d]: %s"), OutIdx, *AddTypeError));
+								OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+								bAddOutputTypeRejected = true;
+								break;
+							}
+							ParsedAdditionalOutputTypes.Add(OutIdx, ParsedAddType);
+						}
+					}
+				}
+				if (bAddOutputTypeRejected)
+				{
+					continue;
+				}
+			}
+
 			UMaterialExpression* BaseExpr = CreateExpressionFunc(UMaterialExpressionCustom::StaticClass(), PosX, PosY);
 			UMaterialExpressionCustom* CustomExpr = Cast<UMaterialExpressionCustom>(BaseExpr);
 			if (!CustomExpr)
@@ -6154,7 +6746,7 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			}
 			if (CustomObj->HasField(TEXT("output_type")))
 			{
-				CustomExpr->OutputType = ParseCustomOutputType(CustomObj->GetStringField(TEXT("output_type")));
+				CustomExpr->OutputType = ParsedOutputType;
 			}
 
 			const TArray<TSharedPtr<FJsonValue>>* InputsArray = nullptr;
@@ -6177,16 +6769,17 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			if (CustomObj->TryGetArrayField(TEXT("additional_outputs"), AddOutputsArray))
 			{
 				CustomExpr->AdditionalOutputs.Empty();
-				for (const TSharedPtr<FJsonValue>& OutVal : *AddOutputsArray)
+				for (int32 OutIdx = 0; OutIdx < AddOutputsArray->Num(); ++OutIdx)
 				{
 					const TSharedPtr<FJsonObject>* OutObjPtr = nullptr;
-					if (OutVal && OutVal->TryGetObject(OutObjPtr) && OutObjPtr)
+					if ((*AddOutputsArray)[OutIdx] && (*AddOutputsArray)[OutIdx]->TryGetObject(OutObjPtr) && OutObjPtr)
 					{
 						FCustomOutput NewOutput;
 						NewOutput.OutputName = *(*OutObjPtr)->GetStringField(TEXT("name"));
-						if ((*OutObjPtr)->HasField(TEXT("type")))
+						// Types were resolved before the node was created (gap M5).
+						if (const ECustomMaterialOutputType* ParsedAddType = ParsedAdditionalOutputTypes.Find(OutIdx))
 						{
-							NewOutput.OutputType = ParseCustomOutputType((*OutObjPtr)->GetStringField(TEXT("type")));
+							NewOutput.OutputType = *ParsedAddType;
 						}
 						CustomExpr->AdditionalOutputs.Add(NewOutput);
 					}
