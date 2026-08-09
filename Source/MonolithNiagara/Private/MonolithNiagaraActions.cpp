@@ -12752,6 +12752,117 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 							FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
 					}
 
+					// ------------------------------------------------------------------
+					// Static switches are gathered BEFORE the input loop, not after it.
+					//
+					// Gap #50: the loop below has to say whether a static-typed input's value
+					// actually survives the round trip, and the only honest answer is "yes, it
+					// is in static_switches[X]" or "no, nothing carries it". Both require the
+					// switch names to already be known. Answering from an assumption instead is
+					// how remediation text ends up naming a fix that does not exist
+					// (recurring defect pattern #5).
+					// ------------------------------------------------------------------
+					TArray<UEdGraphPin*> StaticSwitchPins;
+					TSet<UEdGraphPin*> HiddenSwitchPins;
+					if (ExportEmitterIdx != INDEX_NONE)
+					{
+						FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[ExportEmitterIdx].GetInstance();
+						FCompileConstantResolver SwitchResolver(VE, Usage);
+						FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(
+							*MN, StaticSwitchPins, HiddenSwitchPins, SwitchResolver);
+					}
+
+					// Keyed on the whitespace-stripped spelling: `set_static_switch_value` and
+					// the stack input list disagree about spaces ("Scale RGB" vs "ScaleRGB"),
+					// which is the same collision that falsified #42's "agreement by
+					// construction" claim. Matching loosely here only affects a diagnostic
+					// string, never a write.
+					TMap<FString, FString> StaticSwitchByStrippedName;
+					if (StaticSwitchPins.Num() > 0)
+					{
+						TArray<TSharedPtr<FJsonValue>> SwitchArr;
+						for (UEdGraphPin* SwitchPin : StaticSwitchPins)
+						{
+							if (!SwitchPin) continue;
+							const FString SwitchName = SwitchPin->GetFName().ToString();
+							TSharedRef<FJsonObject> SwObj = MakeShared<FJsonObject>();
+							SwObj->SetStringField(TEXT("name"), SwitchName);
+							SwObj->SetStringField(TEXT("value"), SwitchPin->DefaultValue);
+							SwitchArr.Add(MakeShared<FJsonValueObject>(SwObj));
+
+							FString Stripped = SwitchName;
+							Stripped.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+							StaticSwitchByStrippedName.Add(Stripped.ToLower(), SwitchName);
+						}
+						MO->SetArrayField(TEXT("static_switches"), SwitchArr);
+					}
+
+					// Which store each exported value came from. Additive and diagnostic: without
+					// it, a spec in which some values are pin defaults and some are parameter-store
+					// renderings is two representations in one channel with no way to tell them
+					// apart — the exact shape of bug this batch exists to remove.
+					TSharedRef<FJsonObject> InputSourcesObj = MakeShared<FJsonObject>();
+					TArray<TSharedPtr<FJsonValue>> UnexportedInputsArr;
+
+					// ------------------------------------------------------------------
+					// GAP #50 — the gap #43 fix turned export into a ROUND-TRIP FAILURE.
+					//
+					// #43 taught export to read the rapid-iteration store. IsRapidIterationType
+					// returns true for EVERY static type (NiagaraStackGraphUtilities.cpp:2833-2834),
+					// so static-switch selectors started arriving in `inputs` - and import feeds
+					// `inputs` to set_module_input_value, which REFUSES static types outright
+					// (the gap #26b refusal). An unmodified export fed straight back therefore
+					// failed on "Manually Enable Rotational Solver", i.e. on SolveForcesAndVelocity,
+					// i.e. on nearly every stock-derived emitter.
+					//
+					// The signal was already computed and simply not consulted: `writable` in
+					// get_module_input_value is NA_TypeSupportsLiteralWrite, which is decided by
+					// the setter's own two refusal rules. Export now consults the same predicate,
+					// so a value only lands in `inputs` if the importer's setter can take it.
+					//
+					// KNOWN LIMIT, stated rather than papered over: this models two of the
+					// setter's three refusal paths. The third (#26b's whitespace collision,
+					// where "Scale RGB" is refused because a separate switch is named "ScaleRGB")
+					// is a name collision, not a type property, and is not predicted here.
+					// ------------------------------------------------------------------
+					auto RecordUnexportableInput =
+						[&UnexportedInputsArr, &StaticSwitchByStrippedName](const FString& ShortName,
+							const FNiagaraTypeDefinition& InType, const TCHAR* SourceLabel)
+					{
+						FString Stripped = ShortName;
+						Stripped.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+						const FString* CarriedBy = StaticSwitchByStrippedName.Find(Stripped.ToLower());
+
+						FString Reason;
+						if (InType.IsStatic())
+						{
+							Reason = TEXT("This input is STATIC (a static-switch selector). set_module_input_value refuses "
+										  "static types, so putting it in 'inputs' would make an unmodified import fail on "
+										  "this module. ");
+							Reason += CarriedBy
+								? FString::Printf(TEXT("Its value IS carried by this module's static_switches entry '%s', which import "
+													   "applies through set_static_switch_value, so the round trip does not lose it."),
+									**CarriedBy)
+								: FString(TEXT("No matching static_switches entry was found for it either, so this value will NOT "
+											   "survive an import - reapply it by hand."));
+						}
+						else
+						{
+							Reason = TEXT("Niagara registers no pin-default utilities for this type, so set_module_input_value "
+										  "cannot encode it onto a pin (gap #41). It is NOT in 'inputs' and will NOT survive an "
+										  "import - reapply it by hand.");
+						}
+
+						TSharedRef<FJsonObject> Unexported = MakeShared<FJsonObject>();
+						Unexported->SetStringField(TEXT("input"), ShortName);
+						Unexported->SetStringField(TEXT("type"), InType.GetName());
+						Unexported->SetStringField(TEXT("source"), SourceLabel);
+						Unexported->SetBoolField(TEXT("importable"), false);
+						if (CarriedBy) Unexported->SetStringField(TEXT("carried_by_static_switch"), *CarriedBy);
+						Unexported->SetStringField(TEXT("reason"), Reason);
+						UnexportedInputsArr.Add(MakeShared<FJsonValueObject>(Unexported));
+					};
+
 					// Dynamic inputs array
 					TArray<TSharedPtr<FJsonValue>> DynInputsArr;
 
@@ -12781,13 +12892,6 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 						? NA_ResolveRapidIterationScript(System, ExportEmitterIdx, Usage, FGuid(), ExportUniqueEmitterName)
 						: nullptr;
 
-					// Which store each exported value came from. Additive and diagnostic: without
-					// it, a spec in which some values are pin defaults and some are parameter-store
-					// renderings is two representations in one channel with no way to tell them
-					// apart — the exact shape of bug this batch exists to remove.
-					TSharedRef<FJsonObject> InputSourcesObj = MakeShared<FJsonObject>();
-					TArray<TSharedPtr<FJsonValue>> UnexportedInputsArr;
-
 					for (const FNiagaraVariable& In : ModInputs)
 					{
 						FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
@@ -12815,9 +12919,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 						}
 						else if (OP && OP->LinkedTo.Num() == 0 && !OP->DefaultValue.IsEmpty())
 						{
-							FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
-							InputsObj->SetStringField(ShortName.ToString(), OP->DefaultValue);
-							InputSourcesObj->SetStringField(ShortName.ToString(), TEXT("override_pin"));
+							const FString ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString();
+							// Gap #50 gate. A pin-sourced value is no more importable than an
+							// RI-sourced one if the setter refuses the type, so the same
+							// predicate decides both. Today this only excludes static types
+							// (a pin cannot hold a default for a type with no pin-default
+							// utilities in the first place), but gating on the setter's rule
+							// rather than on "it came from a pin" is what keeps the two sides
+							// from drifting apart again.
+							if (!NA_TypeSupportsLiteralWrite(In.GetType()))
+							{
+								RecordUnexportableInput(ShortName, In.GetType(), TEXT("override_pin"));
+							}
+							else
+							{
+								InputsObj->SetStringField(ShortName, OP->DefaultValue);
+								InputSourcesObj->SetStringField(ShortName, TEXT("override_pin"));
+							}
 						}
 						else if (!OP && ExportRIScript && NA_IsRapidIterationType(In.GetType()))
 						{
@@ -12834,7 +12952,15 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 							if (NA_ReadRapidIterationValue(ExportRIScript, RIVar, RIValue, bRIRenderable))
 							{
 								const FString ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString();
-								if (bRIRenderable)
+								// Gap #50 gate: renderable is not the same question as importable.
+								// A static bool renders perfectly well and is then refused by
+								// set_module_input_value, which is exactly how the #43 fix broke
+								// the round trip.
+								if (bRIRenderable && !NA_TypeSupportsLiteralWrite(In.GetType()))
+								{
+									RecordUnexportableInput(ShortName, In.GetType(), TEXT("rapid_iteration"));
+								}
+								else if (bRIRenderable)
 								{
 									// Composites serialise as a JSON OBJECT ({"x":..,"y":..} /
 									// {"r":..}), which is emitted as a real object rather than as a
@@ -12865,6 +12991,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 									Unexported->SetStringField(TEXT("input"), ShortName);
 									Unexported->SetStringField(TEXT("type"), In.GetType().GetName());
 									Unexported->SetStringField(TEXT("source"), TEXT("rapid_iteration"));
+									// Same flag the gap #50 entries carry, so a consumer can filter
+									// the array uniformly instead of parsing prose.
+									Unexported->SetBoolField(TEXT("importable"), false);
 									Unexported->SetStringField(TEXT("reason"),
 										TEXT("A rapid-iteration value is set for this input but this build cannot render "
 											 "that type as a value, so it is NOT in 'inputs' and WILL NOT survive an "
@@ -12882,30 +13011,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 						MO->SetArrayField(TEXT("unexported_inputs"), UnexportedInputsArr);
 					if (DynInputsArr.Num() > 0)
 						MO->SetArrayField(TEXT("dynamic_inputs"), DynInputsArr);
-
-					// Static switches
-					TArray<UEdGraphPin*> StaticSwitchPins;
-					TSet<UEdGraphPin*> HiddenSwitchPins;
-					if (ExportEmitterIdx != INDEX_NONE)
-					{
-						FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[ExportEmitterIdx].GetInstance();
-						FCompileConstantResolver SwitchResolver(VE, Usage);
-						FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(
-							*MN, StaticSwitchPins, HiddenSwitchPins, SwitchResolver);
-					}
-					if (StaticSwitchPins.Num() > 0)
-					{
-						TArray<TSharedPtr<FJsonValue>> SwitchArr;
-						for (UEdGraphPin* SwitchPin : StaticSwitchPins)
-						{
-							if (!SwitchPin) continue;
-							TSharedRef<FJsonObject> SwObj = MakeShared<FJsonObject>();
-							SwObj->SetStringField(TEXT("name"), SwitchPin->GetFName().ToString());
-							SwObj->SetStringField(TEXT("value"), SwitchPin->DefaultValue);
-							SwitchArr.Add(MakeShared<FJsonValueObject>(SwObj));
-						}
-						MO->SetArrayField(TEXT("static_switches"), SwitchArr);
-					}
+					// `static_switches` is written above, before the input loop, because the
+					// loop's diagnostics depend on knowing which switches exist.
 				}
 
 				ModulesArr.Add(MakeShared<FJsonValueObject>(MO));
@@ -12945,6 +13052,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 			 "not survive an import and must be reapplied by hand. Values read from the rapid-iteration store use "
 			 "the parameter-store encoding (a JSON object for vectors/colours/quats, a plain scalar otherwise), "
 			 "which import_system_spec consumes directly; pin-sourced values remain raw pin default strings."));
+	// Gap #50. Stated because the previous behaviour looked like MORE data, not less: the
+	// spec got fuller and the round trip got worse.
+	R->SetStringField(TEXT("importability_note"),
+		TEXT("An input only appears in 'inputs' if set_module_input_value can actually write its type - the same "
+			 "predicate get_module_input_value reports as `writable`. Static-switch selectors in particular are now "
+			 "kept OUT of 'inputs' (import refuses static types, which made an unmodified export fail on any emitter "
+			 "containing SolveForcesAndVelocity) and appear in 'unexported_inputs' instead, each saying whether the "
+			 "module's 'static_switches' entry carries the value or whether it is genuinely lost. NOT PREDICTED: the "
+			 "setter also refuses an input whose whitespace-stripped name collides with a static switch's name "
+			 "(e.g. 'Scale RGB' vs 'ScaleRGB', gap #26b) - that is a name collision rather than a type property, so a "
+			 "round trip can still fail on it."));
 	return NA_SuccessObj(R);
 }
 
@@ -19610,11 +19728,66 @@ int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const F
 							if (!SIBR.bSuccess) { OutErrors.Add(FString::Printf(TEXT("set_module_binding[%s]: %s"), *BP2.Key, *SIBR.ErrorMessage)); FailCount++; }
 						}
 					}
-					// Static switches
-					if (MO->HasField(TEXT("static_switches")))
+					// Static switches.
+					//
+					// GAP #48(2): this read GetObjectField while export_system_spec writes an
+					// ARRAY of {name, value}. FJsonObject::GetObjectField on a field of the wrong
+					// type returns a static EMPTY object, so the loop ran zero times and EVERY
+					// static-switch value was dropped on import with no error, no warning and a
+					// clean failed_steps count. One representation written, a different one read
+					// — recurring defect pattern #1.
+					//
+					// Both shapes are accepted rather than one being renamed: the array form is
+					// what every spec exported so far contains, and the object form is what
+					// hand-written specs and older callers use. Whichever arrives, the same
+					// (name, value) pairs are collected first and then applied, so what is read
+					// is exactly what is shipped to the setter.
+					if (const TSharedPtr<FJsonValue> SwitchField = MO->TryGetField(TEXT("static_switches")))
 					{
-						TSharedPtr<FJsonObject> Switches = MO->GetObjectField(TEXT("static_switches"));
-						for (auto& SW : Switches->Values)
+						TArray<TPair<FString, TSharedPtr<FJsonValue>>> SwitchPairs;
+						FString ShapeError;
+
+						if (SwitchField->Type == EJson::Array)
+						{
+							for (const TSharedPtr<FJsonValue>& SwVal : SwitchField->AsArray())
+							{
+								const TSharedPtr<FJsonObject>* SwObj = nullptr;
+								if (!SwVal.IsValid() || !SwVal->TryGetObject(SwObj) || !(*SwObj).IsValid()) continue;
+								FString SwName;
+								if (!(*SwObj)->TryGetStringField(TEXT("name"), SwName) || SwName.IsEmpty()) continue;
+								TSharedPtr<FJsonValue> SwValue = (*SwObj)->TryGetField(TEXT("value"));
+								if (!SwValue.IsValid()) continue;
+								SwitchPairs.Emplace(SwName, SwValue);
+							}
+						}
+						else if (SwitchField->Type == EJson::Object)
+						{
+							// Held in a named local: the FJsonObject is owned by SwitchField, but
+							// iterating a temporary's member container is the kind of thing that
+							// only works by accident.
+							const TSharedPtr<FJsonObject> SwitchObj = SwitchField->AsObject();
+							if (SwitchObj.IsValid())
+							{
+								for (const auto& SW : SwitchObj->Values)
+								{
+									SwitchPairs.Emplace(SW.Key, SW.Value);
+								}
+							}
+						}
+						else
+						{
+							ShapeError = FString::Printf(
+								TEXT("static_switches: expected an array of {name,value} or an object of name->value, got JSON type %d — nothing applied"),
+								static_cast<int32>(SwitchField->Type));
+						}
+
+						if (!ShapeError.IsEmpty())
+						{
+							OutErrors.Add(ShapeError);
+							FailCount++;
+						}
+
+						for (const TPair<FString, TSharedPtr<FJsonValue>>& SW : SwitchPairs)
 						{
 							TSharedRef<FJsonObject> SSP = MakeShared<FJsonObject>();
 							SSP->SetStringField(TEXT("system_path"), SystemPath);
@@ -19759,8 +19932,16 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 				AddParams->SetStringField(TEXT("asset_path"), SystemPath);
 				AddParams->SetStringField(TEXT("name"), ParamName);
 				AddParams->SetStringField(TEXT("type"), (*PObj)->GetStringField(TEXT("type")));
-				if ((*PObj)->HasField(TEXT("default_value")))
-					AddParams->SetStringField(TEXT("default_value"), (*PObj)->GetStringField(TEXT("default_value")));
+				// GAP #48(3): this read "default_value" while export_system_spec writes
+				// "default", so EVERY user-parameter default was silently lost on a merge
+				// import. Overwrite mode (ApplySpecToSystem) already read "default" correctly,
+				// which is why the two modes disagreed. Read the exported spelling first and
+				// keep accepting the alias, and pass the JSON VALUE through rather than
+				// GetStringField — that returned "" for a numeric or object default and turned
+				// a type mismatch into an empty write.
+				TSharedPtr<FJsonValue> SpecDefault = (*PObj)->TryGetField(TEXT("default"));
+				if (!SpecDefault.IsValid()) SpecDefault = (*PObj)->TryGetField(TEXT("default_value"));
+				if (SpecDefault.IsValid()) AddParams->SetField(TEXT("default"), SpecDefault);
 				FMonolithActionResult R = HandleAddUserParameter(AddParams);
 				if (!R.bSuccess)
 				{

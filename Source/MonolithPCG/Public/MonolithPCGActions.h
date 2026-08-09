@@ -5,6 +5,7 @@
 
 #if WITH_PCG
 
+class UPCGEdge;
 class UPCGGraph;
 class UPCGNode;
 class UPCGSettings;
@@ -31,6 +32,13 @@ public:
 	static FMonolithActionResult AddPCGNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult ConnectPCGNodes(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult SetPCGNodeSetting(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Teardown. The other half of the authoring set: without these, a bad edge or a
+	// wrong node is unrepairable through this namespace and the caller has to fall back to
+	// editor.run_python. Both prove their blast radius against the graph's own edge list
+	// after the fact, not against what they intended to touch.
+	static FMonolithActionResult RemovePCGEdge(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult RemovePCGNode(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Discovery (makes add_pcg_node usable without guessing class names) ---
 	static FMonolithActionResult ListPCGNodeTypes(const TSharedPtr<FJsonObject>& Params);
@@ -60,6 +68,36 @@ private:
 
 	/** Serialize one node (id, title, class, pins, edges) for list_pcg_nodes. */
 	static TSharedPtr<FJsonObject> SerializeNode(const UPCGGraph* InGraph, const UPCGNode* InNode);
+
+	/**
+	 * Canonical, comparable identity for one edge: "fromNode.fromPin -> toNode.toPin".
+	 * Returns an empty string for an edge missing either end. Used to diff the graph's edge
+	 * list before and after a removal - a set difference computed from the graph itself is
+	 * external to whatever the action intended to do, which is the only kind of scope proof
+	 * that is worth anything (gap #37).
+	 */
+	static FString MakeEdgeKey(const UPCGGraph* InGraph, const UPCGEdge* InEdge);
+
+	/** Every edge in the graph, as MakeEdgeKey strings. */
+	static void SnapshotEdgeKeys(const UPCGGraph* InGraph, TArray<FString>& OutKeys);
+
+	/**
+	 * True when a directed path InTo -> ... -> InFrom already exists, i.e. when adding an
+	 * edge InFrom -> InTo would close a cycle. OutPath is filled with that existing path in
+	 * data-flow order (InTo first, InFrom last) so the error can name it.
+	 *
+	 * Mirrors the engine's own connection check (UPCGEditorGraphNodeBase::IsCompatible,
+	 * PCGEditorGraphNodeBase.cpp:1232-1287), which walks UPSTREAM from the proposed source
+	 * looking for the proposed destination. That check lives in the editor graph layer and
+	 * is never reached by UPCGGraph::AddEdge, which is why an MCP caller could author a
+	 * cycle the UI refuses.
+	 *
+	 * ITERATIVE on purpose - the engine's version recurses. A recursive detector blows the
+	 * stack on exactly the graphs it exists to catch, and the visited set here also makes it
+	 * terminate on a graph that is ALREADY cyclic, which is the state a caller most needs it
+	 * to work in.
+	 */
+	static bool FindUpstreamPath(const UPCGNode* InFrom, const UPCGNode* InTo, TArray<const UPCGNode*>& OutPath);
 };
 
 #endif // WITH_PCG

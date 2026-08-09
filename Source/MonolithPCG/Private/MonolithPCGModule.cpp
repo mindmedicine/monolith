@@ -16,8 +16,12 @@ void FMonolithPCGModule::StartupModule()
 	// module only loads when the PCG plugin is present (see MonolithPCG.Build.cs).
 
 #if WITH_PCG
+	// Count the registry either side of registration rather than hardcoding a number - the
+	// literal that used to be here said "7 actions" while 8 were registered.
+	const int32 CountBefore = FMonolithToolRegistry::Get().GetActionCount();
 	FMonolithPCGActions::RegisterActions(FMonolithToolRegistry::Get());
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — PCG module loaded (7 actions)"));
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — PCG module loaded (%d actions)"),
+		FMonolithToolRegistry::Get().GetActionCount() - CountBefore);
 #else
 	UE_LOG(LogMonolith, Log, TEXT("Monolith — PCG module loaded with WITH_PCG=0; no pcg actions registered (PCG plugin not found)"));
 #endif
