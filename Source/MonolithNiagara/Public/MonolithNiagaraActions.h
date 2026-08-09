@@ -53,6 +53,10 @@ public:
 	static FMonolithActionResult HandleSetModuleInputDI(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateModuleFromHLSL(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateFunctionFromHLSL(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateDynamicInputFromHLSL(const TSharedPtr<FJsonObject>& Params);
+
+	// DIAGNOSTIC PROBE (gap #36) — not a production action. See the handler for what it measures.
+	static FMonolithActionResult HandleProbeTransactionCancel(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Parameter (9) ---
 	static FMonolithActionResult HandleGetAllParameters(const TSharedPtr<FJsonObject>& Params);
@@ -243,6 +247,11 @@ public:
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
+	/** Resolves an enum literal (name string, case-sensitive then insensitive, or display name) to
+	 *  the canonical pin encoding UEnum::GetNameStringByValue produces. Public because
+	 *  MonolithNiagaraHelpers::ValidateStackInputLiteral needs it for ordinary enum inputs (gap #34),
+	 *  not just for static switches. */
+	static bool ResolveStaticSwitchEnumValue(UEnum* Enum, const FString& RequestedValue, FString& OutRawValue, FString* OutDisplayValue = nullptr);
 
 private:
 	// --- Internal helpers ---
@@ -272,7 +281,6 @@ private:
 	static FString JsonArrayToString(const TArray<TSharedPtr<FJsonValue>>& JsonArray);
 	static FString JsonValueToString(const TSharedPtr<FJsonValue>& Value);
 	static UEnum* TryGetStaticSwitchEnum(UEdGraphPin* SwitchPin, UNiagaraNodeFunctionCall* ModuleNode);
-	static bool ResolveStaticSwitchEnumValue(UEnum* Enum, const FString& RequestedValue, FString& OutRawValue, FString* OutDisplayValue = nullptr);
 	static void AddStaticSwitchEnumMetadata(TSharedRef<FJsonObject> JsonObj, UEnum* Enum, const FString& RawValue);
 
 	// DI override resolution helper — walks override pin upstream to find the DI UObject
