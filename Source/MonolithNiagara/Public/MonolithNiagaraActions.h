@@ -246,6 +246,12 @@ public:
 	static FMonolithActionResult HandleRemoveScriptParameter(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
+	/** Renders a parameter store entry as a value string, reporting FAILURE instead of
+	 *  substituting a sentinel. Gap #42 residual: SerializeParameterValue's "<unsupported>"
+	 *  was being shipped to callers as if it were the value, with is_default:false — a
+	 *  wrong answer dressed as an authoritative one. Callers that can act on "cannot render"
+	 *  must use this; SerializeParameterValue is kept for callers that only ever display. */
+	static bool TrySerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store, FString& OutValue);
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);
 	/** Resolves an enum literal (name string, case-sensitive then insensitive, or display name) to
 	 *  the canonical pin encoding UEnum::GetNameStringByValue produces. Public because

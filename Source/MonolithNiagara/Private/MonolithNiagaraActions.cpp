@@ -2613,6 +2613,44 @@ namespace MonolithNiagaraHelpers
 	}
 
 	/**
+	 * Do two pin-default SPELLINGS mean the same value? Decided by parsing both with the type's
+	 * own registered utilities into allocated probes and comparing the resulting BYTES
+	 * (FNiagaraVariable::HoldsSameData, NiagaraTypes.h:1479-1488) — never by string comparison.
+	 *
+	 * This exists because gap #39's `applied` flag was `Pin->DefaultValue == Value`, a string echo
+	 * that was wrong in BOTH directions: true whenever the engine stored a literal verbatim and
+	 * then ignored it (the #32 failure mode), and false whenever the engine legitimately
+	 * re-spelled the value ("1.0" -> "1.000000"). Comparing parsed bytes gets both right.
+	 *
+	 * bOutComparable is false when the type has no pin-default utilities, in which case there is
+	 * no parser to appeal to and the caller must say so rather than guess.
+	 */
+	bool PinDefaultsAreEquivalent(const FNiagaraTypeDefinition& Type, const FString& A, const FString& B,
+		bool& bOutComparable)
+	{
+		bOutComparable = false;
+		if (!Type.IsValid() || Type.GetSize() <= 0 || Type.GetClass() != nullptr) return false;
+
+		FNiagaraEditorModule& NiagaraEditorModule = FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
+		TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(Type);
+		if (!TypeUtilities.IsValid() || !TypeUtilities->CanHandlePinDefaults()) return false;
+
+		FNiagaraVariable ProbeA(Type, NAME_None);
+		FNiagaraVariable ProbeB(Type, NAME_None);
+		ProbeA.AllocateData();
+		ProbeB.AllocateData();
+		if (!ProbeA.IsDataAllocated() || !ProbeB.IsDataAllocated()) return false;
+
+		// Allocated on purpose, same reason as ValidateStackInputLiteral: on an UNALLOCATED
+		// variable the composite parsers cannot report failure at all (EdGraphSchema_Niagara.cpp:
+		// 1661-1676's rescue clause), so an allocated probe is the only way this answer is real.
+		bOutComparable = true;
+		if (!TypeUtilities->SetValueFromPinDefaultString(A, ProbeA)) return false;
+		if (!TypeUtilities->SetValueFromPinDefaultString(B, ProbeB)) return false;
+		return ProbeA.HoldsSameData(ProbeB);
+	}
+
+	/**
 	 * Checks a caller-supplied literal against the pin's ACTUAL Niagara type.
 	 * Returns false with a caller-facing message naming the valid form (the caller
 	 * prefixes it with the input name); on success OutNormalizedValue carries the
@@ -2760,6 +2798,13 @@ namespace MonolithNiagaraHelpers
 				return true;
 			}
 
+			// A ParameterMap pin's default is structural, never a literal a caller supplies —
+			// nothing to validate and nothing that could be silently discarded.
+			if (InputType == FNiagaraTypeDefinition::GetParameterMapDef())
+			{
+				return true;
+			}
+
 			// LoadModuleChecked, not the engine's GetModuleChecked (EdGraphSchema_Niagara.cpp:1667):
 			// NiagaraEditor is a hard PrivateDependency of this module so it is always loaded, but
 			// loading is a superset of getting and costs nothing on the already-loaded path.
@@ -2767,9 +2812,41 @@ namespace MonolithNiagaraHelpers
 			TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(InputType);
 			if (!TypeUtilities.IsValid() || !TypeUtilities->CanHandlePinDefaults())
 			{
-				// No registered pin-default handling (NiagaraMatrix4, user-defined structs).
-				// The literal is written verbatim exactly as before this fix — UNVALIDATED.
-				return true;
+				// ------------------------------------------------------------------
+				// GAP #41 — REFUSE, do not accept-and-discard.
+				//
+				// This used to `return true` and write the literal verbatim, which for
+				// NiagaraMatrix meant: both the 16-value comma form AND the engine's own
+				// (Row0=(X=..),..) export text returned SUCCESS and compiled to the identity
+				// matrix. The value never reached the shader — a fresh in-block control ruled
+				// out compile staleness — and nothing anywhere reported a problem.
+				//
+				// The reason is structural, not a missing parser on our side: every consumer of a
+				// pin default in the engine is gated on this exact predicate
+				// (EdGraphSchema_Niagara.cpp:1669/1711/1756, NiagaraHlslTranslator.cpp:6929,
+				// NiagaraGraphDigest.cpp:437, NiagaraNodeParameterMapGet.cpp:139).
+				//
+				// THE ENGINE SAYS SO IN SO MANY WORDS. UEdGraphSchema_Niagara::PinToNiagaraVariable
+				// takes the else-branch of that gate and logs
+				//     "Pin had default value string, but default values aren't supported for
+				//      variables of type {X}"                    EdGraphSchema_Niagara.cpp:1678-1684
+				// and then resets the variable to its type default at :1688-1690. So the literal is
+				// discarded by the engine, deliberately, with a warning nobody reads. Writing it is
+				// a guaranteed no-op, and reporting success for a guaranteed no-op is the bug.
+				// ------------------------------------------------------------------
+				OutError = FString::Printf(
+					TEXT("is %s, which has no registered pin-default handling, so a literal CANNOT be stored on ")
+					TEXT("its pin at all — this refusal is not a gap in Monolith's validation. Every engine reader ")
+					TEXT("of a pin default is gated on INiagaraEditorTypeUtilities::CanHandlePinDefaults(), and for ")
+					TEXT("this type that predicate is false: UEdGraphSchema_Niagara::PinToNiagaraVariable takes the ")
+					TEXT("else-branch and logs \"Pin had default value string, but default values aren't supported ")
+					TEXT("for variables of type {%s}\" (EdGraphSchema_Niagara.cpp:1678-1684), then resets the ")
+					TEXT("variable to its type default (:1688-1690). Writing '%s' here previously returned SUCCESS ")
+					TEXT("and compiled to the zero/identity value with 0 errors, in every spelling including the ")
+					TEXT("engine's own export text. Drive this input from a parameter instead — ")
+					TEXT("set_module_input_binding, or a dynamic input. NOTHING WAS CHANGED."),
+					*TypeName, *TypeName, *RequestedValue);
+				return false;
 			}
 
 			const FString Trimmed = RequestedValue.TrimStartAndEnd();
@@ -3614,46 +3691,101 @@ FNiagaraTypeDefinition FMonolithNiagaraActions::ResolveNiagaraType(const FString
 	return FNiagaraTypeDefinition::GetFloatDef();
 }
 
-FString FMonolithNiagaraActions::SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store)
+// ============================================================================
+// Parameter-store value rendering.
+//
+// GAP #42 RESIDUAL — WHY THIS COMPARES WITH IsSameBaseDefinition, NOT operator==.
+//
+// FNiagaraTypeDefinition::operator== includes the type FLAGS in the comparison
+// (NiagaraTypes.h:781-784: `ClassStructOrEnum == Other.ClassStructOrEnum && UnderlyingType ==
+// Other.UnderlyingType && Flags == Other.Flags`). A STATIC bool therefore compares UNEQUAL to
+// FNiagaraTypeDefinition::GetBoolDef() even though its bytes are an ordinary FNiagaraBool, and
+// every branch below fell through to the "<unsupported>" sentinel for it.
+//
+// That is not a corner case: FNiagaraStackGraphUtilities::IsRapidIterationType returns true for
+// EVERY static type before it excludes anything (NiagaraStackGraphUtilities.cpp:2833-2834), so
+// static bools and static ints are exactly the things that DO live in RapidIterationParameters.
+// The validator's report of a NiagaraBool returning `value: "\"<unsupported>\""` with
+// `is_default: false, source: "rapid_iteration"` — while the attached note claimed bools never
+// reach that store — is this bug and its knock-on note in one response. `type` read "NiagaraBool"
+// because GetName() returns ClassStructOrEnum.GetName() (NiagaraTypes.h:859-866) and drops the
+// static flag, which is why it did not look like a static type from the outside.
+//
+// IsSameBaseDefinition (NiagaraTypes.h:786-789) is the engine's own flag-insensitive comparison
+// and is what the engine uses when it means "is this a bool" (see the SetValue<bool> check at
+// NiagaraTypes.h:1673). Static scalars now render as real values.
+// ============================================================================
+bool FMonolithNiagaraActions::TrySerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store, FString& OutValue)
 {
 	const FNiagaraTypeDefinition& T = Variable.GetType();
-	if (T == FNiagaraTypeDefinition::GetFloatDef()) return FString::SanitizeFloat(Store.GetParameterValue<float>(Variable));
-	if (T == FNiagaraTypeDefinition::GetIntDef()) return FString::FromInt(Store.GetParameterValue<int32>(Variable));
-	if (T == FNiagaraTypeDefinition::GetBoolDef())
+	if (!T.IsValid()) return false;
+
+	// Enums share FNiagaraInt32's footprint, so without this they would be rendered as bare
+	// integers by the int branch below — a spelling no pin parser accepts (gap #34).
+	if (T.IsEnum()) return false;
+
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetFloatDef()))
+	{
+		OutValue = FString::SanitizeFloat(Store.GetParameterValue<float>(Variable));
+		return true;
+	}
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetIntDef()))
+	{
+		OutValue = FString::FromInt(Store.GetParameterValue<int32>(Variable));
+		return true;
+	}
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetBoolDef()))
 	{
 		FNiagaraBool V = Store.GetParameterValue<FNiagaraBool>(Variable);
-		return V.IsValid() && V.GetValue() ? TEXT("true") : TEXT("false");
+		OutValue = V.IsValid() && V.GetValue() ? TEXT("true") : TEXT("false");
+		return true;
 	}
-	if (T == FNiagaraTypeDefinition::GetVec2Def())
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetVec2Def()))
 	{
 		FVector2f V = Store.GetParameterValue<FVector2f>(Variable);
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetNumberField(TEXT("x"), V.X); O->SetNumberField(TEXT("y"), V.Y);
-		return JsonObjectToString(O);
+		OutValue = JsonObjectToString(O);
+		return true;
 	}
-	if (T == FNiagaraTypeDefinition::GetVec3Def() || T == FNiagaraTypeDefinition::GetPositionDef())
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetVec3Def()) || T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetPositionDef()))
 	{
 		FVector3f V = Store.GetParameterValue<FVector3f>(Variable);
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetNumberField(TEXT("x"), V.X); O->SetNumberField(TEXT("y"), V.Y); O->SetNumberField(TEXT("z"), V.Z);
-		return JsonObjectToString(O);
+		OutValue = JsonObjectToString(O);
+		return true;
 	}
-	if (T == FNiagaraTypeDefinition::GetVec4Def() || T == FNiagaraTypeDefinition::GetQuatDef())
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetVec4Def()) || T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetQuatDef()))
 	{
 		FVector4f V = Store.GetParameterValue<FVector4f>(Variable);
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetNumberField(TEXT("x"), V.X); O->SetNumberField(TEXT("y"), V.Y);
 		O->SetNumberField(TEXT("z"), V.Z); O->SetNumberField(TEXT("w"), V.W);
-		return JsonObjectToString(O);
+		OutValue = JsonObjectToString(O);
+		return true;
 	}
-	if (T == FNiagaraTypeDefinition::GetColorDef())
+	if (T.IsSameBaseDefinition(FNiagaraTypeDefinition::GetColorDef()))
 	{
 		FLinearColor V = Store.GetParameterValue<FLinearColor>(Variable);
 		TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
 		O->SetNumberField(TEXT("r"), V.R); O->SetNumberField(TEXT("g"), V.G);
 		O->SetNumberField(TEXT("b"), V.B); O->SetNumberField(TEXT("a"), V.A);
-		return JsonObjectToString(O);
+		OutValue = JsonObjectToString(O);
+		return true;
 	}
+
+	// NiagaraMatrix, NiagaraID, data interfaces, user structs. Genuinely not rendered here —
+	// the caller decides what to do about it rather than being handed a sentinel.
+	return false;
+}
+
+FString FMonolithNiagaraActions::SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store)
+{
+	FString Value;
+	if (TrySerializeParameterValue(Variable, Store, Value)) return Value;
+	// Unchanged for display-only callers. Anything that has to make a DECISION about the value
+	// must call TrySerializeParameterValue: this string is not a value and never was.
 	return TEXT("\"<unsupported>\"");
 }
 
@@ -7545,6 +7677,9 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	// attaches, compiles, and then cannot be removed by guid — the exact defect gap #31-G
 	// now refuses. So refuse the malformed shape at authoring time instead.
 	// ------------------------------------------------------------------------
+	// Set when the #44 normalisation below rewrites the body that gets stored, so the response can
+	// say so instead of quietly differing from what the caller sent.
+	bool bBodyNewlineTerminated = false;
 	if (Usage == ENiagaraScriptUsage::DynamicInput)
 	{
 		// ------------------------------------------------------------------------
@@ -7606,6 +7741,9 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		// ------------------------------------------------------------------------
 		{
 			// Strip comments first so a ';' inside a comment cannot cause a false refusal.
+			// NOTE: `Scan` is the ANALYSIS copy. What gets stored on the node is `HlslBody`, and
+			// the divergence between the two is itself a defect — see the #44 block below, which
+			// uses bInLineComment's final state to normalise the copy that actually ships.
 			FString Scan;
 			Scan.Reserve(HlslBody.Len());
 			bool bInLineComment = false;
@@ -7676,6 +7814,38 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 					*ParsedOutputs[0].Name,
 					ParsedInputs.Num() > 0 ? *ParsedInputs[0].Name : TEXT("SomeInput"),
 					ParsedInputs.Num() > 0 ? *ParsedInputs[0].Name : TEXT("SomeInput")));
+			}
+
+			// ------------------------------------------------------------------------
+			// GAP #44 — NORMALISE THE BODY THAT IS ACTUALLY SHIPPED.
+			//
+			// The guard above analyses `Scan` (comments stripped) and then the ORIGINAL `HlslBody`
+			// is what gets written to the node. That divergence resurrects the very bug the guard
+			// exists to prevent: the translator wraps a dynamic input body as
+			//     Out_<Name> = (<type>)( <body> );          NiagaraHlslTranslator.cpp:9204
+			// appending `);` with NO separator, so if the body ENDS INSIDE a `//` comment the
+			// terminator is commented out and the assignment is unterminated:
+			//     Out_OutValue = (float)(... : In_InValue // fallthrough);
+			// Measured at error_count: 0, compile_status UpToDate, and no shader-compiler entry in
+			// the log at all.
+			//
+			// WHY A TRAILING NEWLINE IS THE FIX, from the tokenizer rather than by experiment:
+			// UNiagaraNodeCustomHlsl::GetTokensFromString emits a `//` comment as one token running
+			// "up to the end of the line (INCLUDING the newline)" — but when no newline is found it
+			// falls back to `FoundEndIdx = TargetLength - 1` (NiagaraNodeCustomHlsl.cpp:161-171),
+			// i.e. the token ends without one. ProcessCustomHlsl calls it with the defaults
+			// IncludeComments=true, IncludeWhitespace=true (NiagaraNodeCustomHlsl.h:51) and rejoins
+			// the tokens verbatim, so a newline present in the body survives into the wrap and the
+			// `);` lands on the next line.
+			//
+			// Deliberately CONDITIONAL: only a body that ends inside a line comment is touched, so
+			// every other body still round-trips byte-for-byte through get_custom_hlsl_text.
+			// Block comments were never affected — they self-terminate.
+			// ------------------------------------------------------------------------
+			if (bInLineComment)
+			{
+				HlslBody.AppendChar(TEXT('\n'));
+				bBodyNewlineTerminated = true;
 			}
 		}
 #if !WITH_NIAGARA_WIZARD_PRIVATE
@@ -8351,6 +8521,16 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	{
 		Result->SetStringField(TEXT("output_type"), ParsedOutputs[0].Type.GetName());
 		Result->SetStringField(TEXT("library_visibility"), TEXT("Unexposed"));
+		if (bBodyNewlineTerminated)
+		{
+			Result->SetBoolField(TEXT("body_normalized"), true);
+			Result->SetStringField(TEXT("body_normalization_note"),
+				TEXT("Gap #44: the body ended inside a '//' line comment, so a newline was appended to the text "
+					 "STORED on the node. Without it the translator's closing ');' lands on the commented line and "
+					 "the generated assignment is unterminated — at error_count 0, with no shader-compiler entry in "
+					 "the log. Only the trailing newline was added; nothing else about the body was altered, and "
+					 "get_custom_hlsl_text will therefore report one more trailing newline than was submitted."));
+		}
 		Result->SetBoolField(TEXT("shape_unvalidated"), true);
 		Result->SetStringField(TEXT("shape_warning"),
 			TEXT("Gap #38: this graph shape has NOT been verified by a compile. It was authored with the "
@@ -11359,8 +11539,16 @@ namespace
 
 	// Look the RI parameter up by name so we get the store's own FNiagaraVariable (and therefore
 	// its offset) rather than a synthesised one.
-	bool NA_ReadRapidIterationValue(const UNiagaraScript* Script, const FNiagaraVariable& RIVar, FString& OutValue)
+	//
+	// Returns whether an ENTRY EXISTS. Whether that entry could be RENDERED as a value is a
+	// separate answer (bOutRenderable) — gap #42 residual: these two were conflated, so a type
+	// the serialiser cannot express was reported as `value: "<unsupported>"` with
+	// `is_default: false`, i.e. a sentinel presented as authoritative. Existence and
+	// renderability are now reported independently and the caller never ships the sentinel.
+	bool NA_ReadRapidIterationValue(const UNiagaraScript* Script, const FNiagaraVariable& RIVar,
+		FString& OutValue, bool& bOutRenderable)
 	{
+		bOutRenderable = false;
 		if (!Script) return false;
 		const FNiagaraParameterStore& Store = Script->RapidIterationParameters;
 		for (const FNiagaraVariableWithOffset& VWO : Store.ReadParameterVariables())
@@ -11368,11 +11556,31 @@ namespace
 			const FNiagaraVariable& Var = VWO;
 			if (Var.GetName() == RIVar.GetName())
 			{
-				OutValue = FMonolithNiagaraActions::SerializeParameterValue(Var, Store);
+				bOutRenderable = FMonolithNiagaraActions::TrySerializeParameterValue(Var, Store, OutValue);
 				return true;
 			}
 		}
 		return false;
+	}
+
+	// Whether set_module_input_value can actually write this type, decided by the SAME two rules
+	// that action refuses on — so `writable` stops being a guess and becomes a prediction the
+	// setter is bound to honour:
+	//   1. a static type is a static switch selector; writing a literal to it compiles to
+	//      "Could not resolve static variable through pin" (the gap #26b refusal), and
+	//   2. a type with no registered pin-default utilities cannot be encoded onto a pin at all
+	//      (the gap #41 refusal — NiagaraMatrix was accepted, reported successful, and discarded).
+	// Data interfaces are excluded because they go through set_module_input_di, not a literal.
+	bool NA_TypeSupportsLiteralWrite(const FNiagaraTypeDefinition& InputType)
+	{
+		if (!InputType.IsValid()) return false;
+		if (InputType.IsStatic()) return false;
+		if (InputType.GetSize() <= 0 || InputType.GetClass() != nullptr) return false;
+		if (InputType == FNiagaraTypeDefinition::GetParameterMapDef()) return false;
+
+		FNiagaraEditorModule& NiagaraEditorModule = FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
+		TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(InputType);
+		return TypeUtilities.IsValid() && TypeUtilities->CanHandlePinDefaults();
 	}
 }
 
@@ -11445,7 +11653,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 	// (NiagaraStackFunctionInput.cpp:2763-2767 → CreateRapidIterationVariable).
 	FString RapidIterationValue;
 	FString RapidIterationName;
-	bool bHasRapidIterationValue = false;
+	bool bRapidIterationEntryExists = false;   // an entry is present in the store
+	bool bHasRapidIterationValue = false;      // ...AND we can express it as a value
 	if (NA_IsRapidIterationType(InputType))
 	{
 		FString UniqueEmitterName;
@@ -11456,19 +11665,30 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 			const FNiagaraVariable RIVar = NA_MakeRapidIterationParameter(
 				UniqueEmitterName, FoundUsage, RIHandle.GetParameterHandleString(), InputType);
 			RapidIterationName = RIVar.GetName().ToString();
-			bHasRapidIterationValue = NA_ReadRapidIterationValue(RIScript, RIVar, RapidIterationValue);
+			bRapidIterationEntryExists = NA_ReadRapidIterationValue(RIScript, RIVar, RapidIterationValue, bHasRapidIterationValue);
 		}
 	}
 	// Reported only when an entry actually exists, so the field never implies a store that is
 	// empty. (Static switch inputs are RI-eligible by TYPE but are not RI candidates by the
 	// engine's rule — IsRapidIterationCandidate excludes IsStaticParameter() — so they normally
 	// find nothing here and stay quiet.)
-	if (bHasRapidIterationValue)
+	if (bRapidIterationEntryExists)
 	{
 		R->SetStringField(TEXT("rapid_iteration_parameter"), RapidIterationName);
 	}
 
-	// Check for static switch pin first
+	// Gap #42 residual — an entry EXISTS but this build cannot express it as a value string.
+	// BEHAVIOUR CHANGE: the rapid-iteration value used to be emitted as the string
+	// "\"<unsupported>\"" with is_default:false — a wrong answer wearing an authoritative label.
+	// It is now never emitted at all; the absence IS the answer, and it cannot be mistaken for a
+	// literal a caller can write back.
+	const bool bRapidIterationValueUnavailable = bRapidIterationEntryExists && !bHasRapidIterationValue;
+
+	// Check for static switch pin first.
+	// NOTE the ordering: this branch has its OWN value (read straight off the pin) and returns
+	// before the rapid-iteration commentary is attached below. Attaching it here would ship a note
+	// saying no value could be rendered next to a payload containing one — the exact
+	// self-contradiction this batch is removing, one branch over.
 	for (UEdGraphPin* Pin : MN->Pins)
 	{
 		if (Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
@@ -11481,6 +11701,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 			R->SetStringField(TEXT("value_format"), TEXT("pin_default"));
 			return NA_SuccessObj(R);
 		}
+	}
+
+	// Worded about the RAPID-ITERATION value specifically, so it stays true whether or not the
+	// response also carries an effective value from an override pin further down.
+	if (bRapidIterationValueUnavailable)
+	{
+		R->SetBoolField(TEXT("rapid_iteration_value_unavailable"), true);
+		R->SetStringField(TEXT("rapid_iteration_unavailable_reason"), FString::Printf(
+			TEXT("A rapid-iteration entry exists for this input, but %s cannot be rendered as a value string by this "
+				 "build, so no rapid-iteration value is reported rather than a placeholder. This is a reporting "
+				 "limit, not an empty store."),
+			*InputType.GetName()));
 	}
 
 	// Walk override pin for data inputs
@@ -11504,7 +11736,12 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 		{
 			R->SetStringField(TEXT("value"), RapidIterationValue);
 			R->SetBoolField(TEXT("is_default"), false);
-			R->SetBoolField(TEXT("writable"), true);
+			// Not a constant any more: a STATIC bool/int is a legitimate rapid-iteration entry
+			// (IsRapidIterationType returns true for every static type before it excludes
+			// anything, NiagaraStackGraphUtilities.cpp:2833-2834) and set_module_input_value
+			// REFUSES static types outright. Reporting writable:true for one would have been the
+			// same lie in the other direction.
+			R->SetBoolField(TEXT("writable"), NA_TypeSupportsLiteralWrite(InputType));
 			R->SetBoolField(TEXT("is_linked"), false);
 			R->SetBoolField(TEXT("is_dynamic_input"), false);
 			R->SetStringField(TEXT("source"), TEXT("rapid_iteration"));
@@ -11514,11 +11751,34 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 			R->SetStringField(TEXT("value_format"), TEXT("parameter_store_json"));
 			R->SetStringField(TEXT("source_note"),
 				TEXT("Read from Script->RapidIterationParameters, not from an override pin — this is where the "
-					 "editor UI writes values for every rapid-iteration-eligible type (everything except bool, "
-					 "enum, ParameterMap and UObject). set_module_input_value writes the OVERRIDE PIN instead, "
-					 "and the pin wins at compile time, so writing this input will make the rapid-iteration entry "
-					 "above stale — get_all_parameters will keep reporting the old number. Verify writes against "
-					 "the compiled HLSL, not against a read-back."));
+					 "editor UI writes values for every rapid-iteration-eligible type. The rule is "
+					 "FNiagaraStackGraphUtilities::IsRapidIterationType (NiagaraStackGraphUtilities.cpp:2830-2837): "
+					 "EVERY STATIC TYPE qualifies, and among non-static types everything except bool, enum, "
+					 "ParameterMap and UObject. (A plain bool does not reach this store; a STATIC bool does — the "
+					 "earlier wording of this note omitted the static clause and so contradicted responses it was "
+					 "attached to.) set_module_input_value writes the OVERRIDE PIN instead, and the pin wins at "
+					 "compile time, so writing this input will make the rapid-iteration entry above stale — "
+					 "get_all_parameters will keep reporting the old number. Verify writes against the compiled "
+					 "HLSL, not against a read-back."));
+			return NA_SuccessObj(R);
+		}
+
+		if (bRapidIterationValueUnavailable)
+		{
+			// There IS a value; we just cannot spell it. Saying "unset" here would be the same
+			// class of wrong answer as the "<unsupported>" sentinel it replaces, so this branch
+			// reports the store it came from and emits NO `value` field at all.
+			R->SetBoolField(TEXT("is_default"), false);
+			R->SetBoolField(TEXT("writable"), NA_TypeSupportsLiteralWrite(InputType));
+			R->SetBoolField(TEXT("is_linked"), false);
+			R->SetBoolField(TEXT("is_dynamic_input"), false);
+			R->SetStringField(TEXT("source"), TEXT("rapid_iteration"));
+			R->SetStringField(TEXT("source_note"),
+				TEXT("A rapid-iteration entry exists for this input and it is NOT the module default, but its type "
+					 "cannot be rendered as a value string by this build, so no 'value' field is present. Do not "
+					 "treat the missing field as unset. Ground truth for the effective value is the compiled HLSL "
+					 "(get_compiled_gpu_hlsl on a GPU emitter bakes rapid-iteration values in as ConstantNN "
+					 "literals)."));
 			return NA_SuccessObj(R);
 		}
 
@@ -11536,9 +11796,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 			NA_IsRapidIterationType(InputType)
 				? TEXT("Genuinely unset: no override pin AND no entry in Script->RapidIterationParameters. Both "
 					   "stores were checked, so this is the module's own default.")
-				: TEXT("Genuinely unset: no override pin. This type is not rapid-iteration-eligible (bool, enum, "
-					   "ParameterMap and UObject never go to that store), so the override pin is the only store "
-					   "and there is nothing else to check."));
+				: TEXT("Genuinely unset: no override pin. This type is not rapid-iteration-eligible — "
+					   "FNiagaraStackGraphUtilities::IsRapidIterationType admits every static type, then excludes "
+					   "non-static bool, enum, ParameterMap and UObject, and this type falls in that exclusion — "
+					   "so the override pin is the only store and there is nothing else to check."));
 		return NA_SuccessObj(R);
 	}
 
@@ -11594,9 +11855,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputValue(const T
 	// compiles. Any rapid-iteration entry sitting behind it is stale — which is why
 	// get_all_parameters is wrong in the opposite direction after we write. Reported rather than
 	// hidden, because a caller comparing the two readers otherwise sees an unexplained conflict.
-	if (bHasRapidIterationValue)
+	if (bRapidIterationEntryExists)
 	{
-		R->SetStringField(TEXT("rapid_iteration_value"), RapidIterationValue);
+		// Only emitted when it can be rendered — the shadowed entry is stale by definition, so a
+		// placeholder here would be a sentinel for a value that does not even matter.
+		if (bHasRapidIterationValue) R->SetStringField(TEXT("rapid_iteration_value"), RapidIterationValue);
 		R->SetBoolField(TEXT("rapid_iteration_shadowed"), true);
 		R->SetStringField(TEXT("rapid_iteration_note"),
 			TEXT("An override pin AND a rapid-iteration entry both exist for this input. The override pin wins at "
@@ -12492,6 +12755,39 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 					// Dynamic inputs array
 					TArray<TSharedPtr<FJsonValue>> DynInputsArr;
 
+					// ------------------------------------------------------------------
+					// GAP #43 — EXPORT WAS A DATA-LOSS PATH.
+					//
+					// This loop only ever read the OVERRIDE PIN, so it emitted the handful of
+					// values Monolith itself had written and silently omitted every value a human
+					// set in the editor. The editor routes stack locals into
+					// Script->RapidIterationParameters and DELETES the override pin while doing it
+					// (NiagaraStackFunctionInput.cpp:2313), and that path covers every static type
+					// plus every non-static type except bool/enum/ParameterMap/UObject — i.e. most
+					// of a real system. On the validator's fixture the exported spec was
+					// {"Sphere Radius":"33.0"} and nothing else, while SpawnRate 90, Lifetime
+					// 1.4/1.75, Gravity -980 and Cone Angle 32 were all set. An
+					// export -> import round trip therefore discarded the human's work and
+					// reported success.
+					//
+					// The RI store is consulted here exactly the way get_module_input_value now
+					// consults it, and the PIN STILL WINS when both exist — a read is only exposed
+					// if it has no corresponding write (NiagaraCompilationTasks.cpp:346-347), so
+					// the pin is the effective value and the RI entry behind it is stale. Export
+					// therefore emits the EFFECTIVE value, never both.
+					// ------------------------------------------------------------------
+					FString ExportUniqueEmitterName;
+					UNiagaraScript* ExportRIScript = ExportEmitterIdx != INDEX_NONE
+						? NA_ResolveRapidIterationScript(System, ExportEmitterIdx, Usage, FGuid(), ExportUniqueEmitterName)
+						: nullptr;
+
+					// Which store each exported value came from. Additive and diagnostic: without
+					// it, a spec in which some values are pin defaults and some are parameter-store
+					// renderings is two representations in one channel with no way to tell them
+					// apart — the exact shape of bug this batch exists to remove.
+					TSharedRef<FJsonObject> InputSourcesObj = MakeShared<FJsonObject>();
+					TArray<TSharedPtr<FJsonValue>> UnexportedInputsArr;
+
 					for (const FNiagaraVariable& In : ModInputs)
 					{
 						FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
@@ -12521,10 +12817,69 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 						{
 							FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
 							InputsObj->SetStringField(ShortName.ToString(), OP->DefaultValue);
+							InputSourcesObj->SetStringField(ShortName.ToString(), TEXT("override_pin"));
+						}
+						else if (!OP && ExportRIScript && NA_IsRapidIterationType(In.GetType()))
+						{
+							// NO OVERRIDE PIN AT ALL is the precise trigger — the same condition
+							// get_module_input_value falls back on. An override pin that exists but
+							// holds an empty default is still a WRITE and still wins at compile
+							// time, so the rapid-iteration entry behind it would be stale and must
+							// not be exported as if it were the value.
+							// Before gap #43 this was the end of the story and the value was dropped.
+							const FNiagaraVariable RIVar = NA_MakeRapidIterationParameter(
+								ExportUniqueEmitterName, Usage, AH.GetParameterHandleString(), In.GetType());
+							FString RIValue;
+							bool bRIRenderable = false;
+							if (NA_ReadRapidIterationValue(ExportRIScript, RIVar, RIValue, bRIRenderable))
+							{
+								const FString ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString();
+								if (bRIRenderable)
+								{
+									// Composites serialise as a JSON OBJECT ({"x":..,"y":..} /
+									// {"r":..}), which is emitted as a real object rather than as a
+									// string holding JSON — set_module_input_value's EJson::Object
+									// branch consumes that directly, whereas a string of JSON would
+									// reach the literal validator and be refused. Full precision is
+									// preserved: this deliberately does NOT round-trip through
+									// GetPinDefaultStringFromValue, whose %3.3f would turn 0.0001
+									// into 0.000 (the trap gap #32's fix was written to avoid).
+									TSharedPtr<FJsonObject> AsObject;
+									if (RIValue.StartsWith(TEXT("{")))
+									{
+										TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(RIValue);
+										FJsonSerializer::Deserialize(Reader, AsObject);
+									}
+									if (AsObject.IsValid() && AsObject->Values.Num() > 0)
+										InputsObj->SetObjectField(ShortName, AsObject);
+									else
+										InputsObj->SetStringField(ShortName, RIValue);
+									InputSourcesObj->SetStringField(ShortName, TEXT("rapid_iteration"));
+								}
+								else
+								{
+									// An entry exists and cannot be expressed. Named explicitly
+									// rather than omitted, because a silently short spec is exactly
+									// what made #43 invisible: the export looked complete.
+									TSharedRef<FJsonObject> Unexported = MakeShared<FJsonObject>();
+									Unexported->SetStringField(TEXT("input"), ShortName);
+									Unexported->SetStringField(TEXT("type"), In.GetType().GetName());
+									Unexported->SetStringField(TEXT("source"), TEXT("rapid_iteration"));
+									Unexported->SetStringField(TEXT("reason"),
+										TEXT("A rapid-iteration value is set for this input but this build cannot render "
+											 "that type as a value, so it is NOT in 'inputs' and WILL NOT survive an "
+											 "import. Reapply it by hand."));
+									UnexportedInputsArr.Add(MakeShared<FJsonValueObject>(Unexported));
+								}
+							}
 						}
 					}
 					if (InputsObj->Values.Num() > 0)
 						MO->SetObjectField(TEXT("inputs"), InputsObj);
+					if (InputSourcesObj->Values.Num() > 0)
+						MO->SetObjectField(TEXT("input_sources"), InputSourcesObj);
+					if (UnexportedInputsArr.Num() > 0)
+						MO->SetArrayField(TEXT("unexported_inputs"), UnexportedInputsArr);
 					if (DynInputsArr.Num() > 0)
 						MO->SetArrayField(TEXT("dynamic_inputs"), DynInputsArr);
 
@@ -12579,6 +12934,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetObjectField(TEXT("spec"), Spec);
+	// Gap #43. Stated in the response because the previous behaviour was a SILENT omission —
+	// the export looked complete and was not, so nothing prompted anyone to check.
+	R->SetStringField(TEXT("values_note"),
+		TEXT("Module input values now come from BOTH stores: the override pin when one exists (it wins at compile "
+			 "time) and Script->RapidIterationParameters otherwise, which is where the editor UI puts every value a "
+			 "human types. Previously only override pins were exported, so an export->import round trip discarded "
+			 "human-authored values while reporting success. Per module, 'input_sources' names the store each value "
+			 "came from, and 'unexported_inputs' lists any input that IS set but could not be rendered — those will "
+			 "not survive an import and must be reapplied by hand. Values read from the rapid-iteration store use "
+			 "the parameter-store encoding (a JSON object for vectors/colours/quats, a plain scalar otherwise), "
+			 "which import_system_spec consumes directly; pin-sourced values remain raw pin default strings."));
 	return NA_SuccessObj(R);
 }
 
@@ -22746,20 +23112,88 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetGraphPinDefault(const TS
 	const UEdGraphSchema_Niagara* Schema = Cast<UEdGraphSchema_Niagara>(Graph->GetSchema());
 	if (!Schema) Schema = GetDefault<UEdGraphSchema_Niagara>();
 
+	// ------------------------------------------------------------------------
+	// GAP #39 — this action had gap #32's composite hole, and its success flag was a lie.
+	//
+	// It wrote composite literals the same generic way set_module_input_value used to, so the
+	// unallocated-variable parse rescue applied: a Vector2f written as "12.5,34.25" was stored
+	// verbatim, read back verbatim, and compiled to float2(0,0). ValidateStackInputLiteral is the
+	// validator that closed that on the stack path, and it drops straight in here because the
+	// pin's real type is available from the schema.
+	//
+	// Pins with no Niagara type (wildcard/Add pins, non-Niagara categories) are left exactly as
+	// before — refusing those would be an over-refusal, and PinToTypeDefinition legitimately
+	// returns an invalid type for them.
+	// ------------------------------------------------------------------------
+	const FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
+	FString NormalizedValue = Value;
+	if (PinType.IsValid())
+	{
+		FString ValueError;
+		if (!MonolithNiagaraHelpers::ValidateStackInputLiteral(PinType, Value, NormalizedValue, ValueError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Pin '%s' %s"), *Pin->PinName.ToString(), *ValueError));
+		}
+	}
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetGraphPinDefault", "Set Niagara Pin Default"));
 	Graph->Modify();
 	Node->Modify();
-	Schema->TrySetDefaultValue(*Pin, Value, /*bMarkAsModified=*/true);
+	Schema->TrySetDefaultValue(*Pin, NormalizedValue, /*bMarkAsModified=*/true);
 	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithSetPinDefault"), true);
 	GEditor->EndTransaction();
 	SavePackageFor(Script);
 
+	// ------------------------------------------------------------------------
+	// `applied` USED TO BE `Pin->DefaultValue == Value` — a STRING ECHO, not acceptance.
+	// It reported true in exactly the failure mode above (verbatim storage of a literal the
+	// compiler then ignores) and false whenever the engine legitimately normalised a spelling.
+	// Wrong in both directions, and it read as reassurance.
+	//
+	// It now means: the pin holds a value that PARSES EQUAL to what was requested. An exact
+	// string match still counts — but only because the literal was proven parseable above before
+	// it was written, which is what makes the string match evidence rather than coincidence.
+	// `applied_basis` says which test answered, so a caller is never left guessing.
+	// ------------------------------------------------------------------------
+	bool bApplied = (Pin->DefaultValue == NormalizedValue);
+	FString AppliedBasis = bApplied
+		? (PinType.IsValid() ? TEXT("stored_verbatim_after_engine_parse") : TEXT("stored_verbatim_unvalidated_pin_type"))
+		: TEXT("");
+	if (!bApplied)
+	{
+		bool bComparable = false;
+		const bool bEquivalent = MonolithNiagaraHelpers::PinDefaultsAreEquivalent(
+			PinType, NormalizedValue, Pin->DefaultValue, bComparable);
+		if (bComparable)
+		{
+			bApplied = bEquivalent;
+			AppliedBasis = bEquivalent ? TEXT("engine_normalised_parses_equal") : TEXT("engine_parse_mismatch");
+		}
+		else
+		{
+			AppliedBasis = TEXT("not_verifiable_no_pin_default_utilities");
+		}
+	}
+
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+	R->SetStringField(TEXT("pin_type"), PinType.IsValid() ? PinType.GetName() : FString(TEXT("(no Niagara type)")));
 	R->SetStringField(TEXT("requested_value"), Value);
+	if (NormalizedValue != Value) R->SetStringField(TEXT("normalized_value"), NormalizedValue);
 	R->SetStringField(TEXT("actual_value"), Pin->DefaultValue);
-	R->SetBoolField(TEXT("applied"), Pin->DefaultValue == Value);
+	R->SetBoolField(TEXT("validated"), PinType.IsValid());
+	R->SetBoolField(TEXT("applied"), bApplied);
+	R->SetStringField(TEXT("applied_basis"), AppliedBasis);
+	if (!bApplied)
+	{
+		R->SetStringField(TEXT("applied_note"),
+			TEXT("The pin does NOT hold the requested value. 'applied' is no longer a string comparison against the "
+				 "requested text — it is decided by parsing both spellings with this type's own registered editor "
+				 "utilities and comparing the resulting bytes, so engine re-spelling counts as applied and verbatim "
+				 "storage of an unparseable literal does not."));
+	}
 	return NA_SuccessObj(R);
 }
 

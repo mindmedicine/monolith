@@ -123,6 +123,11 @@
 		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true
+		},
+		{
+			"Name": "PCG",
+			"Enabled": true,
+			"Optional": true
 		}
 	],
 	"Modules": [
@@ -223,6 +228,11 @@
 		},
 		{
 			"Name": "MonolithReflectionIntel",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithPCG",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}
