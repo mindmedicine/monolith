@@ -235,6 +235,8 @@ public:
 	static FMonolithActionResult HandleAddMapParameterPin(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetStageGraph(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleDebugDraw(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetPropagatedSwitches(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetPropagatedSwitches(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Script parameter metadata / default mode / hierarchy ---
 	static FMonolithActionResult HandleGetScriptParameters(const TSharedPtr<FJsonObject>& Params);

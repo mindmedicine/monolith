@@ -4175,13 +4175,18 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 	// --- Script-graph authoring (Tier 1: public node classes) ---
 	// Distinct from the stack-level module actions: these edit the NODE GRAPH inside a
 	// Niagara script asset (or an embedded scratch script via "NS_X.NS_X:ScratchName").
-	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'input' (needs input_name + input_type; exposure defaults to exposed + NOT required + auto-bindable, see the 'required' param for why), 'custom_hlsl' (needs hlsl; optional inputs/outputs — this is how you add HLSL to an EXISTING module, e.g. a duplicated engine one). Returns node_guid + created pins."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_graph_node"), TEXT("Add a node to a Niagara script's node graph. node_type: 'op' (math/logic — needs op_name like 'Numeric::Add'; validated empirically, unknown names are rejected), 'function' (needs function_script), 'di_function' (a DATA INTERFACE function call — needs di_class + di_function, plus a value for every specifier that function declares, e.g. identifier; the signature is read from the DI itself, never from the caller), 'input' (needs input_name + input_type; exposure defaults to exposed + NOT required + auto-bindable, see the 'required' param for why), 'custom_hlsl' (needs hlsl; optional inputs/outputs — this is how you add HLSL to an EXISTING module, e.g. a duplicated engine one). Returns node_guid + created pins."),
 		FMonolithActionHandler::CreateStatic(&HandleAddGraphNode),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
-			.Required(TEXT("node_type"), TEXT("string"), TEXT("Tier 1 (public classes): op | function | input | custom_hlsl. Tier 2 (engine-private, dev builds only): map_get | map_set | if | select | static_switch | reroute | convert"))
+			.Required(TEXT("node_type"), TEXT("string"), TEXT("Tier 1 (public classes): op | function | di_function | input | custom_hlsl. Tier 2 (engine-private, dev builds only): map_get | map_set | if | select | static_switch | reroute | convert"))
 			.Optional(TEXT("op_name"), TEXT("string"), TEXT("Operation name for node_type=op, e.g. 'Numeric::Add', 'Numeric::Multiply'"))
 			.Optional(TEXT("function_script"), TEXT("string"), TEXT("Function/module script asset path for node_type=function"))
+			.Optional(TEXT("di_class"), TEXT("string"), TEXT("For node_type=di_function: the data interface class, fuzzy-matched (e.g. 'DebugDraw' -> NiagaraDataInterfaceDebugDraw). The node's first input pin is DI-typed — wire it from the `Module.<Name>` ParameterMapGet read that exposes the DI, exactly as stock ShapeLocation does for `Module.Lathe Profile`."))
+			.Optional(TEXT("di_function"), TEXT("string"), TEXT("For node_type=di_function: the function name as get_di_functions reports it, e.g. 'DrawSpherePersistent'. The signature (pins, types, defaults) is resolved FROM THE DI, so it is correct by construction; unknown names are refused with the full list."))
+			.Optional(TEXT("di_function_index"), TEXT("integer"), TEXT("For node_type=di_function: disambiguates same-named overloads, 0-based in get_di_functions order. Only needed when the action reports more than one match — it refuses rather than guessing."))
+			.Optional(TEXT("identifier"), TEXT("string"), TEXT("For node_type=di_function: shorthand for function_specifiers={\"Identifier\": ...}. MANDATORY on DebugDraw's persistent draws — an unset or 'none' Identifier is not a harmless default, it makes GenerateCompilerTagPrefix fail so the shape is never registered and nothing ever draws. Refused rather than defaulted."))
+			.Optional(TEXT("function_specifiers"), TEXT("object"), TEXT("For node_type=di_function: {\"<specifier>\": \"<value>\"} for every specifier the chosen signature declares (DebugDraw persistent: Identifier; grid collections: Attribute). Undeclared keys are refused — a compile-tag DI requires exactly one specifier, so an extra key silently breaks tag generation."))
 			.Optional(TEXT("hlsl"), TEXT("string"), TEXT("HLSL body for node_type=custom_hlsl. Same rules as create_module_from_hlsl: bare I/O identifiers, no '%', functions wrapped in structs. Call a data interface passed as an input pin by that pin's name, e.g. DebugDraw.DrawSphere(Execute, Center, Radius, 24, Color);"))
 			.Optional(TEXT("inputs"), TEXT("array"), TEXT("For node_type=custom_hlsl: [{name, type}] typed input pins. Names must be bare identifiers (no dots). Data interface types resolve by fuzzy class name (e.g. 'DebugDraw')."))
 			.Optional(TEXT("outputs"), TEXT("array"), TEXT("For node_type=custom_hlsl: [{name, type}] typed output pins. At least one consumed output keeps the node from being dead-stripped."))
@@ -4200,8 +4205,23 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("UEnum asset path when switch_type=enum"))
 			.Optional(TEXT("output_vars"), TEXT("array"), TEXT("For node_type=static_switch: [{name, type}] the variables this switch ROUTES — one case pin per variable per case, plus one output pin each. Omit and the switch is created with only an Add pin. THIS is how you get ParameterMap case pins ('parameter_map'): the Add pin cannot accept a parameter map at all, only value types. 'name' defaults to the type name, matching the engine's own 'NiagaraParameterMap if <case>' pins. Unknown types are refused, not silently turned into floats."))
 			.Optional(TEXT("option_count"), TEXT("integer"), TEXT("For node_type=static_switch with switch_type=integer: how many cases (>=2). Required alongside output_vars for integer switches — a new integer switch has no case count of its own, so its case pins would otherwise come out empty."))
+			.Optional(TEXT("propagate_switches"), TEXT("array"), TEXT("For node_type=function: names of the called script's static switches to PROPAGATE up (or \"all\"). Propagating republishes a switch as a static switch input of THIS script, so a stack value can reach the call; without it the new node is frozen at the called script's own default and silently ignores the stack (gap #57). Omit for the engine's own behaviour — a hand-added node propagates nothing until you tick the checkbox in its details panel. Use set_propagated_switches to change this on a node that already exists."))
 			.Optional(TEXT("position"), TEXT("array"), TEXT("Node position as [x, y] (default [0,0])"))
 			.Optional(TEXT("comment"), TEXT("string"), TEXT("Comment bubble text"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_propagated_switches"), TEXT("Inspect a function-call node's nested static switches: which are PROPAGATED up as static switch inputs of the containing script (so the stack drives them) and which are frozen at the node's own pin value. Reports each switch's current node pin value with enum display names, so 'why is my new node behaving as Default?' is answerable in one call. Read-only."),
+		FMonolithActionHandler::CreateStatic(&HandleGetPropagatedSwitches),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Function-call node guid (from get_module_graph)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_propagated_switches"), TEXT("Propagate (or stop propagating) a function-call node's nested static switches — the MCP equivalent of the per-switch checkbox in the node's details panel. Propagating republishes a switch as a static switch input of the CONTAINING script, which is what lets a stack value reach the call instead of the node sitting frozen at the called script's default (gap #57). Mirrors the editor exactly: emplace, copy the switch's metadata from the called graph, refresh the node, notify the graph. Refuses unknown switch names before opening a transaction."),
+		FMonolithActionHandler::CreateStatic(&HandleSetPropagatedSwitches),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Function-call node guid (from get_module_graph)"))
+			.Required(TEXT("switches"), TEXT("array"), TEXT("Static switch names from the CALLED script (a single name and \"all\" are also accepted). Unknown names are refused with the valid list; an empty list is refused rather than silently doing nothing."))
+			.Optional(TEXT("mode"), TEXT("string"), TEXT("add (DEFAULT — purely additive, can never drop an existing propagation) | set (the list becomes the complete propagated set, dropping any not named — this REMOVES static switch inputs from the containing script, so it is reported as a warning) | remove"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_graph_node"), TEXT("Remove a node from a Niagara script's node graph by guid (breaks its links first)"),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveGraphNode),
@@ -22369,6 +22389,262 @@ namespace MonolithNiagaraGraphAuthoring
 		Node->AllocateDefaultPins();
 	}
 
+	// ---- Propagated static switches (gap #57) --------------------------------------------------
+	//
+	// A function-call node's nested static switches are set ON THE NODE by default: AllocateDefaultPins
+	// gives each one a non-connectable pin seeded from the CALLED graph's default
+	// (UNiagaraNodeFunctionCall::AddStaticSwitchInputPin, NiagaraNodeFunctionCall.cpp:294-334).
+	// "Propagating" one instead republishes it as a static switch input of the CONTAINING script, which
+	// is what makes it appear in the stack: UNiagaraGraph::FindStaticSwitchInputs walks every function
+	// call node and unions in its PropagatedStaticSwitchParameters (NiagaraGraph.cpp:2198-2204), and the
+	// digest adds the same variables to the parent graph's StaticSwitchInputs (NiagaraGraphDigest.cpp:2385-2396).
+	// While propagated, the node's own pin is ignored (`bDefaultValueIsIgnored`, :1138).
+	//
+	// IMPORTANT — this is OPT-IN in the editor too. It is a per-switch CHECKBOX in the node's details
+	// panel (NiagaraFunctionCallNodeDetails.cpp:95-140, whose own comment reads "we add a checkbox row
+	// to allow the user to propagate it up in the call hierarchy"). A hand-added node starts with
+	// PropagatedStaticSwitchParameters EMPTY, exactly like an MCP-added one. So nothing here may
+	// propagate by default: that would invent a scheme the editor does not have, and would silently
+	// enlarge the containing module's parameter surface on an existing, in-use code path.
+	//
+	// Neither FindPropagatedVariable nor RemovePropagatedVariable nor CleanupPropagatedSwitchValues is
+	// DLL-exported (NiagaraNodeFunctionCall.h:171-173, MinimalAPI class), so their bodies — which are
+	// three trivial loops, :1719-1741 and :1917-1927 — are re-derived here. The array itself is a public
+	// UPROPERTY (:83-84), verified in the header rather than assumed from its neighbours.
+
+	/** Mirror of UNiagaraNodeFunctionCall::FindPropagatedVariable (NiagaraNodeFunctionCall.cpp:1719-1729). */
+	static FNiagaraPropagatedVariable* FindPropagated(UNiagaraNodeFunctionCall* Node, const FNiagaraVariable& Var)
+	{
+		for (FNiagaraPropagatedVariable& Propagated : Node->PropagatedStaticSwitchParameters)
+		{
+			if (Propagated.SwitchParameter == Var) return &Propagated;
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Mirror of FNiagaraFunctionCallNodeDetails::CopyMetadataFromCalledGraph
+	 * (NiagaraFunctionCallNodeDetails.cpp:173-190) — the second half of what the checkbox does, and the
+	 * reason a hand-propagated switch arrives in the parent with its tooltip and widget settings intact.
+	 * UNiagaraGraph::SetMetaData is NOT exported (NiagaraGraph.h:362), so its body
+	 * (NiagaraGraph.cpp:3939-3964) is re-derived through the exported GetAllMetaData() map (:368) and the
+	 * exported UNiagaraScriptVariable::Init (NiagaraScriptVariable.h:149). The engine's
+	 * CreateNewGuid fallback is deliberately not reproduced: it only fires for an INVALID incoming guid,
+	 * and the metadata being copied comes from a real authored graph where it is valid.
+	 */
+	static void CopyPropagatedMetadata(UNiagaraGraph* NodeGraph, UNiagaraGraph* CalledGraph, const FNiagaraVariable& Var)
+	{
+		if (!NodeGraph || !CalledGraph) return;
+		if (NodeGraph->GetMetaData(Var).IsSet()) return;              // never overwrite the parent's own
+		TOptional<FNiagaraVariableMetaData> Original = CalledGraph->GetMetaData(Var);
+		if (!Original.IsSet()) return;
+
+		UNiagaraGraph::FScriptVariableMap& Vars = NodeGraph->GetAllMetaData();
+		if (TObjectPtr<UNiagaraScriptVariable>* Found = Vars.Find(Var))
+		{
+			if (*Found)
+			{
+				(*Found)->Modify();
+				(*Found)->Metadata = Original.GetValue();
+			}
+			return;
+		}
+		NodeGraph->Modify();
+		TObjectPtr<UNiagaraScriptVariable>& NewVar =
+			Vars.Add(Var, NewObject<UNiagaraScriptVariable>(NodeGraph, FName(), RF_Transactional));
+		NewVar->Init(Var, Original.GetValue());
+		NewVar->SetIsStaticSwitch(true);   // it is one, by construction: it came from FindStaticSwitchInputs
+	}
+
+	/**
+	 * The switches a function-call node COULD propagate — read from the called graph, which is the same
+	 * source the details panel enumerates (NiagaraFunctionCallNodeDetails.cpp:98). Returns false with a
+	 * reason when the node has no reachable called graph at all.
+	 */
+	static bool GetPropagatableSwitches(UNiagaraNodeFunctionCall* Node, UNiagaraGraph*& OutCalledGraph,
+		TArray<FNiagaraVariable>& OutVars, FString& OutError)
+	{
+		OutCalledGraph = nullptr;
+		UNiagaraScript* Called = Node->FunctionScript;
+		if (!Called)
+		{
+			OutError = TEXT("This node calls no script (it is a data-interface or custom-HLSL call), so it has no nested static switches to propagate.");
+			return false;
+		}
+		UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Called->GetLatestSource());
+		OutCalledGraph = Source ? Source->NodeGraph : nullptr;
+		if (!OutCalledGraph)
+		{
+			OutError = FString::Printf(TEXT("Could not reach the graph of the called script '%s'."), *Called->GetPathName());
+			return false;
+		}
+		OutVars = OutCalledGraph->FindStaticSwitchInputs();
+		return true;
+	}
+
+	static FString JoinVariableNames(const TArray<FNiagaraVariable>& Vars)
+	{
+		TArray<FString> Names;
+		for (const FNiagaraVariable& V : Vars) Names.Add(V.GetName().ToString());
+		return FString::Join(Names, TEXT(", "));
+	}
+
+	/**
+	 * Resolve caller-supplied switch NAMES against the called graph's actual switch list. Refuses unknown
+	 * names rather than silently propagating nothing — a no-op that reports success is the exact failure
+	 * shape gap #57 exists to fix. Matching is by FName, so it is case-insensitive, and the resolved
+	 * FNiagaraVariable is taken FROM the engine's list (never reconstructed), because
+	 * FindPropagatedVariable compares whole variables and only the engine's copy is guaranteed equal.
+	 */
+	static bool ResolveSwitchNames(const TArray<FNiagaraVariable>& Available, const TArray<FString>& RequestedNames,
+		TArray<FNiagaraVariable>& OutResolved, FString& OutError)
+	{
+		for (const FString& Requested : RequestedNames)
+		{
+			const FName AsName(*Requested);
+			const FNiagaraVariable* Match = Available.FindByPredicate(
+				[&AsName](const FNiagaraVariable& V) { return V.GetName() == AsName; });
+			if (!Match)
+			{
+				OutError = FString::Printf(
+					TEXT("The called script has no static switch named '%s'. Available: [%s]%s"),
+					*Requested, *JoinVariableNames(Available),
+					Available.Num() == 0
+						? TEXT(" — this script has no propagatable static switches at all (note that expose-as-pin and "
+							   "compiler-set switches are excluded by FindStaticSwitchInputs, NiagaraGraph.cpp:2192).")
+						: TEXT(""));
+				return false;
+			}
+			OutResolved.AddUnique(*Match);
+		}
+		return true;
+	}
+
+	/**
+	 * Accepts a real JSON array, a string-serialized one (MCP double-encodes), a single bare name, or the
+	 * literal "all" / boolean true meaning "every switch the called script exposes". An EMPTY list is
+	 * refused rather than treated as "propagate nothing": a silent no-op that reports success is the
+	 * exact shape gap #57 exists to fix. To clear propagation, use mode=remove with "all".
+	 */
+	static bool ParseSwitchNameList(const TSharedPtr<FJsonObject>& Params, const TCHAR* Field,
+		TArray<FString>& OutNames, bool& bOutAll, FString& OutError)
+	{
+		bOutAll = false;
+		bool bBool = false;
+		if (Params->TryGetBoolField(Field, bBool))
+		{
+			bOutAll = bBool;
+			if (!bOutAll)
+			{
+				OutError = FString::Printf(TEXT("'%s' was false. Omit it entirely to propagate nothing."), Field);
+				return false;
+			}
+			return true;
+		}
+
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
+		if (Params->TryGetArrayField(Field, ArrPtr) && ArrPtr)
+		{
+			Arr = *ArrPtr;
+		}
+		else
+		{
+			const FString Trimmed = Params->GetStringField(Field).TrimStartAndEnd();
+			if (Trimmed.Equals(TEXT("all"), ESearchCase::IgnoreCase)) { bOutAll = true; return true; }
+			if (Trimmed.StartsWith(TEXT("[")))
+			{
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Trimmed);
+				if (!FJsonSerializer::Deserialize(Reader, Arr))
+				{
+					OutError = FString::Printf(TEXT("'%s' looks like a JSON array but did not parse."), Field);
+					return false;
+				}
+			}
+			else if (!Trimmed.IsEmpty())
+			{
+				OutNames.Add(Trimmed);   // a single bare switch name
+				return true;
+			}
+		}
+
+		for (const TSharedPtr<FJsonValue>& V : Arr)
+		{
+			if (!V.IsValid()) continue;
+			const FString Name = V->AsString().TrimStartAndEnd();
+			if (!Name.IsEmpty()) OutNames.AddUnique(Name);
+		}
+		if (OutNames.Num() == 0)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' resolved to an empty list. Pass one or more switch names, or \"all\". "
+					 "(To clear propagation, call set_propagated_switches with mode=remove and \"all\".)"), Field);
+			return false;
+		}
+		return true;
+	}
+
+	/** The propagated switch names currently on a node, for before/after reporting. */
+	static TArray<FString> ListPropagatedNames(UNiagaraNodeFunctionCall* Node)
+	{
+		TArray<FString> Names;
+		for (const FNiagaraPropagatedVariable& P : Node->PropagatedStaticSwitchParameters)
+		{
+			// ToVariable() applies PropagatedName when the author renamed the propagated parameter —
+			// that renamed form is what the PARENT sees (NiagaraGraph.cpp:2202 calls ToVariable too),
+			// so report both when they differ rather than only the inner name.
+			const FString Inner = P.SwitchParameter.GetName().ToString();
+			Names.Add(P.PropagatedName.IsEmpty() ? Inner : FString::Printf(TEXT("%s (as '%s')"), *Inner, *P.PropagatedName));
+		}
+		return Names;
+	}
+
+	/** The two engine calls the details-panel checkbox makes after mutating the array, in its order. */
+	static void NotifyPropagationChanged(UNiagaraNodeFunctionCall* Node)
+	{
+		// Both are non-exported overrides on MinimalAPI classes, so both MUST dispatch through a base
+		// pointer: a devirtualized direct call would emit an external symbol and fail to link (LNK2019).
+		// UNiagaraNode::RefreshFromExternalChanges is virtual (NiagaraNode.h:87) and UEdGraph::NotifyGraphChanged
+		// is ENGINE_API on the base, so both vtable dispatches are legal and identical at runtime.
+		UNiagaraNode* AsNiagaraNode = Node;
+		AsNiagaraNode->RefreshFromExternalChanges();
+		if (UEdGraph* OwningGraph = Node->GetGraph())
+		{
+			OwningGraph->NotifyGraphChanged();
+		}
+	}
+
+	/**
+	 * Apply a propagation change. Mirrors the details-panel checkbox exactly — emplace (or remove), copy
+	 * metadata on add, then RefreshFromExternalChanges + NotifyGraphChanged. Reports the names it ACTUALLY
+	 * changed, not the ones requested, so an already-propagated switch shows up as a no-op instead of a
+	 * false positive.
+	 */
+	static void ApplyPropagation(UNiagaraNodeFunctionCall* Node, UNiagaraGraph* CalledGraph,
+		const TArray<FNiagaraVariable>& Targets, bool bAdd, TArray<FString>& OutChanged)
+	{
+		if (Targets.Num() == 0) return;
+		UNiagaraGraph* NodeGraph = Cast<UNiagaraGraph>(Node->GetGraph());
+		Node->Modify();
+		for (const FNiagaraVariable& Var : Targets)
+		{
+			if (bAdd)
+			{
+				if (FindPropagated(Node, Var)) continue;              // already propagated: not a change
+				Node->PropagatedStaticSwitchParameters.Emplace(Var);
+				CopyPropagatedMetadata(NodeGraph, CalledGraph, Var);
+				OutChanged.Add(Var.GetName().ToString());
+			}
+			else
+			{
+				const int32 Removed = Node->PropagatedStaticSwitchParameters.RemoveAll(
+					[&Var](const FNiagaraPropagatedVariable& P) { return P.SwitchParameter == Var; });
+				if (Removed > 0) OutChanged.Add(Var.GetName().ToString());
+			}
+		}
+		if (OutChanged.Num() > 0) NotifyPropagationChanged(Node);
+	}
+
 	// Routed through the shared tail: picks the correct InAsset for embedded (scratch-pad /
 	// event / sim-stage) scripts and never uses GError, so a save problem is logged and
 	// reported rather than crashing the editor. Returns the outcome for callers that want
@@ -22421,13 +22697,378 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		}
 	}
 
+	// Non-fatal advisories collected during validation and construction, echoed in the response.
+	// Declared ahead of the transaction because node_type=di_function does all of its work here.
+	TArray<FString> Warnings;
+	// Read off the finished node when propagation was requested (gap #57), so the response reports
+	// what the node CARRIES rather than what the caller asked for.
+	TArray<FString> PropagatedNamesForResponse;
+
+	// --- node_type=di_function pre-flight (gap #54) ------------------------------------------
+	// A DATA INTERFACE function-call node is the INVERSE shape of a script one:
+	//   FunctionScript == nullptr, Signature copied from the data interface, and
+	//   FunctionSpecifiers carrying the values the DI reads at bind time.
+	// Both are public UPROPERTYs (NiagaraNodeFunctionCall.h:76-80) so they assign directly;
+	// SetFunctionSpecifier (:199) is a non-exported member of a MinimalAPI class and would not link.
+	// Everything that can be refused is refused HERE, before BeginTransaction — CancelTransaction
+	// discards the undo record, not the changes (gap #36), so refusing with a transaction already
+	// open still leaves the asset modified. After this block nothing in the di_function path fails.
+	// --- node_type=function: optional static-switch propagation pre-flight (gap #57) ----------
+	// STRICTLY OPT-IN. Absent 'propagate_switches' this block does not run at all and the function
+	// path is byte-identical to before — which is deliberate, because propagating by default would
+	// NOT match the editor (propagation is a per-switch checkbox, NiagaraFunctionCallNodeDetails.cpp:95-140)
+	// and would silently add static switch inputs to every module built through this action.
+	TArray<FString> PropagateNames;
+	bool bPropagateAll = false;
+	const bool bPropagateRequested = (NodeType == TEXT("function")) && Params->HasField(TEXT("propagate_switches"));
+	if (bPropagateRequested)
+	{
+		FString ParseError;
+		if (!ParseSwitchNameList(Params, TEXT("propagate_switches"), PropagateNames, bPropagateAll, ParseError))
+		{
+			return FMonolithActionResult::Error(ParseError);
+		}
+
+		// Validate the names against the called script BEFORE the transaction opens. The script is
+		// loaded here as well as in the branch below; the second LoadObject of an already-resident
+		// asset is a map lookup, and keeping the branch untouched is worth more than saving it.
+		const FString FnPathForCheck = Params->HasField(TEXT("function_script")) ? Params->GetStringField(TEXT("function_script")) : FString();
+		UNiagaraScript* FnScriptForCheck = FnPathForCheck.IsEmpty() ? nullptr : LoadObject<UNiagaraScript>(nullptr, *FnPathForCheck);
+		UNiagaraScriptSource* SrcForCheck = FnScriptForCheck ? Cast<UNiagaraScriptSource>(FnScriptForCheck->GetLatestSource()) : nullptr;
+		UNiagaraGraph* CalledGraphForCheck = SrcForCheck ? SrcForCheck->NodeGraph : nullptr;
+		if (!CalledGraphForCheck)
+		{
+			// The branch below produces the canonical load error; say why validation could not run.
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'propagate_switches' needs a loadable 'function_script' to validate against — could not reach the graph of '%s'."),
+				*FnPathForCheck));
+		}
+
+		const TArray<FNiagaraVariable> AvailableForCheck = CalledGraphForCheck->FindStaticSwitchInputs();
+		if (AvailableForCheck.Num() == 0)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' exposes no propagatable static switches, so 'propagate_switches' would do nothing. "
+					 "FindStaticSwitchInputs (NiagaraGraph.cpp:2184-2208) deliberately excludes compiler-set and "
+					 "expose-as-pin switches. Refusing rather than reporting a successful no-op."),
+				*FnPathForCheck));
+		}
+		if (!bPropagateAll)
+		{
+			TArray<FNiagaraVariable> ResolvedForCheck;
+			FString ResolveError;
+			if (!ResolveSwitchNames(AvailableForCheck, PropagateNames, ResolvedForCheck, ResolveError))
+			{
+				return FMonolithActionResult::Error(ResolveError);
+			}
+		}
+	}
+
+	FNiagaraFunctionSignature DISignature;
+	TMap<FName, FName> DISpecifierValues;
+	if (NodeType == TEXT("di_function"))
+	{
+		auto JoinKeys = [](const TArray<FName>& Keys) -> FString
+		{
+			TArray<FString> AsStrings;
+			for (const FName& K : Keys) AsStrings.Add(K.ToString());
+			return FString::Join(AsStrings, TEXT(", "));
+		};
+
+		const FString DIClassName = Params->HasField(TEXT("di_class")) ? Params->GetStringField(TEXT("di_class")) : FString();
+		const FString DIFuncName  = Params->HasField(TEXT("di_function")) ? Params->GetStringField(TEXT("di_function")) : FString();
+		if (DIClassName.IsEmpty() || DIFuncName.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT(
+				"node_type=di_function requires 'di_class' (e.g. 'DebugDraw') and 'di_function' (e.g. 'DrawSpherePersistent'). "
+				"Call get_di_functions on the same di_class first — it lists the exact function names, their inputs and their defaults."));
+		}
+
+		FString DIDiagnostic;
+		UClass* DIClass = MonolithNiagaraHelpers::ResolveNiagaraDataInterfaceClass(DIClassName, &DIDiagnostic);
+		if (!DIClass)
+		{
+			return FMonolithActionResult::Error(DIDiagnostic.IsEmpty()
+				? FString::Printf(TEXT("Data interface class '%s' not found"), *DIClassName)
+				: DIDiagnostic);
+		}
+
+		// Enumerated exactly the way get_di_functions does (HandleGetDIFunctions), so a name read
+		// from there is a name that matches here: the signature validated is the signature shipped.
+		UNiagaraDataInterface* TempDI = NewObject<UNiagaraDataInterface>(GetTransientPackage(), DIClass);
+		if (!TempDI)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to instantiate data interface '%s'"), *DIClass->GetName()));
+		}
+		TArray<FNiagaraFunctionSignature> Sigs;
+		TempDI->GetFunctionSignatures(Sigs);
+
+		const FName WantedName(*DIFuncName);
+		TArray<int32> MatchIdx;
+		for (int32 i = 0; i < Sigs.Num(); ++i)
+		{
+			if (Sigs[i].Name == WantedName) MatchIdx.Add(i);
+		}
+		if (MatchIdx.Num() == 0)
+		{
+			TArray<FString> Placeable;
+			for (const FNiagaraFunctionSignature& S : Sigs)
+			{
+				if (!S.bHidden) Placeable.Add(S.Name.ToString());
+			}
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' has no function named '%s'. Available: [%s]"),
+				*DIClass->GetName(), *DIFuncName, *FString::Join(Placeable, TEXT(", "))));
+		}
+
+		int32 Chosen = MatchIdx[0];
+		{
+			const bool bHasIndex = Params->HasField(TEXT("di_function_index"));
+			const int32 Requested = bHasIndex ? static_cast<int32>(Params->GetNumberField(TEXT("di_function_index"))) : 0;
+			if (MatchIdx.Num() > 1 && !bHasIndex)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("'%s' declares %d overloads named '%s'. Pass 'di_function_index' (0..%d, in get_di_functions order) "
+						 "to choose — picking one silently would be a coin flip on the pin list."),
+					*DIClass->GetName(), MatchIdx.Num(), *DIFuncName, MatchIdx.Num() - 1));
+			}
+			if (bHasIndex && !MatchIdx.IsValidIndex(Requested))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("'di_function_index' %d is out of range — '%s' has %d overload(s) named '%s' (valid 0..%d)."),
+					Requested, *DIClass->GetName(), MatchIdx.Num(), *DIFuncName, MatchIdx.Num() - 1));
+			}
+			if (bHasIndex) Chosen = MatchIdx[Requested];
+		}
+		DISignature = Sigs[Chosen];
+
+		// The engine's own placement menu skips both of these (EdGraphSchema_Niagara.cpp:820), but
+		// only bHidden actually means "cannot be placed" (NiagaraCommon.h:434); soft-deprecated
+		// functions still compile and run, so those warn instead.
+		if (DISignature.bHidden)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s.%s' is marked bHidden — the header says hidden functions \"can not be placed but may be bound and "
+					 "used\" (NiagaraCommon.h:434) and the engine's own graph menu filters them out "
+					 "(EdGraphSchema_Niagara.cpp:820). Refusing for the same reason it does."),
+				*DIClass->GetName(), *DIFuncName));
+		}
+		if (DISignature.bSoftDeprecatedFunction)
+		{
+			Warnings.Add(FString::Printf(TEXT(
+				"'%s' is soft-deprecated (bSoftDeprecatedFunction), so the editor hides it from the node menu. It still "
+				"compiles — but check get_di_functions for a replacement before building on it."), *DIFuncName));
+		}
+
+		// Exactly the condition UNiagaraNodeFunctionCall::GetDIClass tests (NiagaraNodeFunctionCall.cpp:272-285).
+		// Without a leading DI-typed input the node is not a DI call at all: Compile() skips DI
+		// validation, and the translator's compile-tag loop never finds a DI pin to key off
+		// (NiagaraHlslTranslator.cpp:8508-8543).
+		if (DISignature.Inputs.Num() == 0 || !DISignature.Inputs[0].GetType().IsDataInterface())
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Signature '%s' does not take its data interface as the FIRST input, so a function-call node built from "
+					 "it would not be recognised as a DI call (UNiagaraNodeFunctionCall::GetDIClass). Refusing rather than "
+					 "creating a node that compiles to nothing."), *DIFuncName));
+		}
+
+		// --- Function specifiers ---------------------------------------------------------------
+		// The DI declares the KEYS with no value: NiagaraDataInterfaceDebugDraw.cpp:2558 is
+		// `Signature.FunctionSpecifiers.Add(TEXT("Identifier"))`, i.e. a default-constructed FName,
+		// which is NAME_None. The value is the caller's to supply, and the NODE's map is the one the
+		// compiler reads — FNiagaraCompilationNodeFunctionCall overwrites Signature.FunctionSpecifiers
+		// with InNode->FunctionSpecifiers (NiagaraGraphDigest.cpp:2399-2402) and the live path does the
+		// same in Compile() (NiagaraNodeFunctionCall.cpp:857).
+		// An unset specifier is NOT a harmless default: GenerateCompilerTagPrefix
+		// (NiagaraDataInterfaceDebugDraw.cpp:2986-3000) returns false unless there is exactly ONE
+		// specifier with a non-None value, the translator then errors DataInterfaceFailedTagGen, and
+		// Tim confirmed empirically that an Identifier of 'none' does not draw. So: refuse, never default.
+		TArray<FName> DeclaredKeys;
+		DISignature.FunctionSpecifiers.GetKeys(DeclaredKeys);
+
+		// Caller's spellings; TMap<FString,...> matches case-insensitively, as does FName, so
+		// "identifier" and "Identifier" resolve to the same declared key throughout.
+		TMap<FString, FString> SuppliedRaw;
+		if (Params->HasField(TEXT("function_specifiers")))
+		{
+			// Same MCP double-encoding tolerance as the custom_hlsl pin arrays: it may arrive as a
+			// real JSON object or as a string-serialized one.
+			TSharedPtr<FJsonObject> SpecObj;
+			const TSharedPtr<FJsonObject>* SpecObjPtr = nullptr;
+			if (Params->TryGetObjectField(TEXT("function_specifiers"), SpecObjPtr) && SpecObjPtr)
+			{
+				SpecObj = *SpecObjPtr;
+			}
+			else
+			{
+				const FString Str = Params->GetStringField(TEXT("function_specifiers"));
+				if (!Str.IsEmpty())
+				{
+					TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Str);
+					FJsonSerializer::Deserialize(Reader, SpecObj);
+				}
+			}
+			if (!SpecObj.IsValid())
+			{
+				return FMonolithActionResult::Error(TEXT(
+					"'function_specifiers' must be a JSON object of {\"<specifier>\": \"<value>\"}, e.g. {\"Identifier\": \"ShapeDebug\"}"));
+			}
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : SpecObj->Values)
+			{
+				SuppliedRaw.Add(Pair.Key, Pair.Value.IsValid() ? Pair.Value->AsString() : FString());
+			}
+		}
+		if (Params->HasField(TEXT("identifier")))
+		{
+			const FString IdValue = Params->GetStringField(TEXT("identifier"));
+			// Deliberately literal: 'identifier' maps to a specifier actually NAMED Identifier, never
+			// to "whatever the only specifier happens to be". The latter is a heuristic on shape
+			// rather than identity and would silently write the wrong key.
+			if (!DeclaredKeys.Contains(FName(TEXT("Identifier"))))
+			{
+				const FString Declared = DeclaredKeys.Num() == 0
+					? FString(TEXT("it declares none at all"))
+					: FString::Printf(TEXT("it declares [%s]"), *JoinKeys(DeclaredKeys));
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("'%s' declares no 'Identifier' specifier — %s. Use 'function_specifiers' with the declared name(s)."),
+					*DIFuncName, *Declared));
+			}
+			if (const FString* Existing = SuppliedRaw.Find(TEXT("Identifier")))
+			{
+				if (!Existing->Equals(IdValue, ESearchCase::CaseSensitive))
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("'identifier' ('%s') and function_specifiers[\"Identifier\"] ('%s') disagree. Pass one of them."),
+						*IdValue, **Existing));
+				}
+			}
+			SuppliedRaw.Add(TEXT("Identifier"), IdValue);
+		}
+
+		// Every supplied key must be declared...
+		for (const TPair<FString, FString>& Pair : SuppliedRaw)
+		{
+			if (!DeclaredKeys.Contains(FName(*Pair.Key)))
+			{
+				const FString Declared = DeclaredKeys.Num() == 0 ? FString(TEXT("<none>")) : JoinKeys(DeclaredKeys);
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("'%s' does not declare a specifier named '%s'. Declared: [%s]. An undeclared specifier is not merely "
+						 "ignored — a compile-tag DI requires FunctionSpecifiers.Num() == 1 "
+						 "(NiagaraDataInterfaceDebugDraw.cpp:2988), so one extra key silently breaks tag generation."),
+					*DIFuncName, *Pair.Key, *Declared));
+			}
+		}
+		// ...and every declared key must get a real value.
+		for (const FName& Key : DeclaredKeys)
+		{
+			const FString* Value = SuppliedRaw.Find(Key.ToString());
+			const FName AsName = (Value && !Value->IsEmpty()) ? FName(**Value) : FName();
+			if (AsName.IsNone())
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("'%s' declares the specifier '%s', which MUST be given a non-empty value — %s. Note that the literal "
+						 "string \"none\" is NOT a value: FName(\"None\") IS NAME_None and fails the same check. Refusing rather "
+						 "than defaulting, because the failure is silent: GenerateCompilerTagPrefix returns false "
+						 "(NiagaraDataInterfaceDebugDraw.cpp:2986-3000), the runtime never calls AddNamedPersistentShape "
+						 "(:3018-3031), and nothing draws. Pass identifier=\"<name>\" or function_specifiers={\"%s\": \"<value>\"}."),
+					*DIFuncName, *Key.ToString(),
+					Value == nullptr ? TEXT("none was supplied") : TEXT("the supplied value is empty or 'None'"),
+					*Key.ToString()));
+			}
+			DISpecifierValues.Add(Key, AsName);
+		}
+
+		// --- Advisories that each cost real time to discover the hard way (gaps #55 / #55a) ------
+		if (DISignature.bIsCompileTagGenerator)
+		{
+			Warnings.Add(TEXT(
+				"COMPILE-TAG FUNCTION: its inputs are read at runtime from compile TAGS, not from the VM. Only a literal pin "
+				"default, a rapid-iteration stack value or a User.* parameter survives — NiagaraHlslTranslator.cpp:8546-8552 "
+				"writes one tag per non-DI input pin. Routing a pin through ANY node (even a Make Linear Color) does not error: "
+				"the tag comes out empty and the runtime substitutes its own fallback, so you get a plausible WRONG value "
+				"rather than a failure. Drive these inputs from pin defaults or directly-wired module inputs only."));
+		}
+		if (DISignature.bRequiresExecPin)
+		{
+			Warnings.Add(TEXT(
+				"This signature sets bRequiresExecPin, so the node has a ParameterMap pin as its first input AND first output. "
+				"Splice it into the script's map chain with connect_graph_pins — an unconnected node is simply absent from the "
+				"compile traversal and does nothing, with no error."));
+		}
+
+		TArray<FString> NoDefaultInputs;
+		for (int32 i = 1; i < DISignature.Inputs.Num(); ++i)   // index 0 is the data interface itself
+		{
+			if (!DISignature.Inputs[i].IsDataAllocated())
+			{
+				NoDefaultInputs.Add(DISignature.Inputs[i].GetName().ToString());
+			}
+		}
+		if (NoDefaultInputs.Num() > 0)
+		{
+			// AllocateDefaultPins runs these through TryGetPinDefaultValueFromNiagaraVariable, which
+			// calls ResetVariableToDefaultValue on an unallocated variable (EdGraphSchema_Niagara.cpp:1700-1719)
+			// — so the pin comes up at the type's ZERO, and a zero tag is a SET tag, not an absent one.
+			const FString ColorNote = NoDefaultInputs.Contains(TEXT("Color"))
+				? FString(TEXT(" 'Color' is one of them, and a zero colour is TRANSPARENT BLACK — the shape then draws "
+							   "perfectly invisibly at 0 errors / 0 warnings (gap #55). Set Color explicitly."))
+				: FString();
+			Warnings.Add(FString::Printf(TEXT(
+				"These inputs carry NO default in the DI signature, so their pins come up at the type's zero value: [%s].%s"),
+				*FString::Join(NoDefaultInputs, TEXT(", ")), *ColorNote));
+		}
+
+		// DebugDraw-specific, and worth the special case because the two conditions differ: the draw
+		// is gated on Radius being set (NiagaraDataInterfaceDebugDraw.cpp:817 for the sphere) while
+		// REGISTRATION validity is Center || Radius (:1265) — so a shape can register successfully and
+		// never draw. Keyed on the class identity, not on the function name's shape.
+		if (DIClass->GetName() == TEXT("NiagaraDataInterfaceDebugDraw")
+			&& DISignature.bIsCompileTagGenerator
+			&& DISignature.Inputs.ContainsByPredicate(
+				[](const FNiagaraVariable& V) { return V.GetName() == FName(TEXT("Radius")); }))
+		{
+			Warnings.Add(TEXT(
+				"DebugDraw persistent draw: the draw itself is gated on RADIUS being set "
+				"(NiagaraDataInterfaceDebugDraw.cpp:817), not on Center — while registration validity is Center || Radius "
+				"(:1265). A shape whose Radius tag never resolves registers successfully and never draws. Radius is the "
+				"load-bearing input; wire it directly or leave its literal default in place."));
+		}
+
+		// A duplicate Identifier inside one script IS a collision — the compile-tag name and the
+		// runtime AddNamedPersistentShape key both derive from it — but it is not always a mistake:
+		// two draws in mutually exclusive static-switch branches can legitimately share one, since
+		// only the selected branch compiles. Warn, never refuse.
+		if (const FName* WantedId = DISpecifierValues.Find(FName(TEXT("Identifier"))))
+		{
+			for (UEdGraphNode* ExistingNode : Graph->Nodes)
+			{
+				// UNiagaraNodeCustomHlsl derives from UNiagaraNodeFunctionCall (NiagaraNodeCustomHlsl.h:14)
+				// and has the same "no FunctionScript + valid Signature" shape, so it must be excluded by
+				// class, not by shape. It cannot collide anyway: the CustomHlsl DI path never reaches
+				// WriteCompilerTag, so it never claims a tag name.
+				UNiagaraNodeFunctionCall* ExistingFn = Cast<UNiagaraNodeFunctionCall>(ExistingNode);
+				if (!ExistingFn || ExistingFn->FunctionScript != nullptr) continue;
+				if (Cast<UNiagaraNodeCustomHlsl>(ExistingNode) != nullptr) continue;
+				const FName* OtherId = ExistingFn->FunctionSpecifiers.Find(FName(TEXT("Identifier")));
+				if (OtherId && *OtherId == *WantedId)
+				{
+					Warnings.Add(FString::Printf(TEXT(
+						"Identifier '%s' is already used by another DI function-call node in this script (node %s, function '%s'). "
+						"Both the compile tag name and the runtime shape key derive from it, so two nodes in the SAME compiled "
+						"traversal would collide. This is only safe when the two sit in mutually exclusive static-switch branches."),
+						*WantedId->ToString(), *ExistingNode->NodeGuid.ToString(), *ExistingFn->Signature.Name.ToString()));
+					break;
+				}
+			}
+		}
+	}
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddGraphNode", "Add Niagara Graph Node"));
 	Graph->Modify();
 
 	UEdGraphNode* NewNode = nullptr;
 	FString CreateError;
-	// Non-fatal advisories collected during construction and echoed in the response.
-	TArray<FString> Warnings;
 
 	if (NodeType == TEXT("op"))
 	{
@@ -22474,7 +23115,62 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		UNiagaraNodeFunctionCall* FnNode = Creator.CreateNode(false);
 		FnNode->FunctionScript = FnScript;
 		Creator.Finalize();
+
+		// Gap #57: opt-in propagation of the called script's static switches, applied AFTER
+		// AllocateDefaultPins because the switch pins must exist for RefreshFromExternalChanges to flip
+		// their bDefaultValueIsIgnored (NiagaraNodeFunctionCall.cpp:1132-1142). Names were already
+		// validated in the pre-flight; anything that fails to resolve HERE means the two lookups
+		// disagreed, which is surfaced as a warning rather than silently dropped.
+		if (bPropagateRequested)
+		{
+			UNiagaraGraph* CalledGraph = nullptr;
+			TArray<FNiagaraVariable> Available;
+			FString PropError;
+			if (!GetPropagatableSwitches(FnNode, CalledGraph, Available, PropError))
+			{
+				Warnings.Add(FString::Printf(TEXT("propagate_switches was ignored: %s"), *PropError));
+			}
+			else
+			{
+				TArray<FNiagaraVariable> Targets;
+				if (bPropagateAll)
+				{
+					Targets = Available;
+				}
+				else if (!ResolveSwitchNames(Available, PropagateNames, Targets, PropError))
+				{
+					Warnings.Add(FString::Printf(
+						TEXT("propagate_switches passed pre-flight but failed against the placed node — nothing was propagated: %s"),
+						*PropError));
+					Targets.Reset();
+				}
+				TArray<FString> Propagated;
+				ApplyPropagation(FnNode, CalledGraph, Targets, /*bAdd=*/true, Propagated);
+				PropagatedNamesForResponse = ListPropagatedNames(FnNode);
+			}
+		}
+
 		NewNode = FnNode;
+	}
+	else if (NodeType == TEXT("di_function"))
+	{
+		// Gap #54: the same node class as node_type=function, built inside out. FunctionScript stays
+		// NULL — that is what makes AllocateDefaultPins take its signature branch
+		// (NiagaraNodeFunctionCall.cpp:457-513) and what makes GetDIClass recognise it as a DI call.
+		// The Signature must therefore be complete BEFORE pins are allocated, which is why this uses
+		// SpawnGraphNode/FinalizeSpawnedNode rather than FGraphNodeCreator (same reason as custom_hlsl;
+		// FGraphNodeCreator's destructor also checkf's if an early return skips Finalize).
+		// Every failure mode was already refused in the pre-flight above, before the transaction.
+		UNiagaraNodeFunctionCall* N = SpawnGraphNode<UNiagaraNodeFunctionCall>(Graph);
+		N->Signature = DISignature;
+		// The NODE's map is the one the compiler reads (NiagaraGraphDigest.cpp:2401); prefilling it
+		// also stops CreateVisualWidget from copying the DI's value-less declaration over the top
+		// (NiagaraNodeFunctionCall.cpp:223-226). Signature.FunctionSpecifiers is deliberately left
+		// exactly as the DI declared it — that is the state a hand-authored node has on disk, and the
+		// digest overwrites it from the node anyway.
+		N->FunctionSpecifiers = DISpecifierValues;
+		FinalizeSpawnedNode(N);
+		NewNode = N;
 	}
 	else if (NodeType == TEXT("input"))
 	{
@@ -23024,9 +23720,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		// Note: the supported-type list is built outside the Printf call — a #if inside a
 		// function-like macro's argument list is undefined behavior (MSVC C5101).
 #if WITH_NIAGARA_WIZARD_PRIVATE
-		const TCHAR* SupportedTypes = TEXT("op, function, input, custom_hlsl, map_get, map_set, if, select, static_switch, reroute, convert");
+		const TCHAR* SupportedTypes = TEXT("op, function, di_function, input, custom_hlsl, map_get, map_set, if, select, static_switch, reroute, convert");
 #else
-		const TCHAR* SupportedTypes = TEXT("op, function, input, custom_hlsl (Tier 2 node types need WITH_NIAGARA_WIZARD_PRIVATE=1; this is a release build)");
+		const TCHAR* SupportedTypes = TEXT("op, function, di_function, input, custom_hlsl (Tier 2 node types need WITH_NIAGARA_WIZARD_PRIVATE=1; this is a release build)");
 #endif
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Unknown node_type '%s'. Supported: %s"), *NodeType, SupportedTypes));
@@ -23070,6 +23766,46 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		for (const FString& W : Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
 		R->SetArrayField(TEXT("warnings"), WarnArr);
 	}
+	if (PropagatedNamesForResponse.Num() > 0)
+	{
+		// Gap #57. Present only when propagation was requested, so the existing function-node
+		// response is unchanged for every caller that does not ask for it.
+		TArray<TSharedPtr<FJsonValue>> PropArr;
+		for (const FString& P : PropagatedNamesForResponse) PropArr.Add(MakeShared<FJsonValueString>(P));
+		R->SetArrayField(TEXT("propagated_switches"), PropArr);
+	}
+	// DI function-call echo (gap #54). CONTENTS are read off the NODE, never off the request, so
+	// "I asked for Identifier=X" and "the node carries Identifier=X" stay separately checkable.
+	// The GATE is the branch that ran, deliberately: a "FunctionCall with no FunctionScript" test
+	// would also catch every custom_hlsl node, because UNiagaraNodeCustomHlsl DERIVES from
+	// UNiagaraNodeFunctionCall (NiagaraNodeCustomHlsl.h:14) and has exactly that shape — which would
+	// have added bogus di_class/di_function fields to an existing, in-use response.
+	if (NodeType == TEXT("di_function"))
+	{
+		if (UNiagaraNodeFunctionCall* FnCallNode = Cast<UNiagaraNodeFunctionCall>(NewNode))
+		{
+			R->SetStringField(TEXT("di_function"), FnCallNode->Signature.Name.ToString());
+			if (FnCallNode->Signature.Inputs.Num() > 0 && FnCallNode->Signature.Inputs[0].GetType().IsDataInterface())
+			{
+				if (UClass* PinnedDIClass = FnCallNode->Signature.Inputs[0].GetType().GetClass())
+				{
+					R->SetStringField(TEXT("di_class"), PinnedDIClass->GetName());
+				}
+			}
+			TSharedRef<FJsonObject> SpecOut = MakeShared<FJsonObject>();
+			for (const TPair<FName, FName>& Pair : FnCallNode->FunctionSpecifiers)
+			{
+				SpecOut->SetStringField(Pair.Key.ToString(), Pair.Value.ToString());
+			}
+			R->SetObjectField(TEXT("function_specifiers"), SpecOut);
+			R->SetStringField(TEXT("function_display_name"), FnCallNode->GetFunctionName());
+			R->SetBoolField(TEXT("is_compile_tag_generator"), FnCallNode->Signature.bIsCompileTagGenerator != 0);
+			R->SetBoolField(TEXT("requires_exec_pin"), FnCallNode->Signature.bRequiresExecPin != 0);
+			R->SetBoolField(TEXT("experimental"), FnCallNode->Signature.bExperimental != 0);
+			R->SetBoolField(TEXT("supports_cpu"), FnCallNode->Signature.bSupportsCPU != 0);
+			R->SetBoolField(TEXT("supports_gpu"), FnCallNode->Signature.bSupportsGPU != 0);
+		}
+	}
 #if WITH_NIAGARA_WIZARD_PRIVATE
 	// Echo back what the switch actually ended up routing, read off the node rather than off the
 	// request, so "I asked for a ParameterMap case" and "the node has one" are separately checkable.
@@ -23095,6 +23831,242 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		}
 	}
 #endif
+	return NA_SuccessObj(R);
+}
+
+// ============================================================================
+// Propagated static switches (gap #57)
+// ----------------------------------------------------------------------------
+// A function-call node's nested static switches default to being set ON THE NODE, from the called
+// script's own default. Propagating one republishes it as a static switch input of the CONTAINING
+// script, which is what puts it in the stack and lets a user's stack value reach the call.
+//
+// The editor exposes this as a per-switch checkbox in the node's details panel
+// (NiagaraFunctionCallNodeDetails.cpp:95-140) — it is NOT automatic on node creation, which is why
+// these are explicit actions rather than a silent behaviour change to add_graph_node.
+// ============================================================================
+
+FMonolithActionResult FMonolithNiagaraActions::HandleGetPropagatedSwitches(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString GuidStr = Params->GetStringField(TEXT("node_guid"));
+	UEdGraphNode* Node = FindNodeByGuid(Graph, GuidStr);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("No node with guid '%s'"), *GuidStr));
+
+	UNiagaraNodeFunctionCall* FnNode = Cast<UNiagaraNodeFunctionCall>(Node);
+	if (!FnNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' is a %s, not a function-call node — only function calls carry propagated static switches."),
+			*GuidStr, *Node->GetClass()->GetName()));
+	}
+
+	UNiagaraGraph* CalledGraph = nullptr;
+	TArray<FNiagaraVariable> Available;
+	FString PropError;
+	const bool bReachable = GetPropagatableSwitches(FnNode, CalledGraph, Available, PropError);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), GuidStr);
+	R->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	if (FnNode->FunctionScript)
+	{
+		R->SetStringField(TEXT("function_script"), FnNode->FunctionScript->GetPathName());
+	}
+	if (!bReachable)
+	{
+		const TArray<TSharedPtr<FJsonValue>> Empty;
+		R->SetStringField(TEXT("note"), PropError);
+		R->SetArrayField(TEXT("switches"), Empty);
+		return NA_SuccessObj(R);
+	}
+
+	// One row per switch the called script exposes: is it propagated, and if not, what value is the
+	// node frozen at? That pair is the whole of gap #57 in a readable form.
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	for (const FNiagaraVariable& Var : Available)
+	{
+		TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("name"), Var.GetName().ToString());
+		Row->SetStringField(TEXT("type"), Var.GetType().IsValid() ? Var.GetType().GetName() : TEXT("<unresolved>"));
+
+		const FNiagaraPropagatedVariable* Propagated = FindPropagated(FnNode, Var);
+		Row->SetBoolField(TEXT("is_propagated"), Propagated != nullptr);
+		if (Propagated && !Propagated->PropagatedName.IsEmpty())
+		{
+			Row->SetStringField(TEXT("propagated_as"), Propagated->PropagatedName);
+		}
+
+		// The node's own switch pin, matched by name exactly as RefreshFromExternalChanges does
+		// (NiagaraNodeFunctionCall.cpp:1132-1142). While propagated its value is ignored.
+		for (UEdGraphPin* Pin : FnNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Input && Var.GetName().IsEqual(Pin->GetFName()))
+			{
+				Row->SetStringField(TEXT("node_pin_value"), Pin->DefaultValue);
+				Row->SetBoolField(TEXT("node_pin_value_ignored"), Pin->bDefaultValueIsIgnored);
+				if (UEnum* SwitchEnum = Var.GetType().GetEnum())
+				{
+					AddStaticSwitchEnumMetadata(Row, SwitchEnum, Pin->DefaultValue);
+				}
+				break;
+			}
+		}
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+	R->SetArrayField(TEXT("switches"), Rows);
+
+	TArray<TSharedPtr<FJsonValue>> PropArr;
+	for (const FString& P : ListPropagatedNames(FnNode)) PropArr.Add(MakeShared<FJsonValueString>(P));
+	R->SetArrayField(TEXT("propagated"), PropArr);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetPropagatedSwitches(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraGraphAuthoring;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString GuidStr = Params->GetStringField(TEXT("node_guid"));
+	UEdGraphNode* Node = FindNodeByGuid(Graph, GuidStr);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("No node with guid '%s'"), *GuidStr));
+
+	UNiagaraNodeFunctionCall* FnNode = Cast<UNiagaraNodeFunctionCall>(Node);
+	if (!FnNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' is a %s, not a function-call node — only function calls carry propagated static switches."),
+			*GuidStr, *Node->GetClass()->GetName()));
+	}
+
+	// --- everything below refuses BEFORE the transaction opens (gap #36) --------------------
+	const FString Mode = Params->HasField(TEXT("mode")) ? Params->GetStringField(TEXT("mode")).ToLower() : TEXT("add");
+	if (Mode != TEXT("add") && Mode != TEXT("set") && Mode != TEXT("remove"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown mode '%s'. Valid: add (default, purely additive) | set (the list becomes the complete "
+				 "propagated set, dropping any not named) | remove."), *Mode));
+	}
+
+	TArray<FString> RequestedNames;
+	bool bAll = false;
+	FString ParseError;
+	if (!Params->HasField(TEXT("switches")))
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"'switches' is required: an array of static switch names, a single name, or \"all\". "
+			"Call get_propagated_switches on the same node to see what it exposes."));
+	}
+	if (!ParseSwitchNameList(Params, TEXT("switches"), RequestedNames, bAll, ParseError))
+	{
+		return FMonolithActionResult::Error(ParseError);
+	}
+
+	UNiagaraGraph* CalledGraph = nullptr;
+	TArray<FNiagaraVariable> Available;
+	FString PropError;
+	if (!GetPropagatableSwitches(FnNode, CalledGraph, Available, PropError))
+	{
+		return FMonolithActionResult::Error(PropError);
+	}
+	if (Available.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"The called script exposes no propagatable static switches. FindStaticSwitchInputs "
+			"(NiagaraGraph.cpp:2184-2208) deliberately excludes compiler-set and expose-as-pin switches, so a "
+			"switch driven by a Selector pin will not appear here. NOTHING WAS CHANGED."));
+	}
+
+	TArray<FNiagaraVariable> Targets;
+	if (bAll)
+	{
+		Targets = Available;
+	}
+	else if (!ResolveSwitchNames(Available, RequestedNames, Targets, PropError))
+	{
+		return FMonolithActionResult::Error(PropError + TEXT(" NOTHING WAS CHANGED."));
+	}
+
+	const TArray<FString> Before = ListPropagatedNames(FnNode);
+
+	// mode=set is the only one that can DROP a propagation, and dropping one removes a static switch
+	// input from the containing script's stack. Compute the removals up front so they can be reported
+	// as a delta rather than discovered later.
+	TArray<FNiagaraVariable> ToRemove;
+	if (Mode == TEXT("set"))
+	{
+		for (const FNiagaraPropagatedVariable& Existing : FnNode->PropagatedStaticSwitchParameters)
+		{
+			if (!Targets.Contains(Existing.SwitchParameter)) ToRemove.Add(Existing.SwitchParameter);
+		}
+	}
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetPropagatedSwitches", "Set Propagated Static Switches"));
+	Graph->Modify();
+
+	TArray<FString> Added, Removed;
+	if (Mode == TEXT("remove"))
+	{
+		ApplyPropagation(FnNode, CalledGraph, Targets, /*bAdd=*/false, Removed);
+	}
+	else
+	{
+		ApplyPropagation(FnNode, CalledGraph, Targets, /*bAdd=*/true, Added);
+		if (ToRemove.Num() > 0)
+		{
+			ApplyPropagation(FnNode, CalledGraph, ToRemove, /*bAdd=*/false, Removed);
+		}
+	}
+
+	FnNode->MarkNodeRequiresSynchronization(TEXT("MonolithSetPropagatedSwitches"), true);
+	GEditor->EndTransaction();
+	SavePackageFor(Script);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), GuidStr);
+	R->SetStringField(TEXT("mode"), Mode);
+
+	auto ToJsonArray = [](const TArray<FString>& In)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FString& S : In) Out.Add(MakeShared<FJsonValueString>(S));
+		return Out;
+	};
+	R->SetArrayField(TEXT("propagated_before"), ToJsonArray(Before));
+	// Read back off the node, not from the request — an already-propagated switch must show as a
+	// no-op rather than a false positive.
+	R->SetArrayField(TEXT("propagated_after"), ToJsonArray(ListPropagatedNames(FnNode)));
+	R->SetArrayField(TEXT("added"), ToJsonArray(Added));
+	R->SetArrayField(TEXT("removed"), ToJsonArray(Removed));
+
+	if (Added.Num() == 0 && Removed.Num() == 0)
+	{
+		R->SetStringField(TEXT("note"), TEXT("No change — every requested switch was already in the requested state."));
+	}
+	if (Removed.Num() > 0)
+	{
+		R->SetStringField(TEXT("warning"), FString::Printf(TEXT(
+			"%d switch(es) are no longer propagated. Each one was a static switch INPUT of this script "
+			"(UNiagaraGraph::FindStaticSwitchInputs unions in propagated variables, NiagaraGraph.cpp:2198-2204), "
+			"so the containing module's parameter surface just changed and any stack value set on it is now orphaned. "
+			"The node falls back to its own pin value."), Removed.Num()));
+	}
+	R->SetStringField(TEXT("next"), TEXT(
+		"Propagation only decides WHERE the value comes from, never what it is. For a propagated switch, set the value "
+		"with set_static_switch_value on the CONTAINING script — it is now one of that script's static switch inputs. "
+		"(For a non-propagated switch the value lives on this node's own pin; set_graph_pin_default is the candidate "
+		"route but has not been exercised on a static-switch pin, so verify it rather than assuming.) Either way, "
+		"confirm against compiled output: a read-back returns what you just wrote."));
 	return NA_SuccessObj(R);
 }
 
