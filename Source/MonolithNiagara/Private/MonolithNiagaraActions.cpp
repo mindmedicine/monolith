@@ -7652,6 +7652,105 @@ static TArray<TSharedPtr<FJsonValue>> UsageBitmaskToStages(int32 Bitmask)
 	return Stages;
 }
 
+// ============================================================================
+// Shared graph traversal — ONE enumeration, four callers (gap #77).
+//
+// rename_user_parameter used to run its own private walk for "which module inputs are
+// bound to this name" and cast the upstream node to UNiagaraNodeInput. A linked-parameter
+// binding is a UNiagaraNodeParameterMapGet whose OUTPUT pin carries the parameter name, so
+// that cast could never match: updated_bindings was 0 by construction, for every linked
+// input, always (gap #77, invariant I-24). trace_parameter_binding's walk was correct the
+// whole time. These two helpers ARE that walk, lifted out so the two cannot drift again.
+// ============================================================================
+struct FMonolithNamedGraph
+{
+	UNiagaraGraph* Graph = nullptr;
+	FString OwnerName;   // "System" or the emitter handle name
+};
+
+// System spawn graph + every (filtered) emitter graph. An emitter that exposes no
+// inspectable graph — a stateless emitter has no FVersionedNiagaraEmitterData at all — is
+// reported through OutUninspectableEmitters rather than silently dropped: whatever it
+// references is outside every walk built on this collector, and callers that mutate need
+// to say so instead of implying full coverage.
+static void CollectSystemGraphs(UNiagaraSystem* System, const FString& EmitterFilter,
+	TArray<FMonolithNamedGraph>& OutGraphs, TArray<FString>* OutUninspectableEmitters = nullptr)
+{
+	if (!System) return;
+
+	if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+	{
+		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
+		{
+			if (Src->NodeGraph) OutGraphs.Add({ Src->NodeGraph, TEXT("System") });
+		}
+	}
+	for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
+	{
+		const FString EName = H.GetName().ToString();
+		if (!EmitterFilter.IsEmpty() && EName != EmitterFilter && H.GetId().ToString() != EmitterFilter) continue;
+		FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
+		UNiagaraScriptSource* Src = ED ? Cast<UNiagaraScriptSource>(ED->GraphSource) : nullptr;
+		if (Src && Src->NodeGraph)
+		{
+			OutGraphs.Add({ Src->NodeGraph, EName });
+		}
+		else if (OutUninspectableEmitters)
+		{
+			OutUninspectableEmitters->AddUnique(EName);
+		}
+	}
+}
+
+// Every stack-level READ of a parameter: a UNiagaraNodeParameterMapGet output pin carrying
+// the name, plus each pin it feeds. Pass an empty ParamName to enumerate every read in the
+// supplied graphs (what the zero-reader test in audit_stack_wiring needs).
+struct FMonolithParameterReader
+{
+	FString Owner;
+	FString Parameter;      // the MapGet output pin name, e.g. "User.Alpha"
+	FString Feeds;          // the consumer pin it drives
+	FString ConsumerNode;
+	UNiagaraGraph* Graph = nullptr;
+	UNiagaraNodeParameterMapGet* GetNode = nullptr;
+	UEdGraphPin* OutputPin = nullptr;
+};
+
+static void CollectStackParameterReaders(const TArray<FMonolithNamedGraph>& Graphs,
+	const FString& ParamName, TArray<FMonolithParameterReader>& Out)
+{
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+	for (const FMonolithNamedGraph& GE : Graphs)
+	{
+		if (!GE.Graph) continue;
+		for (UEdGraphNode* Node : GE.Graph->Nodes)
+		{
+			UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
+			if (!GetNode) continue;
+			for (UEdGraphPin* P : GetNode->Pins)
+			{
+				if (!P || P->Direction != EGPD_Output || P->LinkedTo.Num() == 0) continue;
+				if (P->PinName.IsNone() || UEdGraphSchema_Niagara::PinToTypeDefinition(P) == MapDef) continue;
+				const FString PinParam = P->PinName.ToString();
+				if (!ParamName.IsEmpty() && !PinParam.Equals(ParamName, ESearchCase::IgnoreCase)) continue;
+				for (UEdGraphPin* LP : P->LinkedTo)
+				{
+					if (!LP) continue;
+					FMonolithParameterReader R;
+					R.Owner = GE.OwnerName;
+					R.Parameter = PinParam;
+					R.Feeds = LP->PinName.ToString();
+					if (UEdGraphNode* Consumer = LP->GetOwningNode()) R.ConsumerNode = Consumer->GetName();
+					R.Graph = GE.Graph;
+					R.GetNode = GetNode;
+					R.OutputPin = P;
+					Out.Add(MoveTemp(R));
+				}
+			}
+		}
+	}
+}
+
 // Shared: index of every name-addressable parameter written anywhere in a system's
 // stacks, with writer attribution ("Owner/Usage/Module", "User", "engine_intrinsic").
 // Sources: module-script ParameterMapSet pins (alias-resolved per call), assignment
@@ -7718,26 +7817,8 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 	for (const TCHAR* I : Intrinsics) AddWriter(I, TEXT("engine_intrinsic"));
 
 	// Collect graphs: system + (filtered) emitters
-	struct FGraphEntry { UNiagaraGraph* Graph; FString OwnerName; };
-	TArray<FGraphEntry> Graphs;
-	if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
-	{
-		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
-		{
-			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
-		}
-	}
-	for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
-	{
-		FString EName = H.GetName().ToString();
-		if (!EmitterFilter.IsEmpty() && EName != EmitterFilter && H.GetId().ToString() != EmitterFilter) continue;
-		FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
-		if (!ED) continue;
-		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
-		{
-			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, EName });
-		}
-	}
+	TArray<FMonolithNamedGraph> Graphs;
+	CollectSystemGraphs(System, EmitterFilter, Graphs);
 
 	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
 	auto IsSkippablePin = [&MapDef](const UEdGraphPin* P)
@@ -7745,7 +7826,7 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 		return P->PinName.IsNone() || P->PinName == TEXT("Add") || UEdGraphSchema_Niagara::PinToTypeDefinition(P) == MapDef;
 	};
 
-	for (const FGraphEntry& GE : Graphs)
+	for (const FMonolithNamedGraph& GE : Graphs)
 	{
 		for (UEdGraphNode* Node : GE.Graph->Nodes)
 		{
@@ -9059,49 +9140,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleTraceParameterBinding(const
 	}
 	Trace->SetArrayField(TEXT("writers"), WritersArr);
 
-	// Readers — stack-level linked-input feeds: override MapGet output pins matching the name
+	// Readers — stack-level linked-input feeds: override MapGet output pins matching the name.
+	// Shared with rename_user_parameter's fix-up (gap #77) and audit_stack_wiring's zero-reader
+	// test (gap #78) — one traversal, so "what trace reports" and "what rename repairs" cannot
+	// disagree.
 	TArray<TSharedPtr<FJsonValue>> Readers;
 	{
-		struct FGraphEntry { UNiagaraGraph* Graph; FString OwnerName; };
-		TArray<FGraphEntry> Graphs;
-		if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+		TArray<FMonolithNamedGraph> Graphs;
+		CollectSystemGraphs(System, TEXT(""), Graphs);
+		TArray<FMonolithParameterReader> Found;
+		CollectStackParameterReaders(Graphs, ParamName, Found);
+		for (const FMonolithParameterReader& RD : Found)
 		{
-			if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
-			{
-				if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
-			}
-		}
-		for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
-		{
-			FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
-			if (!ED) continue;
-			if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
-			{
-				if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, H.GetName().ToString() });
-			}
-		}
-
-		for (const FGraphEntry& GE : Graphs)
-		{
-			for (UEdGraphNode* Node : GE.Graph->Nodes)
-			{
-				if (!Node || !Node->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapGet"))) continue;
-				for (UEdGraphPin* P : Node->Pins)
-				{
-					if (P->Direction != EGPD_Output || P->LinkedTo.Num() == 0) continue;
-					if (!P->PinName.ToString().Equals(ParamName, ESearchCase::IgnoreCase)) continue;
-					for (UEdGraphPin* LP : P->LinkedTo)
-					{
-						if (!LP) continue;
-						TSharedRef<FJsonObject> BO = MakeShared<FJsonObject>();
-						BO->SetStringField(TEXT("owner"), GE.OwnerName);
-						BO->SetStringField(TEXT("feeds"), LP->PinName.ToString());
-						if (UEdGraphNode* Consumer = LP->GetOwningNode())
-							BO->SetStringField(TEXT("consumer_node"), Consumer->GetName());
-						Readers.Add(MakeShared<FJsonValueObject>(BO));
-					}
-				}
-			}
+			TSharedRef<FJsonObject> BO = MakeShared<FJsonObject>();
+			BO->SetStringField(TEXT("owner"), RD.Owner);
+			BO->SetStringField(TEXT("feeds"), RD.Feeds);
+			if (!RD.ConsumerNode.IsEmpty()) BO->SetStringField(TEXT("consumer_node"), RD.ConsumerNode);
+			Readers.Add(MakeShared<FJsonValueObject>(BO));
 		}
 	}
 	Trace->SetArrayField(TEXT("readers"), Readers);
@@ -21683,8 +21738,31 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetEmitterParent(const TSha
 
 // ============================================================================
 // Action: rename_user_parameter
-// Renames a user parameter and updates all module input bindings that reference it.
-// WARNING: Custom HLSL modules with string references to "User.OldName" will NOT be caught.
+// Renames a user parameter and re-points every stack-level linked input that reads it.
+//
+// INVARIANT I-24 — why this action is shaped the way it is. Removing a User.* parameter
+// that any graph still reads does not leave a hole: the engine immediately re-materialises
+// the old name as a fresh, zero-valued exposed parameter to satisfy the reader. The result
+// is a ZOMBIE at the old name still driving the module, plus the renamed parameter holding
+// the value and driving nothing — at 0 compile errors. So a rename is only correct if the
+// graph readers move WITH it.
+//
+// Three defects fixed here (gaps #76 / #77, validated 2026-08-10):
+//   #76  The old code memcpy'd the value out of the FNiagaraVariable key returned by
+//        GetUserParameters. The engine documents that key's allocated data as stale
+//        (NiagaraUserRedirectionParameterStore.h:31 — "the values will be stale and are not
+//        to be trusted directly"); the live value lives at the store's offset. Measured:
+//        42.5 in, 7.25 out. Now delegated to the engine's own rename, which copies from
+//        ParameterData at the resolved offset.
+//   #77  The binding fix-up cast consumers to UNiagaraNodeInput; a linked-parameter binding
+//        is a UNiagaraNodeParameterMapGet, so it matched nothing and updated_bindings was 0
+//        by construction. Now uses the shared CollectStackParameterReaders walk.
+//   #36  CancelTransaction is NOT a rollback (measured 0 -> 17 -> 17), so all-or-nothing can
+//        only mean refusing BEFORE BeginTransaction. Phase 1 below mutates nothing.
+//
+// STILL NOT COVERED, and reported rather than implied: custom-HLSL string references to
+// "User.OldName" (module scripts are separate assets and the text is opaque), and emitters
+// with no inspectable graph (stateless emitters).
 // ============================================================================
 FMonolithActionResult FMonolithNiagaraActions::HandleRenameUserParameter(const TSharedPtr<FJsonObject>& Params)
 {
@@ -21733,146 +21811,223 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameUserParameter(const T
 			return FMonolithActionResult::Error(FString::Printf(TEXT("Parameter '%s' already exists"), *NewName));
 	}
 
-	FNiagaraTypeDefinition TD = FoundVar.GetType();
-	FString OldBindingName = FString::Printf(TEXT("User.%s"), *OldSearch);
-	FString NewBindingName = FString::Printf(TEXT("User.%s"), *NewSearch);
+	const FNiagaraTypeDefinition TD = FoundVar.GetType();
+	const FString OldBindingName = FString::Printf(TEXT("User.%s"), *OldSearch);
+	const FString NewBindingName = FString::Printf(TEXT("User.%s"), *NewSearch);
+	const FNiagaraVariable OldUserVar(TD, FName(*OldBindingName));
+	const FNiagaraVariable NewUserVar(TD, FName(*NewBindingName));
 
+	// ------------------------------------------------------------------------
+	// Phase 1 — enumerate and validate. NOTHING is mutated in this phase. Gap #36:
+	// GEditor->CancelTransaction does not roll back (measured 0 -> 17 -> 17), so the only
+	// reliable all-or-nothing is to refuse before the transaction is ever opened.
+	// ------------------------------------------------------------------------
+	TArray<FMonolithNamedGraph> Graphs;
+	TArray<FString> UninspectableEmitters;
+	CollectSystemGraphs(System, TEXT(""), Graphs, &UninspectableEmitters);
+
+	TArray<FMonolithParameterReader> Consumers;
+	CollectStackParameterReaders(Graphs, OldBindingName, Consumers);
+
+	struct FGraphRenameTarget
+	{
+		UNiagaraGraph* Graph = nullptr;
+		FString Owner;
+		FNiagaraVariable Var;
+	};
+	TArray<FGraphRenameTarget> Targets;
+	TArray<FString> Blockers;
+
+	for (const FMonolithParameterReader& C : Consumers)
+	{
+		const FString Where = FString::Printf(TEXT("%s: %s feeds '%s'"), *C.Owner, *C.ConsumerNode, *C.Feeds);
+		if (!C.Graph || !C.OutputPin)
+		{
+			Blockers.Add(FString::Printf(TEXT("%s (no owning graph)"), *Where));
+			continue;
+		}
+		if (C.Graph->IsCompilationCopy())
+		{
+			Blockers.Add(FString::Printf(TEXT("%s (compilation-copy graph — UNiagaraGraph::RenameParameter checks against it)"), *Where));
+			continue;
+		}
+		// The graph's parameter reference map is keyed by (name, TYPE). Renaming with the
+		// user-store's type when the pin carries a different one would rename nothing and
+		// report success, so take the type off the pin the reader actually uses.
+		const FNiagaraVariable PinVar = UEdGraphSchema_Niagara::PinToNiagaraVariable(C.OutputPin);
+		if (!PinVar.GetType().IsValid())
+		{
+			Blockers.Add(FString::Printf(TEXT("%s (output pin has no resolvable Niagara type)"), *Where));
+			continue;
+		}
+
+		bool bAlreadyTargeted = false;
+		for (const FGraphRenameTarget& T : Targets)
+		{
+			if (T.Graph == C.Graph && T.Var == PinVar) { bAlreadyTargeted = true; break; }
+		}
+		if (!bAlreadyTargeted) Targets.Add({ C.Graph, C.Owner, PinVar });
+	}
+
+	if (Blockers.Num() > 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Refusing to rename '%s' -> '%s': %d of %d consumer(s) cannot be updated, and a "
+			     "half-renamed system is worse than an un-renamed one (gap #36 — CancelTransaction is "
+			     "not a rollback). NOTHING WAS CHANGED. Blocked: %s"),
+			*OldBindingName, *NewBindingName, Blockers.Num(), Consumers.Num(), *FString::Join(Blockers, TEXT("; "))));
+	}
+
+	// ------------------------------------------------------------------------
+	// Phase 2 — mutate. Order mirrors the engine's own rename
+	// (FNiagaraSystemViewModel::RenameParameter, NiagaraSystemViewModel.cpp:1413-1520):
+	// store first, then graph references, with nothing ticking in between. Renaming the
+	// graphs first would let the User namespace self-populate the NEW name at 0.0 (I-24)
+	// and FNiagaraParameterStore::RenameParameter would then refuse to rename over it.
+	// ------------------------------------------------------------------------
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "RenameUP", "Rename User Parameter"));
 	System->Modify();
 
-	// Step 1: Add new parameter with same type
-	FNiagaraVariable NewVar = MakeUserVariable(NewSearch, TD);
-	NewVar.AllocateData();
-	// Copy raw data from old param
-	if (FoundVar.IsDataAllocated() && FoundVar.GetSizeInBytes() == NewVar.GetSizeInBytes())
-	{
-		FMemory::Memcpy(NewVar.GetData(), FoundVar.GetData(), FoundVar.GetSizeInBytes());
-	}
-	US.AddParameter(NewVar, true, true);
+	// Step 1 — the store. FNiagaraParameterStore::RenameParameter (NiagaraParameterStore.cpp:998)
+	// adds the new name, then copies the value with SetParameterData from
+	// GetParameterData_Internal(Idx) — i.e. out of the LIVE ParameterData buffer at the
+	// resolved offset, handling the data-interface and UObject cases too — and only then
+	// removes the old one. That is gap #76's fix: the previous code memcpy'd from the
+	// FNiagaraVariable key, whose allocated data the engine itself calls stale.
+	// It is not overridden by FNiagaraUserRedirectionParameterStore, but every lookup it makes
+	// goes through the overridden FindParameterOffset/AddParameter/RemoveParameter, so passing
+	// the fully-qualified "User.X" names keeps the redirection table correct.
+	US.RenameParameter(OldUserVar, FName(*NewBindingName));
+	const bool bStoreRenamed = US.IndexOf(NewUserVar) != INDEX_NONE && US.IndexOf(OldUserVar) == INDEX_NONE;
 
-	// Step 2: Walk all emitter graphs — find module bindings that reference old parameter
+	// Step 2 — user-parameter metadata (description, hierarchy section) is held separately
+	// from the store and would otherwise be orphaned on the old name.
+	bool bMetadataCarried = false;
+	if (UNiagaraSystemEditorData* EditorData = Cast<UNiagaraSystemEditorData>(System->GetEditorData()))
+	{
+		EditorData->Modify();
+		bMetadataCarried = EditorData->RenameUserScriptVariable(OldUserVar, FName(*NewBindingName));
+	}
+
+	// Step 3 — graph references. UNiagaraGraph::RenameParameter (NiagaraGraph.cpp:2783) renames
+	// every reference to the parameter in that graph through its own reference collection,
+	// which is what the editor's rename does — not a hand-rolled pin poke that leaves
+	// ParameterToReferencesMap and VariableToScriptVariable stale.
+	TSet<UNiagaraGraph*> RenamedGraphs;
+	TArray<FString> FailedGraphs;
+	for (const FGraphRenameTarget& T : Targets)
+	{
+		if (T.Graph && T.Graph->RenameParameter(T.Var, FName(*NewBindingName)))
+		{
+			RenamedGraphs.Add(T.Graph);
+		}
+		else
+		{
+			FailedGraphs.AddUnique(T.Owner);
+		}
+	}
+
 	int32 UpdatedBindings = 0;
-	TArray<FString> Warnings;
-
-	for (int32 EIdx = 0; EIdx < System->GetEmitterHandles().Num(); EIdx++)
+	for (const FMonolithParameterReader& C : Consumers)
 	{
-		const FNiagaraEmitterHandle& Handle = System->GetEmitterHandles()[EIdx];
-		FString EmitterName = Handle.GetName().ToString();
-		FVersionedNiagaraEmitterData* ED = Handle.GetEmitterData();
-		if (!ED) continue;
-
-		// Check all script stages for this emitter
-		TArray<ENiagaraScriptUsage> Usages = {
-			ENiagaraScriptUsage::EmitterSpawnScript,
-			ENiagaraScriptUsage::EmitterUpdateScript,
-			ENiagaraScriptUsage::ParticleSpawnScript,
-			ENiagaraScriptUsage::ParticleUpdateScript
-		};
-
-		for (ENiagaraScriptUsage Usage : Usages)
-		{
-			UNiagaraNodeOutput* OutputNode = FindOutputNode(System, EmitterName, Usage);
-			if (!OutputNode) continue;
-
-			TArray<UNiagaraNodeFunctionCall*> ModuleNodes;
-			MonolithNiagaraHelpers::GetOrderedModuleNodes(*OutputNode, ModuleNodes);
-
-			for (UNiagaraNodeFunctionCall* ModNode : ModuleNodes)
-			{
-				if (!ModNode) continue;
-
-				// Check upstream override node for binding pins linked to NiagaraNodeInput
-				UEdGraphPin* PMInput = MonolithNiagaraHelpers::GetParameterMapPin(*ModNode, EGPD_Input);
-				if (!PMInput || PMInput->LinkedTo.Num() == 0) continue;
-
-				UEdGraphNode* OverrideNode = PMInput->LinkedTo[0]->GetOwningNode();
-				if (!OverrideNode || Cast<UNiagaraNodeFunctionCall>(OverrideNode)) continue;
-
-				for (UEdGraphPin* Pin : OverrideNode->Pins)
-				{
-					if (Pin->Direction != EGPD_Input) continue;
-					if (Pin->LinkedTo.Num() == 0) continue;
-
-					UNiagaraNodeInput* InputNode = Cast<UNiagaraNodeInput>(Pin->LinkedTo[0]->GetOwningNode());
-					if (!InputNode) continue;
-
-					FString BoundName = InputNode->Input.GetName().ToString();
-					if (BoundName.Equals(OldBindingName, ESearchCase::IgnoreCase))
-					{
-						// Update the binding to point to new parameter
-						InputNode->Modify();
-						FNiagaraVariable NewInput = InputNode->Input;
-						NewInput.SetName(FName(*NewBindingName));
-						InputNode->Input = NewInput;
-						UpdatedBindings++;
-					}
-				}
-			}
-		}
+		if (RenamedGraphs.Contains(C.Graph)) ++UpdatedBindings;
 	}
 
-	// Also check system-level scripts
-	{
-		TArray<ENiagaraScriptUsage> SysUsages = {
-			ENiagaraScriptUsage::SystemSpawnScript,
-			ENiagaraScriptUsage::SystemUpdateScript
-		};
-		for (ENiagaraScriptUsage Usage : SysUsages)
-		{
-			UNiagaraNodeOutput* OutputNode = FindOutputNode(System, TEXT(""), Usage);
-			if (!OutputNode) continue;
+	// Step 4 — downstream fix-up. UNiagaraSystem::HandleVariableRenamed (NiagaraSystem.cpp:441)
+	// re-points FNiagaraUserParameterBinding data-interface bindings, re-inits the system's
+	// compiled data, and propagates the rename into every emitter (renderer bindings included).
+	// Its own store-rename branch is a no-op by now: step 1 already moved the parameter, so
+	// IndexOf(old) is INDEX_NONE. Called last, exactly where the engine calls it.
+	System->HandleVariableRenamed(OldUserVar, NewUserVar, true);
 
-			TArray<UNiagaraNodeFunctionCall*> ModuleNodes;
-			MonolithNiagaraHelpers::GetOrderedModuleNodes(*OutputNode, ModuleNodes);
-
-			for (UNiagaraNodeFunctionCall* ModNode : ModuleNodes)
-			{
-				if (!ModNode) continue;
-				UEdGraphPin* PMInput = MonolithNiagaraHelpers::GetParameterMapPin(*ModNode, EGPD_Input);
-				if (!PMInput || PMInput->LinkedTo.Num() == 0) continue;
-
-				UEdGraphNode* OverrideNode = PMInput->LinkedTo[0]->GetOwningNode();
-				if (!OverrideNode || Cast<UNiagaraNodeFunctionCall>(OverrideNode)) continue;
-
-				for (UEdGraphPin* Pin : OverrideNode->Pins)
-				{
-					if (Pin->Direction != EGPD_Input || Pin->LinkedTo.Num() == 0) continue;
-					UNiagaraNodeInput* InputNode = Cast<UNiagaraNodeInput>(Pin->LinkedTo[0]->GetOwningNode());
-					if (!InputNode) continue;
-
-					FString BoundName = InputNode->Input.GetName().ToString();
-					if (BoundName.Equals(OldBindingName, ESearchCase::IgnoreCase))
-					{
-						InputNode->Modify();
-						FNiagaraVariable NewInput = InputNode->Input;
-						NewInput.SetName(FName(*NewBindingName));
-						InputNode->Input = NewInput;
-						UpdatedBindings++;
-					}
-				}
-			}
-		}
-	}
-
-	// Step 3: Remove old parameter
-	US.RemoveParameter(FoundVar);
+	// Post-check with the SAME traversal that found the consumers. A rename that reports
+	// success while readers are still sitting on the old name is precisely the silent wrong
+	// result this action used to produce, so it is measured rather than assumed.
+	TArray<FMonolithParameterReader> StillOnOldName;
+	CollectStackParameterReaders(Graphs, OldBindingName, StillOnOldName);
 
 	GEditor->EndTransaction();
 	System->RequestCompile(false);
+
+	// ------------------------------------------------------------------------
+	// Phase 3 — report. Loud on anything that did not fully land.
+	// ------------------------------------------------------------------------
+	TArray<FString> Warnings;
+	if (!bStoreRenamed)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("STORE RENAME DID NOT LAND: '%s' is not resolvable in the exposed-parameter store after the rename. "
+			     "Do not save this asset; re-read with get_user_parameters."), *NewBindingName));
+	}
+	if (Consumers.Num() > 0 && UpdatedBindings == 0)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("READERS EXIST BUT NOTHING WAS RE-POINTED: %d stack reader(s) of '%s' were found and 0 were updated. "
+			     "This is invariant I-24: the engine will re-create '%s' as a zero-valued zombie that keeps driving "
+			     "those modules while '%s' drives nothing, and it will compile at 0 errors. Repair each input by hand "
+			     "(set_module_input_value to clear, then set_module_input_binding to '%s')."),
+			Consumers.Num(), *OldBindingName, *OldBindingName, *NewBindingName, *NewBindingName));
+	}
+	if (StillOnOldName.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("INCOMPLETE: %d reader(s) still resolve to '%s' after the rename — see readers_still_on_old_name."),
+			StillOnOldName.Num(), *OldBindingName));
+	}
+	if (FailedGraphs.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT("UNiagaraGraph::RenameParameter returned false for: %s"), *FString::Join(FailedGraphs, TEXT(", "))));
+	}
+	if (UninspectableEmitters.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("NOT INSPECTED: %s expose no node graph (stateless emitters have no emitter data). Any reference they "
+			     "hold to '%s' was neither found nor updated."),
+			*FString::Join(UninspectableEmitters, TEXT(", ")), *OldBindingName));
+	}
+	if (!bMetadataCarried)
+	{
+		Warnings.Add(TEXT("User-parameter metadata (description / hierarchy section) was not carried over — none was registered under the old name."));
+	}
+
+	auto ReadersToJson = [](const TArray<FMonolithParameterReader>& In)
+	{
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		for (const FMonolithParameterReader& C : In)
+		{
+			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("owner"), C.Owner);
+			O->SetStringField(TEXT("feeds"), C.Feeds);
+			if (!C.ConsumerNode.IsEmpty()) O->SetStringField(TEXT("consumer_node"), C.ConsumerNode);
+			Arr.Add(MakeShared<FJsonValueObject>(O));
+		}
+		return Arr;
+	};
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetBoolField(TEXT("success"), true);
 	R->SetStringField(TEXT("old_name"), OldBindingName);
 	R->SetStringField(TEXT("new_name"), NewBindingName);
 	R->SetStringField(TEXT("type"), TD.GetName());
+	R->SetNumberField(TEXT("consumers_found"), Consumers.Num());
 	R->SetNumberField(TEXT("updated_bindings"), UpdatedBindings);
+	R->SetArrayField(TEXT("consumers"), ReadersToJson(Consumers));
+	R->SetNumberField(TEXT("readers_still_on_old_name_count"), StillOnOldName.Num());
+	R->SetArrayField(TEXT("readers_still_on_old_name"), ReadersToJson(StillOnOldName));
+	R->SetBoolField(TEXT("metadata_carried"), bMetadataCarried);
+	R->SetBoolField(TEXT("fully_repointed"), Consumers.Num() == UpdatedBindings && StillOnOldName.Num() == 0);
 	if (Warnings.Num() > 0)
 	{
 		TArray<TSharedPtr<FJsonValue>> WarnArr;
 		for (const FString& W : Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
 		R->SetArrayField(TEXT("warnings"), WarnArr);
 	}
-	R->SetStringField(TEXT("note"), TEXT("Custom HLSL modules referencing 'User.OldName' in string form are NOT automatically updated"));
+	R->SetStringField(TEXT("note"),
+		TEXT("Stack-level linked inputs (ParameterMapGet readers) in the system graph and every emitter graph are "
+		     "re-pointed. STILL OUT OF REACH: custom HLSL that references 'User.OldName' as a STRING (module scripts "
+		     "are separate assets and their text is opaque to this walk), and 'Set User.X' assignment-node targets, "
+		     "which live in the assignment node's own inner graph. Verify with trace_parameter_binding on the NEW name "
+		     "— non-empty readers is the check that matters — then request_compile."));
 	return NA_SuccessObj(R);
 }
 
@@ -22636,27 +22791,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
 	// --- Collect all graphs to audit: system graph + each (filtered) emitter graph ---
-	struct FAuditGraph { UNiagaraGraph* Graph; FString OwnerName; };
-	TArray<FAuditGraph> Graphs;
-
-	if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
-	{
-		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(SysSpawn->GetLatestSource()))
-		{
-			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, TEXT("System") });
-		}
-	}
-	for (const FNiagaraEmitterHandle& H : System->GetEmitterHandles())
-	{
-		FString EName = H.GetName().ToString();
-		if (!EmitterFilter.IsEmpty() && EName != EmitterFilter && H.GetId().ToString() != EmitterFilter) continue;
-		FVersionedNiagaraEmitterData* ED = H.GetEmitterData();
-		if (!ED) continue;
-		if (UNiagaraScriptSource* Src = Cast<UNiagaraScriptSource>(ED->GraphSource))
-		{
-			if (Src->NodeGraph) Graphs.Add({ Src->NodeGraph, EName });
-		}
-	}
+	TArray<FMonolithNamedGraph> Graphs;
+	TArray<FString> UninspectableEmitters;
+	CollectSystemGraphs(System, EmitterFilter, Graphs, &UninspectableEmitters);
 	if (Graphs.Num() == 0) return FMonolithActionResult::Error(TEXT("No graphs found to audit"));
 
 	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
@@ -22679,7 +22816,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	};
 	TArray<FStageInfo> Stages;
 
-	for (const FAuditGraph& AG : Graphs)
+	for (const FMonolithNamedGraph& AG : Graphs)
 	{
 		for (UEdGraphNode* Node : AG.Graph->Nodes)
 		{
@@ -22816,7 +22953,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 
 	TArray<TSharedPtr<FJsonValue>> Orphans;
 	int32 DeadDynamicInputCount = 0;
-	for (const FAuditGraph& AG : Graphs)
+	for (const FMonolithNamedGraph& AG : Graphs)
 	{
 		for (UEdGraphNode* Node : AG.Graph->Nodes)
 		{
@@ -22931,6 +23068,56 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 		}
 	}
 
+	// ------------------------------------------------------------------------
+	// Gap #78 — USER PARAMETERS WITH ZERO READERS. A separate finding kind, because it needs
+	// the INVERSE test and the dead-link test above structurally cannot reach it.
+	//
+	// The dead-link criterion asks "does this linked name have a writer?", and
+	// BuildStackWriterIndex deliberately seeds EVERY exposed parameter as a "User" writer
+	// (see its User-parameters block). That seeding is correct and other checks depend on it,
+	// so it stays — but it means no User.* binding can ever be reported dead here. Measured:
+	// a binding to a name that never existed reported ok_link_count 1, problem_link_count 0,
+	// because the User namespace self-populates any name a graph reads (invariant I-24).
+	//
+	// The failure that hides behind that is the mirror image: after rename_user_parameter the
+	// system holds a zombie at the old name that still drives the modules, and the renamed
+	// parameter that drives nothing. The renamed one has ZERO readers. That is the signal.
+	//
+	// NOT folded into has_issues: a user parameter read only by a renderer material binding, a
+	// data-interface user binding, or custom HLSL text is legitimately reader-free by this
+	// walk. It gets its own count and its own flag so a caller can gate on it deliberately.
+	// ------------------------------------------------------------------------
+	TArray<TSharedPtr<FJsonValue>> UnreadUserParams;
+	{
+		TArray<FMonolithParameterReader> AllReads;
+		CollectStackParameterReaders(Graphs, TEXT(""), AllReads);
+		TSet<FString> ReadNames;
+		for (const FMonolithParameterReader& RD : AllReads) ReadNames.Add(RD.Parameter.ToLower());
+
+		FNiagaraUserRedirectionParameterStore& US = System->GetExposedParameters();
+		TArray<FNiagaraVariable> UserParams;
+		US.GetUserParameters(UserParams);
+		for (const FNiagaraVariable& UPVar : UserParams)
+		{
+			FString Qualified = UPVar.GetName().ToString();
+			if (!Qualified.StartsWith(TEXT("User."))) Qualified = FString::Printf(TEXT("User.%s"), *Qualified);
+			if (ReadNames.Contains(Qualified.ToLower())) continue;
+
+			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("parameter"), Qualified);
+			O->SetStringField(TEXT("type"), UPVar.GetType().GetName());
+			O->SetStringField(TEXT("value"), FMonolithNiagaraActions::SerializeParameterValue(UPVar, US));
+			O->SetStringField(TEXT("kind"), TEXT("unread_user_parameter"));
+			O->SetStringField(TEXT("reason"),
+				TEXT("exposed user parameter that no stack-level linked input reads. If it was just renamed, this is "
+				     "invariant I-24: the OLD name survives as a zero-valued zombie that still drives the modules while "
+				     "this one drives nothing, at 0 compile errors. Confirm with trace_parameter_binding on both names — "
+				     "the broken one has empty readers. NOT ALWAYS A DEFECT: a parameter consumed only by a renderer "
+				     "material binding, a data-interface user binding, or custom HLSL text is invisible to this walk."));
+			UnreadUserParams.Add(MakeShared<FJsonValueObject>(O));
+		}
+	}
+
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetStringField(TEXT("asset_path"), SystemPath);
 	R->SetArrayField(TEXT("stages"), StageArr);
@@ -22943,9 +23130,34 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 	R->SetNumberField(TEXT("dead_dynamic_input_count"), DeadDynamicInputCount);
 	R->SetNumberField(TEXT("writer_count"), WriterIndex.Writers.Num());
 	R->SetNumberField(TEXT("broken_chain_count"), BrokenChainCount);
+	R->SetNumberField(TEXT("unread_user_parameter_count"), UnreadUserParams.Num());
+	R->SetArrayField(TEXT("unread_user_parameters"), UnreadUserParams);
+	R->SetBoolField(TEXT("has_unread_user_parameters"), UnreadUserParams.Num() > 0);
 	// has_issues MUST cover chain integrity. It did not, and the omission was reported on the same
 	// response that carried chain_ok:false with a stage in the I-10 checkf crash precondition.
 	R->SetBoolField(TEXT("has_issues"), DeadLinks.Num() > 0 || Orphans.Num() > 0 || BrokenChainCount > 0);
+	if (UnreadUserParams.Num() > 0)
+	{
+		R->SetStringField(TEXT("user_parameter_warning"), FString::Printf(
+			TEXT("%d exposed user parameter(s) have NO stack-level reader (see unread_user_parameters). This finding is "
+			     "deliberately NOT counted in has_issues — the dead-link test cannot reach this class at all (gap #78), "
+			     "and a parameter read only by a renderer/DI binding is a legitimate zero. Check it explicitly."),
+			UnreadUserParams.Num()));
+	}
+	if (UninspectableEmitters.Num() > 0)
+	{
+		R->SetStringField(TEXT("coverage_warning"), FString::Printf(
+			TEXT("NOT AUDITED: %s expose no node graph (stateless emitters have no emitter data). Nothing they contain "
+			     "was inspected by any check in this response."),
+			*FString::Join(UninspectableEmitters, TEXT(", "))));
+	}
+	if (!EmitterFilter.IsEmpty() && UnreadUserParams.Num() > 0)
+	{
+		R->SetStringField(TEXT("user_parameter_scope_warning"),
+			TEXT("An 'emitter' filter is set, so unread_user_parameters was computed from ONE emitter's graph plus the "
+			     "system graph. A parameter read by a filtered-out emitter will be listed here wrongly. Re-run without "
+			     "'emitter' before acting on it."));
+	}
 	if (BrokenChainCount > 0)
 	{
 		R->SetStringField(TEXT("chain_warning"), FString::Printf(
