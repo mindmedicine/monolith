@@ -296,8 +296,15 @@ private:
 
 	// Shared helper: applies a JSON spec (emitters, user params, renderers, modules) to an existing system.
 	// Used by both create_system_from_spec and import_system_spec.
+	//
+	// OutModuleCounts (gap #51, optional): one entry per emitter created, recording how many modules
+	// the emitter INHERITED from its emitter_asset before any spec module was added, and how many the
+	// spec then added on top. add_emitter requires an emitter_asset, so those two sets stack rather
+	// than replace — this is what makes an export -> import round trip duplicate modules. The counts
+	// are collected so the caller can state that concretely instead of warning in the abstract.
 	static int32 ApplySpecToSystem(UNiagaraSystem* System, const FString& SystemPath,
-		const TSharedPtr<FJsonObject>& Spec, TArray<FString>& OutErrors);
+		const TSharedPtr<FJsonObject>& Spec, TArray<FString>& OutErrors,
+		TArray<TSharedPtr<FJsonValue>>* OutModuleCounts = nullptr);
 
 	// HLSL script creation helper
 	static FMonolithActionResult CreateScriptFromHLSL(const TSharedPtr<FJsonObject>& Params, ENiagaraScriptUsage Usage);

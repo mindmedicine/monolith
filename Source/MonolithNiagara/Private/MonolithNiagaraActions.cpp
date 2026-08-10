@@ -3080,6 +3080,55 @@ namespace MonolithNiagaraHelpers
 
 		return SmallestCount;
 	}
+
+	/**
+	 * GAP #53 — the enum a static switch parameter switches on, found by PARAMETER NAME.
+	 *
+	 * `export_system_spec` keys a static switch on (name, type): the engine's own pin lookup
+	 * (`FTraversalCache::GetStackFunctionStaticInputPinsInternal`, TraversalCache.cpp:701-717,
+	 * and the legacy `GetStackFunctionStaticSwitchPinsLegacy`, NiagaraStackGraphUtilities.cpp:
+	 * 1750-1765) matches `Pin->PinName.IsEqual(...) && Pin->PinType == PinType`. The exported
+	 * spec keys it on the NAME ALONE, so an exported `"NewEnumerator0"` can arrive at a
+	 * differently-typed same-named target on the way back in — recurring defect pattern #1,
+	 * one representation written and another read.
+	 *
+	 * This asks the switch NODE what it is rather than inferring from the value
+	 * (recurring defect pattern #4). `UNiagaraNodeStaticSwitch` is `UCLASS(MinimalAPI)` in a
+	 * PRIVATE header and `GetInputType()` carries no export macro, so the node is matched by
+	 * class NAME and `SwitchTypeData.Enum` is read by reflection — the same technique, and the
+	 * same reason, as FindStaticSwitchIntegerOptionCount above. Both members are UPROPERTYs
+	 * (NiagaraNodeStaticSwitch.h:29-30, 54-58), so this also works in a release build where
+	 * WITH_NIAGARA_WIZARD_PRIVATE is 0 and the type is not even declared.
+	 */
+	UEnum* FindStaticSwitchEnumForParameter(UNiagaraGraph* Graph, const FName& SwitchParameterName)
+	{
+		if (!Graph || SwitchParameterName.IsNone()) return nullptr;
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			UClass* NodeClass = Node->GetClass();
+			if (!NodeClass || NodeClass->GetName() != TEXT("NiagaraNodeStaticSwitch")) continue;
+
+			FNameProperty* NameProp = CastField<FNameProperty>(NodeClass->FindPropertyByName(TEXT("InputParameterName")));
+			if (!NameProp) continue;
+			if (NameProp->GetPropertyValue_InContainer(Node) != SwitchParameterName) continue;
+
+			FStructProperty* SwitchDataProp = CastField<FStructProperty>(NodeClass->FindPropertyByName(TEXT("SwitchTypeData")));
+			if (!SwitchDataProp || !SwitchDataProp->Struct) continue;
+
+			FObjectProperty* EnumProp = CastField<FObjectProperty>(SwitchDataProp->Struct->FindPropertyByName(TEXT("Enum")));
+			if (!EnumProp) continue;
+
+			const void* SwitchData = SwitchDataProp->ContainerPtrToValuePtr<void>(Node);
+			if (UEnum* FoundEnum = Cast<UEnum>(EnumProp->GetObjectPropertyValue_InContainer(SwitchData)))
+			{
+				return FoundEnum;
+			}
+		}
+
+		return nullptr;
+	}
 }
 
 // ============================================================================
@@ -5016,12 +5065,20 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID"))
 			.Optional(TEXT("input"), TEXT("string"), TEXT("Static switch name — omit to list all"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("import_system_spec"), TEXT("Overwrite an existing Niagara system with a JSON spec (removes all emitters/params, applies spec fresh)"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("import_system_spec"),
+		TEXT("Overwrite an existing Niagara system with a JSON spec (removes all emitters/params, applies spec fresh). "
+			 "WARNING - NOT ROUND-TRIP SAFE, IT DUPLICATES MODULES: add_emitter requires an emitter_asset, so every emitter "
+			 "arrives already carrying that asset's modules and the spec's modules are ADDED ON TOP, not merged or "
+			 "replaced. Re-importing an unmodified export_system_spec output roughly doubles the module count "
+			 "(measured: 16 from 10, including two sprite renderers) and all of it compiles clean. The response "
+			 "reports the exact 'N inherited + M from spec = T' split per emitter. export_system_spec itself is a "
+			 "safe, useful READ tool; for what a round trip looks like it does, use duplicate_system (templating), "
+			 "diff_systems (comparison) or source control (backup)."),
 		FMonolithActionHandler::CreateStatic(&HandleImportSystemSpec),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Existing Niagara system to overwrite"))
 			.Required(TEXT("spec"), TEXT("object"), TEXT("System spec JSON (same format as create_system_from_spec)"))
-			.Optional(TEXT("mode"), TEXT("string"), TEXT("Import mode: overwrite or merge"))
+			.Optional(TEXT("mode"), TEXT("string"), TEXT("Import mode: overwrite or merge. NEITHER avoids the module duplication above — merge only skips emitters whose NAME already exists; any emitter it does create still inherits its emitter_asset's modules before the spec's are added."))
 			.Build());
 
 	// --- Phase 9: Medium Priority Expansion (6 new) ---
@@ -11071,20 +11128,58 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 	// Expose-as-pin switches have no such pin; their value travels through the parameter map and
 	// is written on the module input override pin further below.
 	UEdGraphPin* SwitchPin = nullptr;
+	TArray<UEdGraphPin*> SameNamedSwitchPins;
 	if (!bSelectorExposedAsPin)
 	{
+		// ------------------------------------------------------------------------
+		// GAP #53 — a name is not a unique key for a switch pin, and this used to
+		// assume it was ("SwitchPin = first name match; break").
+		//
+		// The engine identifies a static switch pin by NAME **AND TYPE** — both its
+		// pin collectors match `Pin->PinName.IsEqual(Var.GetName()) && Pin->PinType ==
+		// Schema->TypeDefinitionToPinType(Var.GetType())` (TraversalCache.cpp:701-717;
+		// NiagaraStackGraphUtilities.cpp:1750-1765), and `FindStaticSwitchInputs`
+		// AddUnique's on the whole FNiagaraVariable, i.e. on name AND type
+		// (NiagaraGraph.cpp:2194-2195). Two same-named entries of different types are
+		// therefore two distinct switches to the engine and two distinct pins here,
+		// while CollectStaticSwitchInputs de-duplicates on NAME ALONE and an exported
+		// spec carries only the name. Taking the first match could pick a pin the
+		// exporter never read.
+		// ------------------------------------------------------------------------
 		for (UEdGraphPin* Pin : MN->Pins)
 		{
-			if (Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
+			if (Pin && Pin->Direction == EGPD_Input && Pin->GetFName() == MatchedFullName)
 			{
-				SwitchPin = Pin;
-				break;
+				SameNamedSwitchPins.Add(Pin);
 			}
 		}
-		if (!SwitchPin)
+		if (SameNamedSwitchPins.Num() == 0)
 		{
 			return FMonolithActionResult::Error(FString::Printf(
 				TEXT("Static switch pin '%s' not found on module node. The switch exists in the script but has no corresponding pin."), *InputName));
+		}
+
+		SwitchPin = SameNamedSwitchPins[0];
+		for (UEdGraphPin* Candidate : SameNamedSwitchPins)
+		{
+			if (UEdGraphSchema_Niagara::PinToTypeDefinition(Candidate).IsSameBaseDefinition(InputType))
+			{
+				SwitchPin = Candidate;
+				break;
+			}
+		}
+
+		// Recurring defect pattern #1 — validate the thing that is actually SHIPPED.
+		// The write below is `SwitchPin->DefaultValue = ValStr`, so the pin, not the
+		// graph walk, decides which validation applies. IsSameBaseDefinition ignores
+		// type FLAGS (NiagaraTypes.h:786-789), so a static/non-static spelling
+		// difference is not treated as a disagreement and nothing churns in the
+		// ordinary case.
+		const FNiagaraTypeDefinition SwitchPinType = UEdGraphSchema_Niagara::PinToTypeDefinition(SwitchPin);
+		if (SwitchPinType.IsValid() && !SwitchPinType.IsSameBaseDefinition(InputType))
+		{
+			InputType = SwitchPinType;
+			SwitchEnum = SwitchPinType.GetEnum();
 		}
 		if (!SwitchEnum) SwitchEnum = TryGetStaticSwitchEnum(SwitchPin, MN);
 	}
@@ -11157,11 +11252,71 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 			: FString(TEXT("any whole number — this switch's case count could not be determined, so the value is NOT bounds-checked"));
 
 		int32 ParsedValue = 0;
+		FString RescuedFromEnumerator;
 		if (!MonolithNiagaraHelpers::ResolveStaticSwitchIntValue(ValStr, ParsedValue))
 		{
-			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Integer switch '%s' does not accept value '%s' — it is not a whole number. Valid options: [%s]"),
-				*InputName, *ValStr, *ValidOptions));
+			// ------------------------------------------------------------------
+			// GAP #53 — ENUMERATOR-NAME RESCUE, and ONLY as a rescue.
+			//
+			// `export_system_spec` writes a static switch's raw pin default. For an
+			// enum-typed switch that string is the enumerator NAME ("NewEnumerator0",
+			// the spelling every UserDefinedEnum asset uses internally), and the spec
+			// carries only (name, value) — so it can land on an integer-typed target
+			// and be refused as "not a whole number".
+			//
+			// This runs AFTER the integer parse has already failed, never before, so
+			// no value that works today changes meaning: a legitimate "2" is still
+			// parsed as 2 and never handed to an enum resolver. The enum is asked for
+			// by IDENTITY — an enum-typed pin of the same name, then the switch node
+			// itself — not inferred from the shape of the value (pattern #4), and the
+			// resolution reuses the shared ResolveStaticSwitchEnumValue from #26/#34
+			// rather than re-deriving name matching here.
+			//
+			// What is written is the enum's INTEGER value, because the target is an
+			// integer-typed pin. Writing "NewEnumerator0" onto it would be the same
+			// class of bug this is fixing: `FNiagaraEditorIntegerTypeUtilities` would
+			// parse it as 0 and compile clean whatever the name meant.
+			// ------------------------------------------------------------------
+			UEnum* RescueEnum = nullptr;
+			for (UEdGraphPin* Candidate : SameNamedSwitchPins)
+			{
+				if (Candidate == SwitchPin) continue;
+				if (UEnum* CandidateEnum = UEdGraphSchema_Niagara::PinToTypeDefinition(Candidate).GetEnum())
+				{
+					RescueEnum = CandidateEnum;
+					break;
+				}
+			}
+			if (!RescueEnum)
+			{
+				RescueEnum = MonolithNiagaraHelpers::FindStaticSwitchEnumForParameter(CalledGraph, SwitchParameterName);
+			}
+
+			FString RescueRaw;
+			FString RescueDisplay;
+			const bool bRescued = RescueEnum
+				&& FMonolithNiagaraActions::ResolveStaticSwitchEnumValue(RescueEnum, ValStr, RescueRaw, &RescueDisplay);
+			const int64 RescueValue = bRescued ? RescueEnum->GetValueByNameString(RescueRaw) : INDEX_NONE;
+
+			if (!bRescued || RescueValue == INDEX_NONE || RescueValue < 0 || RescueValue > MAX_int32)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Integer switch '%s' does not accept value '%s' — it is not a whole number. Valid options: [%s]. %s"),
+					*InputName, *ValStr, *ValidOptions,
+					RescueEnum
+						? TEXT("It is not a valid entry of the enum attributed to this switch either.")
+						: TEXT("No enum could be attributed to this switch, so an enumerator name such as 'NewEnumerator0' "
+							   "cannot be translated — if this value came from export_system_spec, the exporter read a "
+							   "DIFFERENT same-named pin (the engine keys switch pins on name AND type; the spec keys them "
+							   "on name only) and the two halves are not talking about the same switch.")));
+			}
+
+			ParsedValue = static_cast<int32>(RescueValue);
+			// Keep the human-facing spelling AND the enumerator name the caller sent, so the
+			// success message reports the translation instead of quietly reporting a bare
+			// integer the caller never asked for (pattern #2 — a success that reports a lie).
+			RescuedFromEnumerator = FString::Printf(TEXT("%s = %s"),
+				*ValStr, RescueDisplay.IsEmpty() ? *RescueRaw : *RescueDisplay);
 		}
 
 		if (OptionCount > 0 && (ParsedValue < 0 || ParsedValue >= OptionCount))
@@ -11173,7 +11328,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetStaticSwitchValue(const 
 		}
 
 		ValStr = FString::FromInt(ParsedValue);
-		DisplayValue = ValStr;
+		DisplayValue = RescuedFromEnumerator.IsEmpty()
+			? ValStr
+			: FString::Printf(TEXT("%s (enumerator name translated: %s)"), *ValStr, *RescuedFromEnumerator);
 	}
 
 	// Gap #38 — abort before the transaction rather than crash inside the engine helper.
@@ -12808,6 +12965,38 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 							TSharedRef<FJsonObject> SwObj = MakeShared<FJsonObject>();
 							SwObj->SetStringField(TEXT("name"), SwitchName);
 							SwObj->SetStringField(TEXT("value"), SwitchPin->DefaultValue);
+
+							// GAP #53 — ADDITIVE, and read off the SAME pin the value came from.
+							//
+							// The engine keys a static switch pin on (name, TYPE) — both pin
+							// collectors match name AND PinType (TraversalCache.cpp:701-717,
+							// NiagaraStackGraphUtilities.cpp:1750-1765) — while this array keys it
+							// on the name alone. `value` is therefore ambiguous on its own: an
+							// enum-typed switch's pin default is the raw enumerator NAME (the
+							// "NewEnumerator<N>" spelling every UserDefinedEnum asset uses
+							// internally), which is indistinguishable from a string an integer
+							// switch would refuse. Emitting the type makes the exported artefact
+							// self-describing and makes "how many switches export NewEnumerator*,
+							// and how many of those are genuinely enum-typed" answerable from a
+							// single export rather than by guesswork.
+							//
+							// Import reads `name` and `value` and ignores unknown keys, so this
+							// changes no import behaviour. It is a pure widening of the read tool.
+							const FNiagaraTypeDefinition SwitchPinType = UEdGraphSchema_Niagara::PinToTypeDefinition(SwitchPin);
+							if (SwitchPinType.IsValid())
+							{
+								SwObj->SetStringField(TEXT("type"), SwitchPinType.GetName());
+								if (UEnum* SwitchPinEnum = SwitchPinType.GetEnum())
+								{
+									SwObj->SetStringField(TEXT("enum"), SwitchPinEnum->GetName());
+									const int64 SwitchEnumValue = SwitchPinEnum->GetValueByNameString(SwitchPin->DefaultValue);
+									if (SwitchEnumValue != INDEX_NONE)
+									{
+										SwObj->SetStringField(TEXT("display_value"),
+											SwitchPinEnum->GetDisplayNameTextByValue(SwitchEnumValue).ToString());
+									}
+								}
+							}
 							SwitchArr.Add(MakeShared<FJsonValueObject>(SwObj));
 
 							FString Stripped = SwitchName;
@@ -19631,9 +19820,35 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetStaticSwitchValue(const 
 // ============================================================================
 
 int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const FString& SystemPath,
-	const TSharedPtr<FJsonObject>& Spec, TArray<FString>& OutErrors)
+	const TSharedPtr<FJsonObject>& Spec, TArray<FString>& OutErrors,
+	TArray<TSharedPtr<FJsonValue>>* OutModuleCounts)
 {
 	int32 FailCount = 0;
+
+	// GAP #51 — counts the modules an emitter already has, using the same four stage usages and
+	// the same ordered traversal export_system_spec reports from, so "inherited" here means the
+	// same thing "modules" means in an exported spec. Measured immediately after add_emitter and
+	// before a single spec module is applied.
+	auto CountEmitterModules = [](UNiagaraSystem* InSystem, const FString& InHandleId) -> int32
+	{
+		if (!InSystem) return 0;
+		static const ENiagaraScriptUsage CountedUsages[] = {
+			ENiagaraScriptUsage::EmitterSpawnScript,
+			ENiagaraScriptUsage::EmitterUpdateScript,
+			ENiagaraScriptUsage::ParticleSpawnScript,
+			ENiagaraScriptUsage::ParticleUpdateScript,
+		};
+		int32 Total = 0;
+		for (ENiagaraScriptUsage Usage : CountedUsages)
+		{
+			UNiagaraNodeOutput* Out = FindOutputNode(InSystem, InHandleId, Usage);
+			if (!Out) continue;
+			TArray<UNiagaraNodeFunctionCall*> StageModules;
+			MonolithNiagaraHelpers::GetOrderedModuleNodes(*Out, StageModules);
+			Total += StageModules.Num();
+		}
+		return Total;
+	};
 
 	// Add user parameters
 	if (Spec->HasField(TEXT("user_parameters")))
@@ -19680,6 +19895,14 @@ int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const F
 				SpecSystem->WaitForCompilationComplete();
 			}
 
+			// GAP #51 — measured here, before the first spec module is applied: whatever the
+			// emitter already carries came from the emitter_asset add_emitter demanded, NOT from
+			// this spec.
+			const int32 InheritedModuleCount = OutModuleCounts
+				? CountEmitterModules(SpecSystem ? SpecSystem : System, EmitterId)
+				: 0;
+			int32 SpecModulesAdded = 0;
+
 			// Emitter properties
 			if (EO->HasField(TEXT("properties")))
 			{
@@ -19712,6 +19935,7 @@ int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const F
 					AMP->SetNumberField(TEXT("index"), MO->HasField(TEXT("index")) ? MO->GetNumberField(TEXT("index")) : MI);
 					FMonolithActionResult AMR = HandleAddModule(AMP);
 					if (!AMR.bSuccess) { OutErrors.Add(FString::Printf(TEXT("add_module[%s]: %s"), *MO->GetStringField(TEXT("script")), *AMR.ErrorMessage)); FailCount++; continue; }
+					++SpecModulesAdded;
 
 					FString NodeGuid;
 					if (AMR.Result.IsValid())
@@ -19868,6 +20092,27 @@ int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const F
 					}
 				}
 			}
+
+			// GAP #51 — re-count rather than trusting inherited + added. The second number is what
+			// this function BELIEVES it did; the total is what the emitter actually ends up with,
+			// read back from the same traversal. Reporting only the arithmetic would be a plan
+			// checked against its own intentions (recurring defect pattern #3).
+			if (OutModuleCounts)
+			{
+				UNiagaraSystem* CountSystem = LoadSystem(SystemPath);
+				const int32 FinalModuleCount = CountEmitterModules(CountSystem ? CountSystem : System, EmitterId);
+
+				TSharedRef<FJsonObject> CountObj = MakeShared<FJsonObject>();
+				CountObj->SetStringField(TEXT("emitter"), EO->HasField(TEXT("name")) ? EO->GetStringField(TEXT("name")) : EmitterId);
+				CountObj->SetStringField(TEXT("emitter_asset"), EO->GetStringField(TEXT("asset")));
+				CountObj->SetNumberField(TEXT("modules_inherited_from_emitter_asset"), InheritedModuleCount);
+				CountObj->SetNumberField(TEXT("modules_added_from_spec"), SpecModulesAdded);
+				CountObj->SetNumberField(TEXT("modules_after_import"), FinalModuleCount);
+				CountObj->SetStringField(TEXT("summary"), FString::Printf(
+					TEXT("%d inherited + %d from spec = %d"),
+					InheritedModuleCount, SpecModulesAdded, FinalModuleCount));
+				OutModuleCounts->Add(MakeShared<FJsonValueObject>(CountObj));
+			}
 		}
 	}
 
@@ -19915,6 +20160,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load system '%s'"), *SystemPath));
 
 	TArray<FString> Errors;
+	TArray<TSharedPtr<FJsonValue>> ModuleCounts;
 	int32 FailCount = 0;
 
 	if (Mode.Equals(TEXT("merge"), ESearchCase::IgnoreCase))
@@ -19998,7 +20244,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 			if (NewEmitters.Num() > 0)
 			{
 				FilteredSpec->SetArrayField(TEXT("emitters"), NewEmitters);
-				FailCount += ApplySpecToSystem(System, SystemPath, FilteredSpec, Errors);
+				FailCount += ApplySpecToSystem(System, SystemPath, FilteredSpec, Errors, &ModuleCounts);
 			}
 		}
 	}
@@ -20035,7 +20281,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 		System->RequestCompile(true);
 		System->WaitForCompilationComplete();
 
-		FailCount = ApplySpecToSystem(System, SystemPath, Spec, Errors);
+		FailCount = ApplySpecToSystem(System, SystemPath, Spec, Errors, &ModuleCounts);
 	}
 
 	// Final compile
@@ -20053,6 +20299,66 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 	Final->SetStringField(TEXT("mode"), Mode);
 	Final->SetNumberField(TEXT("emitter_count"), EmitterCount);
 	Final->SetNumberField(TEXT("failed_steps"), FailCount);
+
+	// ------------------------------------------------------------------------
+	// GAP #51 — THIS ACTION IS NOT ROUND-TRIP SAFE, AND NOW IT SAYS SO.
+	//
+	// The duplication is structural, not a bug in either step: add_emitter REQUIRES an
+	// `emitter_asset`, so every emitter arrives already carrying its parent asset's modules,
+	// and the spec's modules are then added on top. Measured on the first real round trip:
+	// 16 modules from 10, including two sprite renderers.
+	//
+	// The behaviour is deliberately UNCHANGED. Choosing merge-vs-replace would be designing
+	// for a use nobody has: duplicate_system covers templating, diff_systems covers
+	// comparison, source control covers backup, and export_system_spec — the half that IS
+	// useful, being a read tool — is unaffected either way. What was wrong was reporting a
+	// clean `failed_steps: 0` for a system that had silently doubled. A success that reports
+	// a lie is worse than a failure (recurring defect pattern #2), so the numbers are
+	// reported instead: concrete "N inherited + M from spec = T" per emitter, re-counted
+	// off the asset rather than inferred from the arithmetic.
+	// ------------------------------------------------------------------------
+	Final->SetBoolField(TEXT("round_trip_safe"), false);
+
+	int32 TotalInherited = 0;
+	int32 TotalFromSpec = 0;
+	int32 TotalAfter = 0;
+	for (const TSharedPtr<FJsonValue>& CV : ModuleCounts)
+	{
+		const TSharedPtr<FJsonObject>* CO = nullptr;
+		if (!CV.IsValid() || !CV->TryGetObject(CO) || !(*CO).IsValid()) continue;
+		TotalInherited += static_cast<int32>((*CO)->GetNumberField(TEXT("modules_inherited_from_emitter_asset")));
+		TotalFromSpec += static_cast<int32>((*CO)->GetNumberField(TEXT("modules_added_from_spec")));
+		TotalAfter += static_cast<int32>((*CO)->GetNumberField(TEXT("modules_after_import")));
+	}
+
+	FString Warning =
+		TEXT("import_system_spec is NOT round-trip safe and DUPLICATES MODULES. add_emitter requires an ")
+		TEXT("emitter_asset, so each emitter arrives already carrying that asset's modules; this action then ")
+		TEXT("ADDS the spec's modules ON TOP of them rather than replacing them. Feeding an unmodified ")
+		TEXT("export_system_spec output back in therefore produces a system with roughly double the modules ")
+		TEXT("(measured: 16 from 10, including two sprite renderers — gap #51), and every duplicate compiles ")
+		TEXT("clean. This is structural, not a transient failure, and it is not avoidable through parameters. ");
+
+	if (ModuleCounts.Num() > 0)
+	{
+		Warning += FString::Printf(
+			TEXT("THIS CALL: %d module(s) inherited from the emitter asset(s) + %d applied from the spec = %d ")
+			TEXT("module(s) now on the imported emitter(s) — see module_duplication for the per-emitter split. "),
+			TotalInherited, TotalFromSpec, TotalAfter);
+		Final->SetArrayField(TEXT("module_duplication"), ModuleCounts);
+	}
+	else
+	{
+		Warning += TEXT("No emitters were created by this call, so no duplication counts were taken. ");
+	}
+
+	Warning +=
+		TEXT("export_system_spec is a genuinely useful READ tool and is unaffected by this. For the jobs an ")
+		TEXT("export->import round trip looks like it does, use duplicate_system (templating), diff_systems ")
+		TEXT("(comparison) or source control (backup) instead.");
+
+	Final->SetStringField(TEXT("warning"), Warning);
+
 	if (Errors.Num() > 0)
 	{
 		TArray<TSharedPtr<FJsonValue>> ErrArr;
