@@ -35,7 +35,10 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_cdo_properties"),
 		TEXT("Read all CDO (Class Default Object) properties from a Blueprint or any UObject asset. "
 			 "Essential for GameplayEffects (Duration, Modifiers, Tags, Stacking), AbilitySets, InputActions, "
-			 "and any asset whose config is stored as UPROPERTY defaults rather than Blueprint graph nodes."),
+			 "and any asset whose config is stored as UPROPERTY defaults rather than Blueprint graph nodes. "
+			 "Enum-typed properties additionally carry 'enum' (UEnum path), 'display_value' and 'authored_name' "
+			 "beside the raw 'value' -- an editor-authored enum asset stores entries as 'NewEnumerator<n>', "
+			 "which is meaningless without them. Arrays of enums get 'element_display_values'."),
 		FMonolithActionHandler::CreateStatic(&HandleGetCDOProperties),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Asset path (e.g. /Game/Blueprints/BP_MyActor or /Game/Data/DA_MyData)"))
@@ -44,6 +47,7 @@ void FMonolithBlueprintCDOActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("owner_class_filter"), TEXT("string"), TEXT("Only include properties whose owner_class name contains this string (case-insensitive). Lets you skip everything inherited from AActor/APawn/ACharacter when only project-level props matter."))
 			.Optional(TEXT("name_pattern"), TEXT("string"), TEXT("Only include properties whose name contains this substring (case-insensitive)"))
 			.Optional(TEXT("exclude_categories"), TEXT("array"), TEXT("List of category names to skip entirely (case-insensitive exact match — e.g. [\"Replication\", \"Cooking\", \"HLOD\", \"Lighting\"])"))
+			.Optional(TEXT("include_enum_options"), TEXT("boolean"), TEXT("Enum-typed properties also carry 'valid_options' -- the full raw_value/display_value/authored_name/value table for their UEnum (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_cdo_property"),
@@ -142,6 +146,25 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: asset_path"));
 	}
 
+	// Boolean flags are validated BEFORE the asset load (#36: refuse first).
+	// include_parent_defaults previously went through GetBoolField, which routes to
+	// GetField<EJson::None>()->AsBool() (JsonObject.cpp:523-526) -- i.e. the same
+	// TJsonValueString::TryGetBool hole: any non-boolean string silently became
+	// `false`, which for THIS flag means "quietly hide every inherited property".
+	bool bIncludeParentDefaults = true;
+	bool bIncludeEnumOptions    = false;
+	FString FlagError;
+	if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("include_parent_defaults"), bIncludeParentDefaults, &FlagError)
+		&& !FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
+	if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("include_enum_options"), bIncludeEnumOptions, &FlagError)
+		&& !FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
+
 	// Try Blueprint first (has GeneratedClass -> CDO), then fall back to any UObject
 	UObject* TargetObject = nullptr;
 	UClass* TargetClass = nullptr;
@@ -180,11 +203,7 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 		CategoryFilter = Params->GetStringField(TEXT("category_filter"));
 	}
 
-	bool bIncludeParentDefaults = true;
-	if (Params->HasField(TEXT("include_parent_defaults")))
-	{
-		bIncludeParentDefaults = Params->GetBoolField(TEXT("include_parent_defaults"));
-	}
+	// bIncludeParentDefaults / bIncludeEnumOptions were validated at the top of this handler.
 
 	FString OwnerClassFilter;
 	if (Params->HasField(TEXT("owner_class_filter")))
@@ -256,6 +275,51 @@ FMonolithActionResult FMonolithBlueprintCDOActions::HandleGetCDOProperties(const
 		PropObj->SetStringField(TEXT("category"), Category);
 		PropObj->SetStringField(TEXT("owner_class"), OwnerClass->GetName());
 		PropObj->SetField(TEXT("value"), MonolithCDOInternal::PropertyToJsonValue(Prop, ValuePtr, TargetObject));
+
+		// #63 -- 'value' for an enum property is the raw entry identifier, which for
+		// an editor-authored enum asset is "NewEnumerator<n>" and means nothing on
+		// its own. Emit the resolved names beside it; 'value' is untouched because a
+		// write takes the raw form back. The value string is re-derived through
+		// ExportTextItem_Direct rather than read back out of the JSON, so what is
+		// resolved is the property, not our own serialization of it.
+		if (const UEnum* PropEnum = MonolithBlueprintInternal::EnumFromProperty(Prop))
+		{
+			FString RawEnumValue;
+			Prop->ExportTextItem_Direct(RawEnumValue, ValuePtr, nullptr, TargetObject, PPF_None);
+			MonolithBlueprintInternal::AddEnumDisplayFields(
+				PropObj, PropEnum, RawEnumValue, bIncludeEnumOptions);
+		}
+		// Arrays of enums: same treatment, one entry per element, so an enum inside a
+		// container is not a silent hole. Nested enums inside structs / maps / sets are
+		// NOT covered -- they are serialized by FMonolithReflectionReader in MonolithCore,
+		// which this pass was not scoped to touch. Their absence is detectable from 'type'.
+		else if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Prop))
+		{
+			if (const UEnum* InnerEnum = MonolithBlueprintInternal::EnumFromProperty(ArrayProp->Inner))
+			{
+				FScriptArrayHelper ArrayHelper(ArrayProp, ValuePtr);
+				TArray<TSharedPtr<FJsonValue>> ElementEnums;
+				for (int32 ElemIndex = 0; ElemIndex < ArrayHelper.Num(); ++ElemIndex)
+				{
+					FString RawElemValue;
+					ArrayProp->Inner->ExportTextItem_Direct(
+						RawElemValue, ArrayHelper.GetRawPtr(ElemIndex), nullptr, TargetObject, PPF_None);
+
+					TSharedPtr<FJsonObject> ElemObj = MakeShared<FJsonObject>();
+					ElemObj->SetNumberField(TEXT("index"), ElemIndex);
+					ElemObj->SetStringField(TEXT("raw_value"), RawElemValue);
+					MonolithBlueprintInternal::AddEnumDisplayFields(ElemObj, InnerEnum, RawElemValue);
+					ElementEnums.Add(MakeShared<FJsonValueObject>(ElemObj));
+				}
+				PropObj->SetStringField(TEXT("enum"), InnerEnum->GetPathName());
+				PropObj->SetArrayField(TEXT("element_display_values"), ElementEnums);
+				if (bIncludeEnumOptions)
+				{
+					PropObj->SetArrayField(TEXT("valid_options"),
+						MonolithBlueprintInternal::BuildEnumOptions(InnerEnum));
+				}
+			}
+		}
 
 		if (Prop->HasAnyPropertyFlags(CPF_Net))
 			PropObj->SetBoolField(TEXT("replicated"), true);
@@ -749,8 +813,21 @@ namespace MonolithCDOPhase1Internal
 		}
 		Spec.Tree = *TreePtr;
 
-		Params->TryGetBoolField(TEXT("dry_run"), Spec.bDryRun);
-		Params->TryGetBoolField(TEXT("strict"), Spec.bStrict);
+		// Strict: dry_run is the highest-consequence boolean in the codebase.
+		// TryGetBoolField never fails on a string, so "TRUE " (trailing space) or any
+		// other unrecognised spelling silently became `false` — i.e. the caller asked
+		// to simulate and got a real write. Refuse instead.
+		FString FlagError;
+		if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("dry_run"), Spec.bDryRun, &FlagError)
+			&& !FlagError.IsEmpty())
+		{
+			return FMonolithActionResult::Error(FlagError, FMonolithJsonUtils::ErrInvalidParams);
+		}
+		if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("strict"), Spec.bStrict, &FlagError)
+			&& !FlagError.IsEmpty())
+		{
+			return FMonolithActionResult::Error(FlagError, FMonolithJsonUtils::ErrInvalidParams);
+		}
 
 		if (!FMonolithBulkFillRegistry::Get().HasAdapter(TEXT("blueprint")))
 		{

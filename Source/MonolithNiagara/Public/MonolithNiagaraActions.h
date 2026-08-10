@@ -247,6 +247,11 @@ public:
 	static FMonolithActionResult HandleAssignScriptParameterToCategory(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveScriptParameter(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Module-script I/O surgery (gap #7): rename / retype a parameter, remove a map pin ---
+	static FMonolithActionResult HandleRenameScriptParameter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveMapParameterPin(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetScriptParameterType(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	/** Renders a parameter store entry as a value string, reporting FAILURE instead of
 	 *  substituting a sentinel. Gap #42 residual: SerializeParameterValue's "<unsupported>"

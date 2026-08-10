@@ -1006,10 +1006,22 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleSeedDataAsset(const
 	bool bStrict = false;
 	bool bSkipSave = false;
 	bool bReadBackValues = false;
-	Params->TryGetBoolField(TEXT("dry_run"), bDryRun);
-	Params->TryGetBoolField(TEXT("strict"), bStrict);
-	Params->TryGetBoolField(TEXT("skip_save"), bSkipSave);
-	Params->TryGetBoolField(TEXT("read_back_values"), bReadBackValues);
+	// Strict: TryGetBoolField never fails on a string, so an unrecognised spelling of
+	// dry_run ("TRUE " with a trailing space, "y", "1.0") silently became `false` and
+	// the caller who asked to simulate got a real write. Refuse instead (#36).
+	{
+		FString FlagError;
+		const TCHAR* const StrictFlags[] = { TEXT("dry_run"), TEXT("strict"), TEXT("skip_save"), TEXT("read_back_values") };
+		bool* const StrictTargets[]      = { &bDryRun,        &bStrict,       &bSkipSave,        &bReadBackValues };
+		for (int32 FlagIndex = 0; FlagIndex < UE_ARRAY_COUNT(StrictFlags); ++FlagIndex)
+		{
+			if (!MonolithBlueprintInternal::TryGetStrictBool(Params, StrictFlags[FlagIndex], *StrictTargets[FlagIndex], &FlagError)
+				&& !FlagError.IsEmpty())
+			{
+				return FMonolithActionResult::Error(FlagError);
+			}
+		}
+	}
 
 	// Extract asset name from save path
 	int32 LastSlash;

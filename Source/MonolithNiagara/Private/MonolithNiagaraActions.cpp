@@ -34,6 +34,10 @@
 #include "Curves/RichCurve.h"
 #include "NiagaraConstants.h"
 #include "NiagaraTypes.h"
+// set_script_parameter_type re-derives the editor's own change-type admission filter, which asks
+// FNiagaraTypeRegistry::GetRegisteredPayloadTypes() (NiagaraTypeRegistry.h:57, NIAGARA_API)
+// — see NiagaraParameterPanelViewModel.cpp:594.
+#include "NiagaraTypeRegistry.h"
 #include "NiagaraParameterStore.h"
 #include "NiagaraRendererProperties.h"
 #include "NiagaraSpriteRendererProperties.h"
@@ -4035,7 +4039,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
 			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("get_module_graph"), TEXT("Get the node graph of a module script"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_module_graph"), TEXT("Get the node graph of a module script. Function-call nodes also report 'function_specifiers' (e.g. a data-interface call's Identifier) when they carry any — that map is what the compiler reads, and it is not a pin, so nothing else exposes it."),
 		FMonolithActionHandler::CreateStatic(&HandleGetModuleGraph),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Module script asset path"))
@@ -4047,7 +4051,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Specific CustomHlsl node GUID when the script contains multiple nodes"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("set_custom_hlsl_text"), TEXT("Overwrite the Custom HLSL source text on a Niagara script's CustomHlsl node"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_custom_hlsl_text"), TEXT("Overwrite the Custom HLSL source text on a Niagara script's CustomHlsl node. If the node's usage is DynamicInput the body must be a single EXPRESSION (no ';', no assignment, no 'return') — the translator supplies the assignment and terminator itself, and a statement body compiles to malformed HLSL at error_count: 0. Such a body is refused before anything is written; a body ending inside a '//' comment gets a trailing newline so the translator's own ');' is not commented out."),
 		FMonolithActionHandler::CreateStatic(&HandleSetCustomHLSLText),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
@@ -4251,7 +4255,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("convert_mode"), TEXT("string"), TEXT("For node_type=convert: break (split a type into components) | make (assemble a type from components) | swizzle. Omit for an empty convert node. The engine autowires pins AND inner component connections."))
 			.Optional(TEXT("convert_type"), TEXT("string"), TEXT("Type for convert_mode=break/make (e.g. vec3, vec4, quat, color)"))
 			.Optional(TEXT("swizzle"), TEXT("string"), TEXT("Component string for convert_mode=swizzle, 1-4 chars, e.g. 'xyz' or 'zx'"))
-			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("UEnum asset path when switch_type=enum"))
+			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("The UEnum when switch_type=enum: a full object path ('/Script/Niagara.ENiagaraCoordinateSpace') or a bare enum name ('ENiagaraCoordinateSpace'). Same resolver as add_map_parameter_pin's enum_path."))
 			.Optional(TEXT("output_vars"), TEXT("array"), TEXT("For node_type=static_switch: [{name, type}] the variables this switch ROUTES — one case pin per variable per case, plus one output pin each. Omit and the switch is created with only an Add pin. THIS is how you get ParameterMap case pins ('parameter_map'): the Add pin cannot accept a parameter map at all, only value types. 'name' defaults to the type name, matching the engine's own 'NiagaraParameterMap if <case>' pins. Unknown types are refused, not silently turned into floats."))
 			.Optional(TEXT("option_count"), TEXT("integer"), TEXT("For node_type=static_switch with switch_type=integer: how many cases (>=2). Required alongside output_vars for integer switches — a new integer switch has no case count of its own, so its case pins would otherwise come out empty."))
 			.Optional(TEXT("propagate_switches"), TEXT("array"), TEXT("For node_type=function: names of the called script's static switches to PROPAGATE up (or \"all\"). Propagating republishes a switch as a static switch input of THIS script, so a stack value can reach the call; without it the new node is frozen at the called script's own default and silently ignores the stack (gap #57). Omit for the engine's own behaviour — a hand-added node propagates nothing until you tick the checkbox in its details panel. Use set_propagated_switches to change this on a node that already exists."))
@@ -4316,7 +4320,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("x"), TEXT("integer"), TEXT("Node X position"))
 			.Required(TEXT("y"), TEXT("integer"), TEXT("Node Y position"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("list_graph_node_pins"), TEXT("List a graph node's pins with index, name, direction, Niagara type, default value and link targets — the addressing reference for connect_graph_pins / set_graph_pin_default"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("list_graph_node_pins"), TEXT("List a graph node's pins with index, name, direction, Niagara type, default value and link targets — the addressing reference for connect_graph_pins / set_graph_pin_default. On a function-call node that carries them, also reports 'function_specifiers' (e.g. a data-interface call's Identifier), which are node state rather than pins."),
 		FMonolithActionHandler::CreateStatic(&HandleListGraphNodePins),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
@@ -4329,7 +4333,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Full parameter name, e.g. 'Module.MyInput', 'Emitter.MyOutput', 'Engine.DeltaTime'"))
-			.Required(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, ...)"))
+			.Optional(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, a data interface class name, ...). Required UNLESS enum_path is given, and MUTUALLY EXCLUSIVE with it. Enum types cannot be named here — use enum_path."))
+			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("Enum-typed pin: the UEnum as a full object path ('/Script/Niagara.ENiagaraCoordinateSpace') or a bare name ('ENiagaraCoordinateSpace'). MUTUALLY EXCLUSIVE with 'type' — passing both is refused rather than silently resolved (gap #69); it used to win silently. This is the same route add_graph_node's switch_type=enum takes — an enum module input can only be read onto a MapGet this way."))
 			.Optional(TEXT("existing"), TEXT("bool"), TEXT("true = reference a parameter that already exists instead of creating a new one (the pin is repaired onto the existing parameter). Default false, which refuses a name that is already taken."))
 			.Build());
 
@@ -4389,6 +4394,38 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.Shape Origin001')"))
+			.Build());
+
+	// --- Module-script I/O surgery (gap #7) -------------------------------------------------
+	// The three edits that previously forced a full RECREATE of a module script. The recreate's
+	// real cost was never the recreate: it was the I-19 churn on every PLACED instance, which is
+	// what produced incidents #13/C14 and #2/C6. All three refuse before opening a transaction
+	// (#36) and warn — never silently — when the script is placed somewhere (I-20 / #62).
+	Registry.RegisterAction(TEXT("niagara"), TEXT("rename_script_parameter"), TEXT("Rename a module script's parameter AND every pin that references it, in one operation (UNiagaraGraph::RenameParameter — the editor's own Parameters-panel rename). Refuses static switch parameters (the engine refuses them too), refuses a target name that is already taken unless allow_merge=true (a merge keeps the TARGET's metadata and discards this parameter's), and always refuses when the target name exists with a DIFFERENT type, because that would silently produce two parameters sharing one name. WARNS when the script is already placed in a system: placed callers keep the pins they were built with and no action refreshes them today (gap #62). Not exposed through batch_execute — batch does not abort or roll back, and a half-applied rename is worse than a failed one."),
+		FMonolithActionHandler::CreateStatic(&HandleRenameScriptParameter),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Current parameter name, exactly as get_script_parameters reports it (e.g. 'Module.Amount')"))
+			.Required(TEXT("new_name"), TEXT("string"), TEXT("New fully-namespaced name (e.g. 'Module.Intensity'). A name with no namespace is accepted but warned about — a bare name is a different parameter from the namespaced one."))
+			.Optional(TEXT("allow_merge"), TEXT("bool"), TEXT("Default false. true = permit renaming ONTO a parameter that already exists with the same type; the two merge, the TARGET's metadata wins and this parameter's is discarded (NiagaraGraph.cpp:2859-2874)."))
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_map_parameter_pin"), TEXT("Remove one parameter pin from a ParameterMapGet (read) or ParameterMapSet (write) node — the inverse of add_map_parameter_pin, and the sweep for read pins left dangling by an earlier edit (gap #66). On a MapGet the engine's own OnPinRemoved takes the paired default-value input pin with it and clears the pin-pair guid map (NiagaraNodeParameterMapGet.cpp:175-199), so this reproduces the editor's context-menu 'Remove pin' exactly. It does NOT remove the parameter from the script's registry — that is remove_script_parameter's job, and the response says whether the parameter is now unreferenced. Refuses a pin that still has connections unless break_links=true, listing every link it would break. Requires the engine-private wizard build (dev builds only)."),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveMapParameterPin),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Pin name to remove, i.e. the parameter it carries (e.g. 'Module.Shape Origin'). Match list_graph_node_pins exactly — the match is case-sensitive."))
+			.Optional(TEXT("break_links"), TEXT("bool"), TEXT("Default false, which REFUSES a connected pin and names every connection. true = break the connections and remove the pin anyway."))
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_script_parameter_type"), TEXT("Change the TYPE of an existing module-script parameter, retyping every pin that carries it and keeping the connections that still typecheck (UNiagaraGraph::ChangeParameterType — the editor's own Change Type). Connections that cannot be kept become ORPHANED pins rather than vanishing, exactly as the editor's script toolkit does (NiagaraParameterPanelViewModel.cpp:2907); the response reports every orphan created. Re-derives the engine's own admission rules: refuses static switch parameters, static-typed parameters, parameters subscribed to a Parameter Definition, and target types the editor's own Change Type submenu filters out (data interfaces, enums, UObjects, payload and internal types — NiagaraParameterPanelViewModel.cpp:594). WARNS when the script is already placed in a system (gap #62). Not exposed through batch_execute."),
+		FMonolithActionHandler::CreateStatic(&HandleSetScriptParameterType),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.Amount')"))
+			.Required(TEXT("type"), TEXT("string"), TEXT("New Niagara type: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix. Enum and data-interface types are refused here on purpose — the editor does not offer them either; build an enum-typed pin with add_map_parameter_pin's enum_path instead."))
+			.Optional(TEXT("allow_orphaned_pins"), TEXT("bool"), TEXT("Default true, matching the editor's script-toolkit path. false = do NOT create orphaned pins; connections that no longer typecheck are then left in place at the wrong type, which the response calls out."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_debug_draw"), TEXT("Toggle a placed module's debug visualization — the 'eye' icon in the stack. Only works on modules that contain a Function.DebugState static switch (e.g. the stock ShapeLocation); the response reports supports_debug_draw either way. Drawing is done by the module's own DebugDraw data interface and is globally gated by the cvar fx.Niagara.DebugDraw.Enabled. Omit 'enabled' to just query the current state."),
@@ -4557,11 +4594,12 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	// Batch (2)
-	Registry.RegisterAction(TEXT("niagara"), TEXT("batch_execute"), TEXT("Execute multiple operations in one transaction"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("batch_execute"), TEXT("Execute multiple operations in one transaction, with ONE trailing compile instead of one per call. NOT ATOMIC: a failed step does not abort the batch and nothing is rolled back — batch INDEPENDENT operations only, never an ordered sequence. Addressing is per-operation: an op that names its own asset_path/system_path/script_path addresses that asset; an op that names none inherits the batch-level default. Script-graph ops (add_graph_node, add_map_parameter_pin, connect_graph_pins, set_graph_pin_default, ...) address a SCRIPT — give them script_path, per op or batch-level. The summary reports 'warned_steps' as well as 'failed': a step can succeed with a coerced value."),
 		FMonolithActionHandler::CreateStatic(&HandleBatchExecute),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"))
-			.Required(TEXT("operations"), TEXT("array"), TEXT("Array of operation objects to execute"))
+			.OptionalAssetPath(TEXT("asset_path"), TEXT("Default Niagara asset for operations that name none. A SYSTEM path is injected as 'system_path' (stack ops); a SCRIPT path is injected as 'script_path' (graph ops). Optional — omit it when every operation carries its own path."))
+			.OptionalAssetPath(TEXT("script_path"), TEXT("Default Niagara SCRIPT for graph operations that name none (standalone module/function script, or an embedded scratch script 'NS_X.NS_X:ScratchName'). Can be given alongside asset_path so one batch mixes system-addressed and script-addressed ops."))
+			.Required(TEXT("operations"), TEXT("array"), TEXT("Array of operation objects. Each needs 'op' (the niagara action name) plus that action's own params; per-op asset_path/system_path/script_path overrides the batch default."))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("create_system_from_spec"), TEXT("Create a full system from JSON spec"),
 		FMonolithActionHandler::CreateStatic(&HandleCreateSystemFromSpec),
@@ -6019,6 +6057,25 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleGraph(const TShare
 		{
 			NodeObj->SetStringField(TEXT("function_name"), FN->GetFunctionName());
 			if (FN->FunctionScript) NodeObj->SetStringField(TEXT("function_script"), FN->FunctionScript->GetPathName());
+
+			// GAP #61 — FunctionSpecifiers were writable and unreadable. A DI function-call node's
+			// Identifier is the difference between a persistent debug shape drawing and silently
+			// never registering (GenerateCompilerTagPrefix, NiagaraDataInterfaceDebugDraw.cpp:2986),
+			// and until now the ONLY surface reporting it was add_graph_node's own write echo — i.e.
+			// it could only ever confirm what the caller just said. Read it off the node.
+			// TMap<FName, FName> FunctionSpecifiers is a public UPROPERTY (NiagaraNodeFunctionCall.h:79-80)
+			// and it is the map the compiler reads (NiagaraGraphDigest.cpp:2399-2402).
+			// Emitted ONLY when non-empty, so every node that has no specifiers keeps its exact
+			// previous JSON shape.
+			if (FN->FunctionSpecifiers.Num() > 0)
+			{
+				TSharedRef<FJsonObject> SpecObj = MakeShared<FJsonObject>();
+				for (const TPair<FName, FName>& Pair : FN->FunctionSpecifiers)
+				{
+					SpecObj->SetStringField(Pair.Key.ToString(), Pair.Value.ToString());
+				}
+				NodeObj->SetObjectField(TEXT("function_specifiers"), SpecObj);
+			}
 		}
 		TArray<TSharedPtr<FJsonValue>> PinsArr;
 		for (UEdGraphPin* Pin : Node->Pins)
@@ -6082,6 +6139,147 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleGraph(const TShare
 		Res->SetArrayField(TEXT("edges"), EdgesArr);
 	}
 	return NA_SuccessObj(Res);
+}
+
+// ============================================================================
+// DYNAMIC-INPUT EXPRESSION-BODY CONTRACT (gaps #38 / #44 / #49).
+//
+// A DynamicInput custom-HLSL body is NOT a statement block: the translator emits it INLINE as an
+// expression, supplying both the assignment and the terminator —
+//     OutCustomHlsl = ReplaceDest + " = (" + <type> + ")(" + OutCustomHlsl + ");\n";
+// TNiagaraHlslTranslator::ProcessCustomHlsl, NiagaraHlslTranslator.cpp:9204.
+//
+// This lived inline in create_dynamic_input_from_hlsl. It is a shared function now because
+// set_custom_hlsl_text is a SECOND way to put a body on the same node and had neither half of it
+// (gap #49) — two copies of a rule that has already been got wrong twice is how they drift.
+//
+// The gate is `UNiagaraNodeCustomHlsl::ScriptUsage == DynamicInput` — the NODE's own public
+// UPROPERTY (NiagaraNodeCustomHlsl.h:27-28), NOT the containing script's usage — because that is
+// literally what the translator branches on: HandleCustomHlslNode reads
+// GraphBridge::GetCustomHlslUsage(node), which returns `CustomNode->ScriptUsage`
+// (NiagaraCompilationGraphBridgeImpl.cpp:130-133), and passes it to the `InUsage ==
+// ENiagaraScriptUsage::DynamicInput` test at :9188. Same predicate, same object: whatever we
+// checked is the thing that ships.
+// ============================================================================
+namespace MonolithNiagaraDynamicInputBody
+{
+	/**
+	 * Validate `InOutBody` as a single expression and normalise the copy that is actually stored.
+	 *
+	 * Returns false with a caller-facing reason in OutError (no trailing "NOTHING WAS ..." — the
+	 * call site owns that wording, since one creates an asset and the other edits a live node).
+	 * On success InOutBody may have gained a trailing newline; bOutNewlineTerminated reports it.
+	 *
+	 * OutputName / SampleInputName only shape the WRONG/RIGHT example in the refusal text.
+	 */
+	static bool ValidateAndNormalise(FString& InOutBody, const FString& OutputName, const FString& SampleInputName,
+		FString& OutError, bool& bOutNewlineTerminated)
+	{
+		bOutNewlineTerminated = false;
+
+		// Strip comments first so a ';' inside a comment cannot cause a false refusal.
+		// NOTE: `Scan` is the ANALYSIS copy. What gets stored is `InOutBody`, and the divergence
+		// between the two is itself a defect — see the #44 normalisation below, which uses
+		// bInLineComment's final state to fix the copy that actually ships.
+		FString Scan;
+		Scan.Reserve(InOutBody.Len());
+		bool bInLineComment = false;
+		bool bInBlockComment = false;
+		for (int32 i = 0; i < InOutBody.Len(); ++i)
+		{
+			const TCHAR C = InOutBody[i];
+			const TCHAR N = (i + 1 < InOutBody.Len()) ? InOutBody[i + 1] : TEXT('\0');
+			if (bInLineComment)
+			{
+				if (C == TEXT('\n')) { bInLineComment = false; Scan.AppendChar(C); }
+				continue;
+			}
+			if (bInBlockComment)
+			{
+				if (C == TEXT('*') && N == TEXT('/')) { bInBlockComment = false; ++i; }
+				continue;
+			}
+			if (C == TEXT('/') && N == TEXT('/')) { bInLineComment = true; ++i; continue; }
+			if (C == TEXT('/') && N == TEXT('*')) { bInBlockComment = true; ++i; continue; }
+			Scan.AppendChar(C);
+		}
+		const FString Trimmed = Scan.TrimStartAndEnd();
+
+		FString Offence;
+		if (Trimmed.IsEmpty())
+		{
+			Offence = TEXT("it is empty once comments are stripped");
+		}
+		else if (Trimmed.Contains(TEXT(";")))
+		{
+			Offence = TEXT("it contains a ';' — the translator appends the terminator itself");
+		}
+		else if (Trimmed.StartsWith(TEXT("return")))
+		{
+			Offence = TEXT("it starts with 'return' — a dynamic input body is not a function body");
+		}
+		else
+		{
+			// An '=' that is not part of ==, !=, <= or >= is an assignment, i.e. a statement.
+			for (int32 i = 0; i < Trimmed.Len(); ++i)
+			{
+				if (Trimmed[i] != TEXT('=')) continue;
+				const TCHAR Prev = (i > 0) ? Trimmed[i - 1] : TEXT('\0');
+				const TCHAR Next = (i + 1 < Trimmed.Len()) ? Trimmed[i + 1] : TEXT('\0');
+				if (Prev == TEXT('=') || Prev == TEXT('!') || Prev == TEXT('<') || Prev == TEXT('>')
+					|| Next == TEXT('=')) continue;
+				Offence = TEXT("it contains an assignment '=' — the translator writes the output itself");
+				break;
+			}
+		}
+
+		if (!Offence.IsEmpty())
+		{
+			OutError = FString::Printf(
+				TEXT("A dynamic input's 'hlsl' must be a single EXPRESSION, not a statement, and this body is "
+					 "rejected because %s.\n"
+					 "The translator wraps the body as `Out_%s = (<type>)( <your body> );` "
+					 "(NiagaraHlslTranslator.cpp:9188-9204), so it supplies both the assignment and the "
+					 "semicolon. A statement body compiles to malformed HLSL at error_count: 0 — nothing "
+					 "downstream will tell you.\n"
+					 "  WRONG: %s = %s * 3.0;\n"
+					 "  RIGHT: %s * 3.0\n"
+					 "This is the ONE place the create_module_from_hlsl rules do not carry over."),
+				*Offence, *OutputName, *OutputName, *SampleInputName, *SampleInputName);
+			return false;
+		}
+
+		// ------------------------------------------------------------------------
+		// GAP #44 — NORMALISE THE BODY THAT IS ACTUALLY SHIPPED.
+		//
+		// The guard above analyses `Scan` (comments stripped) and the ORIGINAL body is what gets
+		// written to the node. That divergence resurrects the very bug the guard exists to
+		// prevent: the translator appends `);` with NO separator (NiagaraHlslTranslator.cpp:9204),
+		// so if the body ENDS INSIDE a `//` comment the terminator is commented out and the
+		// assignment is unterminated:
+		//     Out_OutValue = (float)(... : In_InValue // fallthrough);
+		// Measured at error_count: 0, compile_status UpToDate, and no shader-compiler entry in the
+		// log at all.
+		//
+		// WHY A TRAILING NEWLINE IS THE FIX, from the tokenizer rather than by experiment:
+		// UNiagaraNodeCustomHlsl::GetTokensFromString emits a `//` comment as one token running
+		// "up to the end of the line (INCLUDING the newline)" — but when no newline is found it
+		// falls back to `FoundEndIdx = TargetLength - 1` (NiagaraNodeCustomHlsl.cpp:161-171), i.e.
+		// the token ends without one. ProcessCustomHlsl calls it with IncludeComments=true,
+		// IncludeWhitespace=true (NiagaraNodeCustomHlsl.h:51) and rejoins the tokens verbatim, so a
+		// newline present in the body survives into the wrap and the `);` lands on the next line.
+		//
+		// Deliberately CONDITIONAL: only a body that ends inside a line comment is touched, so
+		// every other body still round-trips byte-for-byte through get_custom_hlsl_text.
+		// Block comments were never affected — they self-terminate.
+		// ------------------------------------------------------------------------
+		if (bInLineComment)
+		{
+			InOutBody.AppendChar(TEXT('\n'));
+			bOutNewlineTerminated = true;
+		}
+		return true;
+	}
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleGetCustomHLSLText(const TSharedPtr<FJsonObject>& Params)
@@ -6214,6 +6412,45 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetCustomHLSLText(const TSh
 	if (!HlslProp)
 		return FMonolithActionResult::Error(TEXT("CustomHlsl property not found on CustomHlsl node"));
 
+	// --- GAP #49 — the dynamic-input expression contract applies HERE TOO. -------------------
+	//
+	// This action was the second, unguarded way to put a body on a DynamicInput custom-HLSL node,
+	// so pointing it at one reproduced BOTH of #44's bugs: a statement body compiles to malformed
+	// HLSL at error_count: 0, and a body ending inside a `//` comment swallows the terminator the
+	// translator appends. Same rule, same code (MonolithNiagaraDynamicInputBody), applied here.
+	//
+	// Gated on the NODE's own ScriptUsage, which is exactly the translator's own predicate
+	// (NiagaraHlslTranslator.cpp:9188 via NiagaraCompilationGraphBridgeImpl.cpp:130-133), so a
+	// Module- or Function-usage node is untouched and every existing caller of those is unaffected.
+	// Refused BEFORE BeginTransaction — CancelTransaction does not roll back (gap #36).
+	bool bBodyNewlineTerminated = false;
+	if (TargetNode->ScriptUsage == ENiagaraScriptUsage::DynamicInput)
+	{
+		// Names for the WRONG/RIGHT example only. Read from the node's Signature because that is
+		// the same source the translator's wrap reads (`InSignature.Outputs[0].GetName()`, :9202).
+		FString DynOutName = TEXT("OutValue");
+		if (TargetNode->Signature.Outputs.Num() > 0)
+		{
+			DynOutName = TargetNode->Signature.Outputs[0].GetName().ToString();
+		}
+		FString DynInName = TEXT("SomeInput");
+		for (const FNiagaraVariable& SigIn : TargetNode->Signature.Inputs)
+		{
+			if (SigIn.GetType() != FNiagaraTypeDefinition::GetParameterMapDef())
+			{
+				DynInName = SigIn.GetName().ToString();
+				break;
+			}
+		}
+
+		FString BodyError;
+		if (!MonolithNiagaraDynamicInputBody::ValidateAndNormalise(HlslText, DynOutName, DynInName,
+			BodyError, bBodyNewlineTerminated))
+		{
+			return FMonolithActionResult::Error(BodyError + TEXT(" NOTHING WAS CHANGED."));
+		}
+	}
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetCustomHlslText", "Set Custom HLSL Text"));
 	Script->Modify();
 	Src->NodeGraph->Modify();
@@ -6230,6 +6467,15 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetCustomHLSLText(const TSh
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("node_guid"), TargetNode->NodeGuid.ToString());
 	R->SetNumberField(TEXT("length"), HlslText.Len());
+	R->SetBoolField(TEXT("dynamic_input_body"), TargetNode->ScriptUsage == ENiagaraScriptUsage::DynamicInput);
+	if (bBodyNewlineTerminated)
+	{
+		R->SetBoolField(TEXT("body_newline_terminated"), true);
+		R->SetStringField(TEXT("note"), TEXT("The body ended inside a '//' comment, so a trailing newline was appended "
+		                                     "before storing it. Without that the translator's own `);` lands inside the "
+		                                     "comment and the assignment is never terminated — at error_count: 0 (gap #44). "
+		                                     "'length' is the stored length, one greater than the text you sent."));
+	}
 	return NA_SuccessObj(R);
 }
 
@@ -7815,114 +8061,19 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		// which is not valid HLSL, and Niagara still reported error_count: 0. The translator never
 		// syntax-checks the body, and with no component in a level nothing triggers a shader
 		// compile, so there is no layer below this one that will catch it. Refuse here.
+		//
+		// Body + normaliser live in MonolithNiagaraDynamicInputBody so set_custom_hlsl_text — the
+		// other way to put a body on this node — enforces the identical rule (gap #49).
 		// ------------------------------------------------------------------------
 		{
-			// Strip comments first so a ';' inside a comment cannot cause a false refusal.
-			// NOTE: `Scan` is the ANALYSIS copy. What gets stored on the node is `HlslBody`, and
-			// the divergence between the two is itself a defect — see the #44 block below, which
-			// uses bInLineComment's final state to normalise the copy that actually ships.
-			FString Scan;
-			Scan.Reserve(HlslBody.Len());
-			bool bInLineComment = false;
-			bool bInBlockComment = false;
-			for (int32 i = 0; i < HlslBody.Len(); ++i)
+			FString BodyError;
+			if (!MonolithNiagaraDynamicInputBody::ValidateAndNormalise(
+				HlslBody,
+				ParsedOutputs[0].Name,
+				ParsedInputs.Num() > 0 ? ParsedInputs[0].Name : FString(TEXT("SomeInput")),
+				BodyError, bBodyNewlineTerminated))
 			{
-				const TCHAR C = HlslBody[i];
-				const TCHAR N = (i + 1 < HlslBody.Len()) ? HlslBody[i + 1] : TEXT('\0');
-				if (bInLineComment)
-				{
-					if (C == TEXT('\n')) { bInLineComment = false; Scan.AppendChar(C); }
-					continue;
-				}
-				if (bInBlockComment)
-				{
-					if (C == TEXT('*') && N == TEXT('/')) { bInBlockComment = false; ++i; }
-					continue;
-				}
-				if (C == TEXT('/') && N == TEXT('/')) { bInLineComment = true; ++i; continue; }
-				if (C == TEXT('/') && N == TEXT('*')) { bInBlockComment = true; ++i; continue; }
-				Scan.AppendChar(C);
-			}
-			const FString Trimmed = Scan.TrimStartAndEnd();
-
-			FString Offence;
-			if (Trimmed.IsEmpty())
-			{
-				Offence = TEXT("it is empty once comments are stripped");
-			}
-			else if (Trimmed.Contains(TEXT(";")))
-			{
-				Offence = TEXT("it contains a ';' — the translator appends the terminator itself");
-			}
-			else if (Trimmed.StartsWith(TEXT("return")))
-			{
-				Offence = TEXT("it starts with 'return' — a dynamic input body is not a function body");
-			}
-			else
-			{
-				// An '=' that is not part of ==, !=, <= or >= is an assignment, i.e. a statement.
-				for (int32 i = 0; i < Trimmed.Len(); ++i)
-				{
-					if (Trimmed[i] != TEXT('=')) continue;
-					const TCHAR Prev = (i > 0) ? Trimmed[i - 1] : TEXT('\0');
-					const TCHAR Next = (i + 1 < Trimmed.Len()) ? Trimmed[i + 1] : TEXT('\0');
-					if (Prev == TEXT('=') || Prev == TEXT('!') || Prev == TEXT('<') || Prev == TEXT('>')
-						|| Next == TEXT('=')) continue;
-					Offence = TEXT("it contains an assignment '=' — the translator writes the output itself");
-					break;
-				}
-			}
-
-			if (!Offence.IsEmpty())
-			{
-				return FMonolithActionResult::Error(FString::Printf(
-					TEXT("A dynamic input's 'hlsl' must be a single EXPRESSION, not a statement, and this body is "
-						 "rejected because %s.\n"
-						 "The translator wraps the body as `Out_%s = (<type>)( <your body> );` "
-						 "(NiagaraHlslTranslator.cpp:9188-9204), so it supplies both the assignment and the "
-						 "semicolon. A statement body compiles to malformed HLSL at error_count: 0 — nothing "
-						 "downstream will tell you.\n"
-						 "  WRONG: %s = %s * 3.0;\n"
-						 "  RIGHT: %s * 3.0\n"
-						 "This is the ONE place the create_module_from_hlsl rules do not carry over. "
-						 "NOTHING WAS CREATED."),
-					*Offence,
-					*ParsedOutputs[0].Name,
-					*ParsedOutputs[0].Name,
-					ParsedInputs.Num() > 0 ? *ParsedInputs[0].Name : TEXT("SomeInput"),
-					ParsedInputs.Num() > 0 ? *ParsedInputs[0].Name : TEXT("SomeInput")));
-			}
-
-			// ------------------------------------------------------------------------
-			// GAP #44 — NORMALISE THE BODY THAT IS ACTUALLY SHIPPED.
-			//
-			// The guard above analyses `Scan` (comments stripped) and then the ORIGINAL `HlslBody`
-			// is what gets written to the node. That divergence resurrects the very bug the guard
-			// exists to prevent: the translator wraps a dynamic input body as
-			//     Out_<Name> = (<type>)( <body> );          NiagaraHlslTranslator.cpp:9204
-			// appending `);` with NO separator, so if the body ENDS INSIDE a `//` comment the
-			// terminator is commented out and the assignment is unterminated:
-			//     Out_OutValue = (float)(... : In_InValue // fallthrough);
-			// Measured at error_count: 0, compile_status UpToDate, and no shader-compiler entry in
-			// the log at all.
-			//
-			// WHY A TRAILING NEWLINE IS THE FIX, from the tokenizer rather than by experiment:
-			// UNiagaraNodeCustomHlsl::GetTokensFromString emits a `//` comment as one token running
-			// "up to the end of the line (INCLUDING the newline)" — but when no newline is found it
-			// falls back to `FoundEndIdx = TargetLength - 1` (NiagaraNodeCustomHlsl.cpp:161-171),
-			// i.e. the token ends without one. ProcessCustomHlsl calls it with the defaults
-			// IncludeComments=true, IncludeWhitespace=true (NiagaraNodeCustomHlsl.h:51) and rejoins
-			// the tokens verbatim, so a newline present in the body survives into the wrap and the
-			// `);` lands on the next line.
-			//
-			// Deliberately CONDITIONAL: only a body that ends inside a line comment is touched, so
-			// every other body still round-trips byte-for-byte through get_custom_hlsl_text.
-			// Block comments were never affected — they self-terminate.
-			// ------------------------------------------------------------------------
-			if (bInLineComment)
-			{
-				HlslBody.AppendChar(TEXT('\n'));
-				bBodyNewlineTerminated = true;
+				return FMonolithActionResult::Error(BodyError + TEXT(" NOTHING WAS CREATED."));
 			}
 		}
 #if !WITH_NIAGARA_WIZARD_PRIVATE
@@ -9796,12 +9947,285 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererBinding(const TS
 // Batch Actions (2)
 // ============================================================================
 
+// ----------------------------------------------------------------------------
+// batch_execute's op dispatch TABLE.
+//
+// This was a ~110-arm `else if (OpName == TEXT("..."))` chain until gap #67 added the
+// script-graph ops, at which point MSVC refused the translation unit outright:
+//
+//     MonolithNiagaraActions.cpp(10240,8): fatal error C1061:
+//     compiler limit: blocks nested too deeply
+//
+// Every `else if` opens a nested block, so the chain was sitting just under the ~128
+// limit. That makes the chain not merely verbose but a HARD CEILING on how many
+// operations batch_execute could ever dispatch — the next few ops anyone added would
+// have hit the same wall, whoever they were. Splitting it into two chains would have
+// bought maybe 100 more ops and left the same trap armed, so it is a table instead.
+//
+// The table also removes a second, unrelated problem. The old "Unknown op" error could
+// not name the valid set, because the only record of that set WAS the chain, and any
+// list written next to it would be a second copy that drifts (recurring defect pattern
+// #1: validate one representation, ship another). The table IS the set, so the error
+// message is now GENERATED from the same object the dispatch reads.
+//
+// LOOKUP SEMANTICS ARE UNCHANGED, which is worth stating because it is not obvious:
+// TMap<FString, ...> hashes and compares case-INSENSITIVELY (GetTypeHash(const FString&)
+// forwards to FCrc::Strihash_DEPRECATED, and DefaultKeyFuncs matches with
+// FString::operator==, which forwards to Equals(..., IgnoreCase)). That is exactly what
+// `OpName == TEXT("add_emitter")` did — see recurring defect pattern #9. So an op name
+// that dispatched before still dispatches, in the same case-insensitive way.
+//
+// Aliases that shared an arm (`set_module_input`, `add_user_param`, ...) are separate
+// keys pointing at the same function. Ordering and the section comments are preserved
+// from the chain purely so this diff can be audited line-against-line.
+// ----------------------------------------------------------------------------
+using FMonolithNiagaraBatchOp = FMonolithActionResult (*)(const TSharedPtr<FJsonObject>&);
+
+static const TMap<FString, FMonolithNiagaraBatchOp>& NA_GetBatchOpTable()
+{
+	static const TMap<FString, FMonolithNiagaraBatchOp> Table = []
+	{
+		using FN = FMonolithNiagaraActions;
+		TMap<FString, FMonolithNiagaraBatchOp> T;
+		T.Reserve(160);
+
+		T.Add(TEXT("add_emitter"), &FN::HandleAddEmitter);
+		T.Add(TEXT("remove_emitter"), &FN::HandleRemoveEmitter);
+		T.Add(TEXT("add_module"), &FN::HandleAddModule);
+		T.Add(TEXT("remove_module"), &FN::HandleRemoveModule);
+		T.Add(TEXT("set_module_input_value"), &FN::HandleSetModuleInputValue);
+		T.Add(TEXT("set_module_input"), &FN::HandleSetModuleInputValue);            // alias
+		T.Add(TEXT("set_module_input_binding"), &FN::HandleSetModuleInputBinding);
+		T.Add(TEXT("set_module_binding"), &FN::HandleSetModuleInputBinding);        // alias
+		T.Add(TEXT("set_emitter_property"), &FN::HandleSetEmitterProperty);
+		T.Add(TEXT("add_renderer"), &FN::HandleAddRenderer);
+		T.Add(TEXT("remove_renderer"), &FN::HandleRemoveRenderer);
+		T.Add(TEXT("set_renderer_material"), &FN::HandleSetRendererMaterial);
+		T.Add(TEXT("set_renderer_property"), &FN::HandleSetRendererProperty);
+		T.Add(TEXT("add_user_parameter"), &FN::HandleAddUserParameter);
+		T.Add(TEXT("add_user_param"), &FN::HandleAddUserParameter);                 // alias
+		T.Add(TEXT("remove_user_parameter"), &FN::HandleRemoveUserParameter);
+		T.Add(TEXT("remove_user_param"), &FN::HandleRemoveUserParameter);           // alias
+		T.Add(TEXT("set_parameter_default"), &FN::HandleSetParameterDefault);
+		T.Add(TEXT("set_module_enabled"), &FN::HandleSetModuleEnabled);
+		T.Add(TEXT("set_module_input_di"), &FN::HandleSetModuleInputDI);
+		T.Add(TEXT("set_curve_value"), &FN::HandleSetCurveValue);
+		T.Add(TEXT("move_module"), &FN::HandleMoveModule);
+		T.Add(TEXT("set_emitter_enabled"), &FN::HandleSetEmitterEnabled);
+		T.Add(TEXT("reorder_emitters"), &FN::HandleReorderEmitters);
+		T.Add(TEXT("duplicate_emitter"), &FN::HandleDuplicateEmitter);
+		T.Add(TEXT("set_renderer_binding"), &FN::HandleSetRendererBinding);
+		T.Add(TEXT("request_compile"), &FN::HandleRequestCompile);
+		T.Add(TEXT("get_system_diagnostics"), &FN::HandleGetSystemDiagnostics);
+		T.Add(TEXT("get_system_property"), &FN::HandleGetSystemProperty);
+		T.Add(TEXT("set_system_property"), &FN::HandleSetSystemProperty);
+		T.Add(TEXT("set_static_switch_value"), &FN::HandleSetStaticSwitchValue);
+		// Wave 2
+		T.Add(TEXT("get_system_summary"), &FN::HandleGetSystemSummary);
+		T.Add(TEXT("get_emitter_summary"), &FN::HandleGetEmitterSummary);
+		T.Add(TEXT("list_emitter_properties"), &FN::HandleListEmitterProperties);
+		T.Add(TEXT("get_module_input_value"), &FN::HandleGetModuleInputValue);
+		T.Add(TEXT("get_module_inputs"), &FN::HandleGetModuleInputs);
+		// Wave 3
+		T.Add(TEXT("configure_curve_keys"), &FN::HandleConfigureCurveKeys);
+		T.Add(TEXT("configure_data_interface"), &FN::HandleConfigureDataInterface);
+		// Wave 4
+		T.Add(TEXT("duplicate_system"), &FN::HandleDuplicateSystem);
+		T.Add(TEXT("set_fixed_bounds"), &FN::HandleSetFixedBounds);
+		T.Add(TEXT("set_effect_type"), &FN::HandleSetEffectType);
+		T.Add(TEXT("create_emitter"), &FN::HandleCreateEmitter);
+		T.Add(TEXT("export_system_spec"), &FN::HandleExportSystemSpec);
+		// Wave 5
+		T.Add(TEXT("add_dynamic_input"), &FN::HandleAddDynamicInput);
+		T.Add(TEXT("insert_dynamic_input"), &FN::HandleInsertDynamicInput);
+		T.Add(TEXT("set_dynamic_input_value"), &FN::HandleSetDynamicInputValue);
+		T.Add(TEXT("search_dynamic_inputs"), &FN::HandleSearchDynamicInputs);
+		// Phase 3: Dynamic Input Features
+		T.Add(TEXT("list_dynamic_inputs"), &FN::HandleListDynamicInputs);
+		T.Add(TEXT("get_dynamic_input_tree"), &FN::HandleGetDynamicInputTree);
+		T.Add(TEXT("remove_dynamic_input"), &FN::HandleRemoveDynamicInput);
+		T.Add(TEXT("get_dynamic_input_value"), &FN::HandleGetDynamicInputValue);
+		T.Add(TEXT("get_dynamic_input_inputs"), &FN::HandleGetDynamicInputInputs);
+		// Wave 6
+		T.Add(TEXT("add_event_handler"), &FN::HandleAddEventHandler);
+		T.Add(TEXT("validate_system"), &FN::HandleValidateSystem);
+		T.Add(TEXT("add_simulation_stage"), &FN::HandleAddSimulationStage);
+		// Composite
+		T.Add(TEXT("set_spawn_shape"), &FN::HandleSetSpawnShape);
+		// Phase 4: Module & Emitter Management
+		T.Add(TEXT("rename_emitter"), &FN::HandleRenameEmitter);
+		T.Add(TEXT("get_emitter_property"), &FN::HandleGetEmitterProperty);
+		// Phase 5: Renderer & DI Improvements
+		T.Add(TEXT("list_available_renderers"), &FN::HandleListAvailableRenderers);
+		T.Add(TEXT("set_renderer_mesh"), &FN::HandleSetRendererMesh);
+		T.Add(TEXT("configure_ribbon"), &FN::HandleConfigureRibbon);
+		T.Add(TEXT("configure_subuv"), &FN::HandleConfigureSubUV);
+		// Phase 6A: Event Handlers, Simulation Stages, Module Outputs
+		T.Add(TEXT("get_event_handlers"), &FN::HandleGetEventHandlers);
+		T.Add(TEXT("set_event_handler_property"), &FN::HandleSetEventHandlerProperty);
+		T.Add(TEXT("remove_event_handler"), &FN::HandleRemoveEventHandler);
+		T.Add(TEXT("get_simulation_stages"), &FN::HandleGetSimulationStages);
+		T.Add(TEXT("set_simulation_stage_property"), &FN::HandleSetSimulationStageProperty);
+		T.Add(TEXT("remove_simulation_stage"), &FN::HandleRemoveSimulationStage);
+		T.Add(TEXT("get_module_output_parameters"), &FN::HandleGetModuleOutputParameters);
+		// Phase 6B: NPC Support
+		T.Add(TEXT("create_npc"), &FN::HandleCreateNPC);
+		T.Add(TEXT("get_npc"), &FN::HandleGetNPC);
+		T.Add(TEXT("add_npc_parameter"), &FN::HandleAddNPCParameter);
+		T.Add(TEXT("remove_npc_parameter"), &FN::HandleRemoveNPCParameter);
+		T.Add(TEXT("set_npc_default"), &FN::HandleSetNPCDefault);
+		// Phase 6B: Effect Type CRUD
+		T.Add(TEXT("create_effect_type"), &FN::HandleCreateEffectType);
+		T.Add(TEXT("get_effect_type"), &FN::HandleGetEffectType);
+		T.Add(TEXT("set_effect_type_property"), &FN::HandleSetEffectTypeProperty);
+		// Phase 6B: Parameter Discovery
+		T.Add(TEXT("get_available_parameters"), &FN::HandleGetAvailableParameters);
+		// Phase 6B: Preview
+		T.Add(TEXT("preview_system"), &FN::HandlePreviewSystem);
+		// Phase 7: Advanced Features
+		T.Add(TEXT("diff_systems"), &FN::HandleDiffSystems);
+		T.Add(TEXT("save_emitter_as_template"), &FN::HandleSaveEmitterAsTemplate);
+		T.Add(TEXT("clone_module_overrides"), &FN::HandleCloneModuleOverrides);
+		// Read operations (14)
+		T.Add(TEXT("get_ordered_modules"), &FN::HandleGetOrderedModules);
+		T.Add(TEXT("get_all_parameters"), &FN::HandleGetAllParameters);
+		T.Add(TEXT("get_user_parameters"), &FN::HandleGetUserParameters);
+		T.Add(TEXT("get_parameter_value"), &FN::HandleGetParameterValue);
+		T.Add(TEXT("get_parameter_type"), &FN::HandleGetParameterType);
+		T.Add(TEXT("trace_parameter_binding"), &FN::HandleTraceParameterBinding);
+		T.Add(TEXT("get_renderer_bindings"), &FN::HandleGetRendererBindings);
+		T.Add(TEXT("list_emitters"), &FN::HandleListEmitters);
+		T.Add(TEXT("list_renderers"), &FN::HandleListRenderers);
+		T.Add(TEXT("list_renderer_properties"), &FN::HandleListRendererProperties);
+		T.Add(TEXT("list_module_scripts"), &FN::HandleListModuleScripts);
+		T.Add(TEXT("get_module_graph"), &FN::HandleGetModuleGraph);
+		T.Add(TEXT("get_custom_hlsl_text"), &FN::HandleGetCustomHLSLText);
+		T.Add(TEXT("set_custom_hlsl_text"), &FN::HandleSetCustomHLSLText);
+		T.Add(TEXT("get_di_functions"), &FN::HandleGetDIFunctions);
+		T.Add(TEXT("get_compiled_gpu_hlsl"), &FN::HandleGetCompiledGPUHLSL);
+		// Phase 8: Expansion
+		T.Add(TEXT("save_system"), &FN::HandleSaveSystem);
+		T.Add(TEXT("get_static_switch_value"), &FN::HandleGetStaticSwitchValue);
+		T.Add(TEXT("import_system_spec"), &FN::HandleImportSystemSpec);
+		// Phase 9: Medium Priority Expansion
+		T.Add(TEXT("get_di_properties"), &FN::HandleGetDIProperties);
+		T.Add(TEXT("clear_emitter_modules"), &FN::HandleClearEmitterModules);
+		T.Add(TEXT("get_module_script_inputs"), &FN::HandleGetModuleScriptInputs);
+		T.Add(TEXT("get_scalability_settings"), &FN::HandleGetScalabilitySettings);
+		T.Add(TEXT("set_scalability_settings"), &FN::HandleSetScalabilitySettings);
+		T.Add(TEXT("list_systems"), &FN::HandleListSystems);
+		// Phase 10: Low Priority & QoL
+		T.Add(TEXT("duplicate_module"), &FN::HandleDuplicateModule);
+		T.Add(TEXT("get_emitter_parent"), &FN::HandleGetEmitterParent);
+		T.Add(TEXT("rename_user_parameter"), &FN::HandleRenameUserParameter);
+		// Layout (Phase 3b) — the one entry that is not a FMonolithNiagaraActions member.
+		T.Add(TEXT("auto_layout"), &FMonolithNiagaraLayoutActions::HandleAutoLayout);
+		// Tranche 2 (#64): read-only Search & Discovery + per-system DI
+		T.Add(TEXT("search_by_parameter"), &FN::HandleSearchByParameter);
+		T.Add(TEXT("search_by_data_interface"), &FN::HandleSearchByDataInterface);
+		T.Add(TEXT("query_niagara"), &FN::HandleQueryNiagara);
+		T.Add(TEXT("find_similar_systems"), &FN::HandleFindSimilarSystems);
+		T.Add(TEXT("search_by_material"), &FN::HandleSearchByMaterial);
+		T.Add(TEXT("find_niagara_references"), &FN::HandleFindNiagaraReferences);
+		T.Add(TEXT("list_system_data_interfaces"), &FN::HandleListSystemDataInterfaces);
+
+		// ------------------------------------------------------------------------------
+		// GAP #67 — script-graph authoring. These address a SCRIPT (their own script_path,
+		// or the batch-level script default), never a system, which is why the injection in
+		// HandleBatchExecute had to become per-op before they could be reached at all.
+		//
+		// This is the highest-value batching class: wiring one node is ~21 calls of which 20
+		// are the same op twice over (add_map_parameter_pin xN, connect_graph_pins xN). They
+		// are INDEPENDENT and HOMOGENEOUS, which is exactly the class batch's
+		// no-abort/no-rollback contract is safe for — see the contract note in the summary.
+		//
+		// These 13 are also the ops that broke the old chain's nesting limit.
+		// ------------------------------------------------------------------------------
+		T.Add(TEXT("add_graph_node"), &FN::HandleAddGraphNode);
+		T.Add(TEXT("remove_graph_node"), &FN::HandleRemoveGraphNode);
+		T.Add(TEXT("connect_graph_pins"), &FN::HandleConnectGraphPins);
+		T.Add(TEXT("disconnect_graph_pins"), &FN::HandleDisconnectGraphPins);
+		T.Add(TEXT("set_graph_pin_default"), &FN::HandleSetGraphPinDefault);
+		T.Add(TEXT("set_graph_node_position"), &FN::HandleSetGraphNodePosition);
+		T.Add(TEXT("list_graph_node_pins"), &FN::HandleListGraphNodePins);
+		T.Add(TEXT("add_map_parameter_pin"), &FN::HandleAddMapParameterPin);
+		T.Add(TEXT("set_node_comment"), &FN::HandleSetNodeComment);
+		T.Add(TEXT("get_propagated_switches"), &FN::HandleGetPropagatedSwitches);
+		T.Add(TEXT("set_propagated_switches"), &FN::HandleSetPropagatedSwitches);
+		T.Add(TEXT("get_script_parameters"), &FN::HandleGetScriptParameters);
+		T.Add(TEXT("set_script_parameter_meta"), &FN::HandleSetScriptParameterMeta);
+		// Gap #7 surgery, batch-eligible half. remove_map_parameter_pin qualifies on the batch
+		// contract's own terms — the #66 sweep is N INDEPENDENT, HOMOGENEOUS removals of pins on
+		// different nodes, which is exactly the class batch's no-abort/no-rollback behaviour is
+		// safe for. rename_script_parameter and set_script_parameter_type are deliberately NOT
+		// here: they are ordered, whole-graph edits, and after a mid-batch failure batch leaves
+		// the earlier ops committed (9 of 10 observed), i.e. a half-renamed graph.
+		T.Add(TEXT("remove_map_parameter_pin"), &FN::HandleRemoveMapParameterPin);
+
+		return T;
+	}();
+	return Table;
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString SystemPath = NA_GetAssetPath(Params);
+	// ------------------------------------------------------------------------------
+	// GAP #67 — batch could not reach graph authoring, and the path handling was the
+	// STRUCTURAL half of why (the missing dispatch entries further down were the other).
+	//
+	// Batch used to resolve `asset_path` with LoadSystem and then inject the result as
+	// `system_path` into EVERY sub-op. Graph ops (add_graph_node, connect_graph_pins,
+	// add_map_parameter_pin, ...) address a SCRIPT, not a system, so there was nothing
+	// for them to inherit and the batch refused before the first op ever ran.
+	//
+	// The addressing is now PER-OP with a batch-level DEFAULT:
+	//   * an op that names its own asset (asset_path / system_path / script_path)
+	//     addresses that asset, and the batch default is NOT injected over it;
+	//   * an op that names nothing inherits the batch default.
+	// The default is typed by what it actually loads — a system is injected as
+	// `system_path`, a script as `script_path` — so one batch can carry both defaults
+	// and mix system-addressed and script-addressed ops.
+	//
+	// `asset_path` is therefore OPTIONAL now: a batch of graph ops that each carry their
+	// own script_path needs no batch-level asset at all. A path that is supplied and
+	// loads as NEITHER a system nor a script is still refused up front, as before.
+	// ------------------------------------------------------------------------------
+	const FString BatchAssetPath = NA_GetAssetPath(Params);
+	FString BatchScriptPath = Params->HasField(TEXT("script_path"))
+		? Params->GetStringField(TEXT("script_path")) : FString();
 
-	UNiagaraSystem* System = LoadSystem(SystemPath);
-	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
+	UNiagaraSystem* System = nullptr;
+	FString SystemPath;
+	if (!BatchAssetPath.IsEmpty())
+	{
+		// Deliberately NOT LoadSystem(): that helper logs an Error on every miss, and a miss is now
+		// an ordinary step on the way to trying the path as a script. A genuine failure is still
+		// reported — as this function's own return value, once, with both attempts named.
+		System = FMonolithAssetUtils::LoadAssetByPath<UNiagaraSystem>(BatchAssetPath);
+		if (System)
+		{
+			SystemPath = BatchAssetPath;
+		}
+		else if (LoadObject<UNiagaraScript>(nullptr, *BatchAssetPath, nullptr, LOAD_NoWarn | LOAD_Quiet))
+		{
+			// A script named as the batch-level asset becomes the default script_path —
+			// unless the caller already named one explicitly, which wins.
+			if (BatchScriptPath.IsEmpty()) BatchScriptPath = BatchAssetPath;
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' loaded as neither a NiagaraSystem nor a NiagaraScript, so it cannot be the batch's default "
+				     "asset. Pass a system path for stack ops, a script path (or 'script_path') for graph ops, or omit "
+				     "it entirely and give each operation its own asset_path/script_path. NOTHING WAS CHANGED."),
+				*BatchAssetPath));
+		}
+	}
+	if (!BatchScriptPath.IsEmpty() && !LoadObject<UNiagaraScript>(nullptr, *BatchScriptPath, nullptr, LOAD_NoWarn | LOAD_Quiet))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load script '%s' (batch-level 'script_path'). NOTHING WAS CHANGED."), *BatchScriptPath));
+	}
 
 	// Bug 1 fix: "operations" arrives as a parsed JSON array — don't serialize to string then re-parse.
 	// TryGetField returns the array value directly; if it was sent as a pre-serialized string we fall back.
@@ -9825,10 +10249,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		return FMonolithActionResult::Error(TEXT("'operations' must be an array"));
 	}
 
-	// Track whether any write ops are in the batch — skip transaction/compile for read-only batches
+	// Track whether any write ops are in the batch — skip transaction/compile for read-only batches.
+	// connect_/disconnect_ were missing, so a batch of nothing but connect_graph_pins ran outside a
+	// transaction (gap #67's op family).
 	static const TArray<FString> WritePrefixes = {
 		TEXT("add_"), TEXT("remove_"), TEXT("set_"), TEXT("move_"), TEXT("create_"),
-		TEXT("configure_"), TEXT("duplicate_"), TEXT("reorder_"), TEXT("request_compile"), TEXT("rename_")
+		TEXT("configure_"), TEXT("duplicate_"), TEXT("reorder_"), TEXT("request_compile"), TEXT("rename_"),
+		TEXT("connect_"), TEXT("disconnect_")
 	};
 	auto IsWriteOp = [](const FString& Name) -> bool
 	{
@@ -9854,11 +10281,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 	if (bAnyWrites)
 	{
 		GEditor->BeginTransaction(NSLOCTEXT("Monolith", "BatchExec", "Batch Execute"));
-		System->Modify();
+		// Only the system is Modify()'d here; a script-addressed batch has no system, and each
+		// graph op opens its own nested transaction and Modify()s its own graph/node.
+		if (System) System->Modify();
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Results;
 	int32 Ok = 0, Fail = 0;
+	// GAP #68 — the summary modelled successes and failures and nothing else, so a sub-op that
+	// coerced a value and said so in its own data.warning was invisible in an aggregate that read
+	// success: true, failed: 0. Indices only; the text stays in results[i].data so there is exactly
+	// one copy of it and nothing to drift.
+	TArray<TSharedPtr<FJsonValue>> WarnedIndices;
 
 	for (int32 i = 0; i < Ops.Num(); ++i)
 	{
@@ -9884,151 +10318,62 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 
 		// Delegate to individual handlers by constructing param objects
 		TSharedRef<FJsonObject> SubParams = MakeShared<FJsonObject>();
-		SubParams->SetStringField(TEXT("system_path"), SystemPath);
 
-		// Copy all fields from Op to SubParams
+		// GAP #67 — the op's OWN fields are copied FIRST and the batch default is only filled in
+		// behind them. The old order (inject, then copy) meant the batch's idea of the asset was
+		// written into every op before the op could say otherwise; that is the same overwrite bug
+		// in miniature, and it is what made a script-addressed op unreachable.
 		for (auto& Pair : Op->Values)
 		{
 			SubParams->SetField(Pair.Key, Pair.Value);
 		}
 
+		const bool bOpNamesItsOwnAsset =
+			Op->HasField(TEXT("asset_path")) || Op->HasField(TEXT("system_path")) || Op->HasField(TEXT("script_path"));
+		if (!bOpNamesItsOwnAsset)
+		{
+			if (!SystemPath.IsEmpty()) SubParams->SetStringField(TEXT("system_path"), SystemPath);
+			if (!BatchScriptPath.IsEmpty()) SubParams->SetStringField(TEXT("script_path"), BatchScriptPath);
+		}
+
+		// Dispatch through the table (see NA_GetBatchOpTable above — the ~110-arm else-if chain
+		// this replaces exceeded MSVC's block-nesting limit once gap #67's ops were added).
+		// Placeholder only: both branches below assign it.
 		FMonolithActionResult SubResult = FMonolithActionResult::Error(TEXT("Unknown op"));
 
-		if (OpName == TEXT("add_emitter")) SubResult = HandleAddEmitter(SubParams);
-		else if (OpName == TEXT("remove_emitter")) SubResult = HandleRemoveEmitter(SubParams);
-		else if (OpName == TEXT("add_module")) SubResult = HandleAddModule(SubParams);
-		else if (OpName == TEXT("remove_module")) SubResult = HandleRemoveModule(SubParams);
-		else if (OpName == TEXT("set_module_input_value") || OpName == TEXT("set_module_input")) SubResult = HandleSetModuleInputValue(SubParams);
-		else if (OpName == TEXT("set_module_input_binding") || OpName == TEXT("set_module_binding")) SubResult = HandleSetModuleInputBinding(SubParams);
-		else if (OpName == TEXT("set_emitter_property")) SubResult = HandleSetEmitterProperty(SubParams);
-		else if (OpName == TEXT("add_renderer")) SubResult = HandleAddRenderer(SubParams);
-		else if (OpName == TEXT("remove_renderer")) SubResult = HandleRemoveRenderer(SubParams);
-		else if (OpName == TEXT("set_renderer_material")) SubResult = HandleSetRendererMaterial(SubParams);
-		else if (OpName == TEXT("set_renderer_property")) SubResult = HandleSetRendererProperty(SubParams);
-		else if (OpName == TEXT("add_user_parameter") || OpName == TEXT("add_user_param")) SubResult = HandleAddUserParameter(SubParams);
-		else if (OpName == TEXT("remove_user_parameter") || OpName == TEXT("remove_user_param")) SubResult = HandleRemoveUserParameter(SubParams);
-		else if (OpName == TEXT("set_parameter_default")) SubResult = HandleSetParameterDefault(SubParams);
-		else if (OpName == TEXT("set_module_enabled")) SubResult = HandleSetModuleEnabled(SubParams);
-		else if (OpName == TEXT("set_module_input_di")) SubResult = HandleSetModuleInputDI(SubParams);
-		else if (OpName == TEXT("set_curve_value")) SubResult = HandleSetCurveValue(SubParams);
-		else if (OpName == TEXT("move_module")) SubResult = HandleMoveModule(SubParams);
-		else if (OpName == TEXT("set_emitter_enabled")) SubResult = HandleSetEmitterEnabled(SubParams);
-		else if (OpName == TEXT("reorder_emitters")) SubResult = HandleReorderEmitters(SubParams);
-		else if (OpName == TEXT("duplicate_emitter")) SubResult = HandleDuplicateEmitter(SubParams);
-		else if (OpName == TEXT("set_renderer_binding")) SubResult = HandleSetRendererBinding(SubParams);
-		else if (OpName == TEXT("request_compile")) SubResult = HandleRequestCompile(SubParams);
-		else if (OpName == TEXT("get_system_diagnostics")) SubResult = HandleGetSystemDiagnostics(SubParams);
-		else if (OpName == TEXT("get_system_property")) SubResult = HandleGetSystemProperty(SubParams);
-		else if (OpName == TEXT("set_system_property")) SubResult = HandleSetSystemProperty(SubParams);
-		else if (OpName == TEXT("set_static_switch_value")) SubResult = HandleSetStaticSwitchValue(SubParams);
-		// Wave 2
-		else if (OpName == TEXT("get_system_summary")) SubResult = HandleGetSystemSummary(SubParams);
-		else if (OpName == TEXT("get_emitter_summary")) SubResult = HandleGetEmitterSummary(SubParams);
-		else if (OpName == TEXT("list_emitter_properties")) SubResult = HandleListEmitterProperties(SubParams);
-		else if (OpName == TEXT("get_module_input_value")) SubResult = HandleGetModuleInputValue(SubParams);
-		else if (OpName == TEXT("get_module_inputs")) SubResult = HandleGetModuleInputs(SubParams);
-		// Wave 3
-		else if (OpName == TEXT("configure_curve_keys")) SubResult = HandleConfigureCurveKeys(SubParams);
-		else if (OpName == TEXT("configure_data_interface")) SubResult = HandleConfigureDataInterface(SubParams);
-		// Wave 4
-		else if (OpName == TEXT("duplicate_system")) SubResult = HandleDuplicateSystem(SubParams);
-		else if (OpName == TEXT("set_fixed_bounds")) SubResult = HandleSetFixedBounds(SubParams);
-		else if (OpName == TEXT("set_effect_type")) SubResult = HandleSetEffectType(SubParams);
-		else if (OpName == TEXT("create_emitter")) SubResult = HandleCreateEmitter(SubParams);
-		else if (OpName == TEXT("export_system_spec")) SubResult = HandleExportSystemSpec(SubParams);
-		// Wave 5
-		else if (OpName == TEXT("add_dynamic_input")) SubResult = HandleAddDynamicInput(SubParams);
-		else if (OpName == TEXT("insert_dynamic_input")) SubResult = HandleInsertDynamicInput(SubParams);
-		else if (OpName == TEXT("set_dynamic_input_value")) SubResult = HandleSetDynamicInputValue(SubParams);
-		else if (OpName == TEXT("search_dynamic_inputs")) SubResult = HandleSearchDynamicInputs(SubParams);
-		// Phase 3: Dynamic Input Features
-		else if (OpName == TEXT("list_dynamic_inputs")) SubResult = HandleListDynamicInputs(SubParams);
-		else if (OpName == TEXT("get_dynamic_input_tree")) SubResult = HandleGetDynamicInputTree(SubParams);
-		else if (OpName == TEXT("remove_dynamic_input")) SubResult = HandleRemoveDynamicInput(SubParams);
-		else if (OpName == TEXT("get_dynamic_input_value")) SubResult = HandleGetDynamicInputValue(SubParams);
-		else if (OpName == TEXT("get_dynamic_input_inputs")) SubResult = HandleGetDynamicInputInputs(SubParams);
-		// Wave 6
-		else if (OpName == TEXT("add_event_handler")) SubResult = HandleAddEventHandler(SubParams);
-		else if (OpName == TEXT("validate_system")) SubResult = HandleValidateSystem(SubParams);
-		else if (OpName == TEXT("add_simulation_stage")) SubResult = HandleAddSimulationStage(SubParams);
-		// Composite
-		else if (OpName == TEXT("set_spawn_shape")) SubResult = HandleSetSpawnShape(SubParams);
-		// Phase 4: Module & Emitter Management
-		else if (OpName == TEXT("rename_emitter")) SubResult = HandleRenameEmitter(SubParams);
-		else if (OpName == TEXT("get_emitter_property")) SubResult = HandleGetEmitterProperty(SubParams);
-		// Phase 5: Renderer & DI Improvements
-		else if (OpName == TEXT("list_available_renderers")) SubResult = HandleListAvailableRenderers(SubParams);
-		else if (OpName == TEXT("set_renderer_mesh")) SubResult = HandleSetRendererMesh(SubParams);
-		else if (OpName == TEXT("configure_ribbon")) SubResult = HandleConfigureRibbon(SubParams);
-		else if (OpName == TEXT("configure_subuv")) SubResult = HandleConfigureSubUV(SubParams);
-		// Phase 6A: Event Handlers, Simulation Stages, Module Outputs
-		else if (OpName == TEXT("get_event_handlers")) SubResult = HandleGetEventHandlers(SubParams);
-		else if (OpName == TEXT("set_event_handler_property")) SubResult = HandleSetEventHandlerProperty(SubParams);
-		else if (OpName == TEXT("remove_event_handler")) SubResult = HandleRemoveEventHandler(SubParams);
-		else if (OpName == TEXT("get_simulation_stages")) SubResult = HandleGetSimulationStages(SubParams);
-		else if (OpName == TEXT("set_simulation_stage_property")) SubResult = HandleSetSimulationStageProperty(SubParams);
-		else if (OpName == TEXT("remove_simulation_stage")) SubResult = HandleRemoveSimulationStage(SubParams);
-		else if (OpName == TEXT("get_module_output_parameters")) SubResult = HandleGetModuleOutputParameters(SubParams);
-		// Phase 6B: NPC Support
-		else if (OpName == TEXT("create_npc")) SubResult = HandleCreateNPC(SubParams);
-		else if (OpName == TEXT("get_npc")) SubResult = HandleGetNPC(SubParams);
-		else if (OpName == TEXT("add_npc_parameter")) SubResult = HandleAddNPCParameter(SubParams);
-		else if (OpName == TEXT("remove_npc_parameter")) SubResult = HandleRemoveNPCParameter(SubParams);
-		else if (OpName == TEXT("set_npc_default")) SubResult = HandleSetNPCDefault(SubParams);
-		// Phase 6B: Effect Type CRUD
-		else if (OpName == TEXT("create_effect_type")) SubResult = HandleCreateEffectType(SubParams);
-		else if (OpName == TEXT("get_effect_type")) SubResult = HandleGetEffectType(SubParams);
-		else if (OpName == TEXT("set_effect_type_property")) SubResult = HandleSetEffectTypeProperty(SubParams);
-		// Phase 6B: Parameter Discovery
-		else if (OpName == TEXT("get_available_parameters")) SubResult = HandleGetAvailableParameters(SubParams);
-		// Phase 6B: Preview
-		else if (OpName == TEXT("preview_system")) SubResult = HandlePreviewSystem(SubParams);
-		// Phase 7: Advanced Features
-		else if (OpName == TEXT("diff_systems")) SubResult = HandleDiffSystems(SubParams);
-		else if (OpName == TEXT("save_emitter_as_template")) SubResult = HandleSaveEmitterAsTemplate(SubParams);
-		else if (OpName == TEXT("clone_module_overrides")) SubResult = HandleCloneModuleOverrides(SubParams);
-		// Read operations (14)
-		else if (OpName == TEXT("get_ordered_modules")) SubResult = HandleGetOrderedModules(SubParams);
-		else if (OpName == TEXT("get_all_parameters")) SubResult = HandleGetAllParameters(SubParams);
-		else if (OpName == TEXT("get_user_parameters")) SubResult = HandleGetUserParameters(SubParams);
-		else if (OpName == TEXT("get_parameter_value")) SubResult = HandleGetParameterValue(SubParams);
-		else if (OpName == TEXT("get_parameter_type")) SubResult = HandleGetParameterType(SubParams);
-		else if (OpName == TEXT("trace_parameter_binding")) SubResult = HandleTraceParameterBinding(SubParams);
-		else if (OpName == TEXT("get_renderer_bindings")) SubResult = HandleGetRendererBindings(SubParams);
-		else if (OpName == TEXT("list_emitters")) SubResult = HandleListEmitters(SubParams);
-		else if (OpName == TEXT("list_renderers")) SubResult = HandleListRenderers(SubParams);
-		else if (OpName == TEXT("list_renderer_properties")) SubResult = HandleListRendererProperties(SubParams);
-		else if (OpName == TEXT("list_module_scripts")) SubResult = HandleListModuleScripts(SubParams);
-		else if (OpName == TEXT("get_module_graph")) SubResult = HandleGetModuleGraph(SubParams);
-		else if (OpName == TEXT("get_custom_hlsl_text")) SubResult = HandleGetCustomHLSLText(SubParams);
-		else if (OpName == TEXT("set_custom_hlsl_text")) SubResult = HandleSetCustomHLSLText(SubParams);
-		else if (OpName == TEXT("get_di_functions")) SubResult = HandleGetDIFunctions(SubParams);
-		else if (OpName == TEXT("get_compiled_gpu_hlsl")) SubResult = HandleGetCompiledGPUHLSL(SubParams);
-		// Phase 8: Expansion
-		else if (OpName == TEXT("save_system")) SubResult = HandleSaveSystem(SubParams);
-		else if (OpName == TEXT("get_static_switch_value")) SubResult = HandleGetStaticSwitchValue(SubParams);
-		else if (OpName == TEXT("import_system_spec")) SubResult = HandleImportSystemSpec(SubParams);
-		// Phase 9: Medium Priority Expansion
-		else if (OpName == TEXT("get_di_properties")) SubResult = HandleGetDIProperties(SubParams);
-		else if (OpName == TEXT("clear_emitter_modules")) SubResult = HandleClearEmitterModules(SubParams);
-		else if (OpName == TEXT("get_module_script_inputs")) SubResult = HandleGetModuleScriptInputs(SubParams);
-		else if (OpName == TEXT("get_scalability_settings")) SubResult = HandleGetScalabilitySettings(SubParams);
-		else if (OpName == TEXT("set_scalability_settings")) SubResult = HandleSetScalabilitySettings(SubParams);
-		else if (OpName == TEXT("list_systems")) SubResult = HandleListSystems(SubParams);
-		// Phase 10: Low Priority & QoL
-		else if (OpName == TEXT("duplicate_module")) SubResult = HandleDuplicateModule(SubParams);
-		else if (OpName == TEXT("get_emitter_parent")) SubResult = HandleGetEmitterParent(SubParams);
-		else if (OpName == TEXT("rename_user_parameter")) SubResult = HandleRenameUserParameter(SubParams);
-		// Layout (Phase 3b)
-		else if (OpName == TEXT("auto_layout")) SubResult = FMonolithNiagaraLayoutActions::HandleAutoLayout(SubParams);
-		// Tranche 2 (#64): read-only Search & Discovery + per-system DI
-		else if (OpName == TEXT("search_by_parameter")) SubResult = HandleSearchByParameter(SubParams);
-		else if (OpName == TEXT("search_by_data_interface")) SubResult = HandleSearchByDataInterface(SubParams);
-		else if (OpName == TEXT("query_niagara")) SubResult = HandleQueryNiagara(SubParams);
-		else if (OpName == TEXT("find_similar_systems")) SubResult = HandleFindSimilarSystems(SubParams);
-		else if (OpName == TEXT("search_by_material")) SubResult = HandleSearchByMaterial(SubParams);
-		else if (OpName == TEXT("find_niagara_references")) SubResult = HandleFindNiagaraReferences(SubParams);
-		else if (OpName == TEXT("list_system_data_interfaces")) SubResult = HandleListSystemDataInterfaces(SubParams);
+		const TMap<FString, FMonolithNiagaraBatchOp>& OpTable = NA_GetBatchOpTable();
+		if (const FMonolithNiagaraBatchOp* OpHandler = OpTable.Find(OpName))
+		{
+			SubResult = (*OpHandler)(SubParams);
+		}
+		else
+		{
+			// GAP #68 — "Unknown op" named nothing and suggested nothing. It can name things now
+			// WITHOUT introducing a second copy of the op list that could drift (recurring defect
+			// pattern #1): the suggestions and the count are read out of the very table the
+			// dispatch above just failed to find the name in. Error path only, so the linear scan
+			// costs nothing that matters.
+			TArray<FString> NearMatches;
+			for (const TPair<FString, FMonolithNiagaraBatchOp>& Entry : OpTable)
+			{
+				if (Entry.Key.Contains(OpName) || OpName.Contains(Entry.Key))
+				{
+					NearMatches.Add(Entry.Key);
+				}
+			}
+			NearMatches.Sort();
+
+			SubResult = FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown op '%s' — batch_execute dispatches %d of the 'niagara' namespace's actions and this name "
+				     "is not among them (it may not exist at all, or it may exist and simply not be batchable).%s "
+				     "Check the spelling against monolith_discover(\"niagara\"), and call the action directly if it is "
+				     "not batchable. Nothing was executed for this step; the batch does NOT abort, so later steps "
+				     "still ran."),
+				*OpName, OpTable.Num(),
+				NearMatches.Num() > 0
+					? *FString::Printf(TEXT(" Did you mean: %s?"), *FString::Join(NearMatches, TEXT(", ")))
+					: TEXT("")));
+		}
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess) RO->SetStringField(TEXT("error"), SubResult.ErrorMessage);
@@ -10037,6 +10382,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		{
 			RO->SetObjectField(TEXT("data"), SubResult.Result);
 		}
+		// GAP #68 — a step that succeeded WITH a warning is neither a success nor a failure to a
+		// caller reading the summary, and until now it read as a plain success. Both spellings the
+		// namespace uses are recognised: a 'warning' string and a 'warnings' array.
+		if (SubResult.bSuccess && SubResult.Result.IsValid())
+		{
+			FString WarnStr;
+			const TArray<TSharedPtr<FJsonValue>>* WarnArrPtr = nullptr;
+			const bool bWarned =
+				(SubResult.Result->TryGetStringField(TEXT("warning"), WarnStr) && !WarnStr.IsEmpty())
+				|| (SubResult.Result->TryGetArrayField(TEXT("warnings"), WarnArrPtr) && WarnArrPtr && WarnArrPtr->Num() > 0);
+			if (bWarned)
+			{
+				RO->SetBoolField(TEXT("warned"), true);
+				WarnedIndices.Add(MakeShared<FJsonValueNumber>(i));
+			}
+		}
 		Results.Add(MakeShared<FJsonValueObject>(RO));
 		if (SubResult.bSuccess) Ok++; else Fail++;
 	}
@@ -10044,7 +10405,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 	if (bAnyWrites)
 	{
 		GEditor->EndTransaction();
-		System->RequestCompile(false);
+		// A script-addressed batch has no system to recompile; each graph op already saved its own
+		// script package. Compiling is not skipped for system batches — that single trailing compile
+		// instead of one per call is most of what batching buys.
+		if (System) System->RequestCompile(false);
 	}
 
 	TSharedRef<FJsonObject> Final = MakeShared<FJsonObject>();
@@ -10052,7 +10416,35 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 	Final->SetNumberField(TEXT("total"), Ops.Num());
 	Final->SetNumberField(TEXT("succeeded"), Ok);
 	Final->SetNumberField(TEXT("failed"), Fail);
+	// GAP #68. `success` deliberately still means "nothing failed" — a warning is not a failure and
+	// silently promoting it to one would break every caller that branches on it. What changes is
+	// that a warned step is no longer INVISIBLE from the summary.
+	//
+	// The key is `warned_steps`, NOT `warnings`: FMonolithToolRegistry::ExecuteAction appends its
+	// own top-level `warnings` ARRAY to every successful result (MonolithToolRegistry.cpp:528-541),
+	// and it does so with SetArrayField after a TryGetArrayField that a number would fail — so a
+	// count parked on that key would be silently overwritten by the framework. That is the very
+	// defect class this field exists to expose.
+	Final->SetNumberField(TEXT("warned_steps"), WarnedIndices.Num());
+	if (WarnedIndices.Num() > 0)
+	{
+		Final->SetArrayField(TEXT("warned_op_indices"), WarnedIndices);
+		Final->SetStringField(TEXT("warnings_note"),
+			TEXT("At least one step SUCCEEDED WITH A WARNING — read results[<index>].data.warning / .warnings for each "
+			     "index in 'warned_op_indices'. A warning usually means a value was COERCED rather than refused, i.e. "
+			     "the asset now holds something the caller did not ask for. 'success' and 'failed' do not account for "
+			     "these. (A top-level 'warnings' array, if present, comes from the tool framework and is about the "
+			     "batch_execute CALL itself, not about the steps.)"));
+	}
 	Final->SetArrayField(TEXT("results"), Results);
+	// The contract, stated in the response rather than only in the gap log: batch_execute is NOT
+	// atomic. It does not abort on a failed step (later steps still run) and it does not roll back
+	// (the EndTransaction above is unconditional, and per #36 even cancelling would not undo the
+	// work). That is safe for INDEPENDENT, HOMOGENEOUS ops and unsafe for ordered ones.
+	Final->SetStringField(TEXT("contract"),
+		TEXT("NOT ATOMIC: a failed step does not abort the batch and nothing is rolled back — earlier steps stay "
+		     "committed and later steps still run. Batch INDEPENDENT operations only; never batch a sequence where a "
+		     "later step depends on an earlier one succeeding."));
 	return NA_SuccessObj(Final);
 }
 
@@ -12708,6 +13100,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateEmitter(const TShared
 	return NA_SuccessObj(R);
 }
 
+// One renderer -> one spec entry. Hoisted out of export_system_spec's emitter loop so the STANDARD
+// and STATELESS branches (gap #64) serialize a renderer through the same code and cannot drift into
+// describing the same object two ways.
+static TSharedRef<FJsonObject> NA_SerializeRendererForSpec(UNiagaraRendererProperties* Rend)
+{
+	TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
+	RO->SetStringField(TEXT("class"), Rend->GetClass()->GetName());
+	UMaterialInterface* Mat = nullptr;
+	if (UNiagaraSpriteRendererProperties* S = Cast<UNiagaraSpriteRendererProperties>(Rend)) Mat = S->Material;
+	else if (UNiagaraRibbonRendererProperties* Rib = Cast<UNiagaraRibbonRendererProperties>(Rend)) Mat = Rib->Material;
+	if (Mat) RO->SetStringField(TEXT("material"), Mat->GetPathName());
+	return RO;
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SystemPath = NA_GetAssetPath(Params);
@@ -12776,13 +13182,189 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 
 	// Emitters
 	TArray<TSharedPtr<FJsonValue>> EmittersArr;
+	int32 StatelessEmitterCount = 0;
+	int32 UndescribedEmitterCount = 0;
 	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
 	{
 		FVersionedNiagaraEmitterData* ED = Handle.GetEmitterData();
-		if (!ED) continue;
+		if (!ED)
+		{
+			// ------------------------------------------------------------------------------
+			// GAP #64 — this was a bare `continue`, and it is why a stock FountainLightweight
+			// exported as {"emitters": []}: one emitter, none reported, no warning and no
+			// unexported_* entry. Export is the half of the spec pair that is actually used,
+			// so "this system is empty" is the worst available failure mode — it looks like a
+			// clean answer and nothing prompts anyone to check.
+			//
+			// The cause is not a missing emitter, it is a SECOND EMITTER MODE.
+			// FNiagaraEmitterHandle::GetEmitterData is
+			//     EmitterMode == ENiagaraEmitterMode::Standard ? VersionedInstance.GetEmitterData() : nullptr
+			// (NiagaraEmitterHandle.cpp:243-246). A lightweight emitter is
+			// ENiagaraEmitterMode::Stateless: its content lives in a UNiagaraStatelessEmitter
+			// held in a separate handle field, it has a FIXED module list instead of a script
+			// graph, and it has no emitter/particle scripts at all — so there is no stack to
+			// walk and never was.
+			//
+			// What is exported is what genuinely exists (module classes, renderers, spawn-info
+			// count, emitter-level values); everything else is NAMED in `unexported` rather
+			// than omitted. The object is read through reflection because
+			// UNiagaraStatelessEmitter lives in Niagara/Internal/Stateless — its UPROPERTYs are
+			// reachable from here, its header is not.
+			// ------------------------------------------------------------------------------
+			const bool bStateless = (Handle.GetEmitterMode() == ENiagaraEmitterMode::Stateless);
+			UNiagaraEmitterBase* EmitterBase = Handle.GetEmitterBase();
+
+			TSharedRef<FJsonObject> SO = MakeShared<FJsonObject>();
+			SO->SetStringField(TEXT("name"), Handle.GetName().ToString());
+			SO->SetStringField(TEXT("mode"), bStateless ? TEXT("stateless") : TEXT("unknown"));
+			SO->SetBoolField(TEXT("enabled"), Handle.GetIsEnabled());
+			SO->SetBoolField(TEXT("importable"), false);
+			if (EmitterBase)
+			{
+				// Deliberately NOT called "asset": `asset` is the key import feeds to add_emitter,
+				// and this object is not addable. A different key is what keeps a hand-edited spec
+				// out of an error message about the wrong thing.
+				SO->SetStringField(TEXT("object_path"), EmitterBase->GetPathName());
+				SO->SetStringField(TEXT("class"), EmitterBase->GetClass()->GetName());
+			}
+
+			if (bStateless && EmitterBase)
+			{
+				StatelessEmitterCount++;
+				UClass* StatelessClass = EmitterBase->GetClass();
+
+				auto ReadObjectArray = [StatelessClass, EmitterBase](const TCHAR* PropName, TArray<UObject*>& Out) -> bool
+				{
+					FArrayProperty* AP = CastField<FArrayProperty>(StatelessClass->FindPropertyByName(FName(PropName)));
+					if (!AP) return false;
+					FObjectPropertyBase* Inner = CastField<FObjectPropertyBase>(AP->Inner);
+					if (!Inner) return false;
+					FScriptArrayHelper_InContainer Helper(AP, EmitterBase);
+					for (int32 ElemIdx = 0; ElemIdx < Helper.Num(); ++ElemIdx)
+					{
+						Out.Add(Inner->GetObjectPropertyValue(Helper.GetRawPtr(ElemIdx)));
+					}
+					return true;
+				};
+
+				// Stateless "modules" are UNiagaraStatelessModule OBJECTS, not function-call nodes
+				// in a graph. Deliberately NOT emitted as `modules`: import feeds that key to
+				// add_module, which takes a module SCRIPT path, and these have none.
+				TArray<UObject*> ModuleObjs;
+				if (ReadObjectArray(TEXT("Modules"), ModuleObjs))
+				{
+					TArray<TSharedPtr<FJsonValue>> StatelessModArr;
+					for (UObject* ModObj : ModuleObjs)
+					{
+						if (!ModObj) continue;
+						TSharedRef<FJsonObject> SMO = MakeShared<FJsonObject>();
+						SMO->SetStringField(TEXT("class"), ModObj->GetClass()->GetName());
+						if (FBoolProperty* EnabledProp = CastField<FBoolProperty>(
+								ModObj->GetClass()->FindPropertyByName(TEXT("bModuleEnabled"))))
+						{
+							SMO->SetBoolField(TEXT("enabled"), EnabledProp->GetPropertyValue_InContainer(ModObj));
+						}
+						StatelessModArr.Add(MakeShared<FJsonValueObject>(SMO));
+					}
+					SO->SetArrayField(TEXT("stateless_modules"), StatelessModArr);
+				}
+
+				TArray<UObject*> RendererObjs;
+				if (ReadObjectArray(TEXT("RendererProperties"), RendererObjs))
+				{
+					TArray<TSharedPtr<FJsonValue>> StatelessRendArr;
+					for (UObject* RendObj : RendererObjs)
+					{
+						UNiagaraRendererProperties* Rend = Cast<UNiagaraRendererProperties>(RendObj);
+						if (!Rend) continue;
+						StatelessRendArr.Add(MakeShared<FJsonValueObject>(NA_SerializeRendererForSpec(Rend)));
+					}
+					SO->SetArrayField(TEXT("renderers"), StatelessRendArr);
+				}
+
+				if (FArrayProperty* SpawnProp = CastField<FArrayProperty>(StatelessClass->FindPropertyByName(TEXT("SpawnInfos"))))
+				{
+					FScriptArrayHelper_InContainer SpawnHelper(SpawnProp, EmitterBase);
+					SO->SetNumberField(TEXT("spawn_info_count"), SpawnHelper.Num());
+				}
+				if (FIntProperty* SeedP = CastField<FIntProperty>(StatelessClass->FindPropertyByName(TEXT("RandomSeed"))))
+					SO->SetNumberField(TEXT("random_seed"), SeedP->GetPropertyValue_InContainer(EmitterBase));
+				if (FBoolProperty* DetP = CastField<FBoolProperty>(StatelessClass->FindPropertyByName(TEXT("bDeterministic"))))
+					SO->SetBoolField(TEXT("determinism"), DetP->GetPropertyValue_InContainer(EmitterBase));
+				if (FObjectPropertyBase* TmplP = CastField<FObjectPropertyBase>(StatelessClass->FindPropertyByName(TEXT("EmitterTemplate"))))
+				{
+					if (UObject* Tmpl = TmplP->GetObjectPropertyValue(TmplP->ContainerPtrToValuePtr<void>(EmitterBase)))
+						SO->SetStringField(TEXT("emitter_template"), Tmpl->GetPathName());
+				}
+				if (FStructProperty* BoundsP = CastField<FStructProperty>(StatelessClass->FindPropertyByName(TEXT("FixedBounds"))))
+				{
+					// Identity by struct PATH, not by TBaseStructure<FBox>::Get(): there is no such
+					// specialization. UE_DECLARE_CORE_VARIANT_TYPE (Class.h:5738-5753) declares
+					// TBaseStructure for Vector/Quat/Box2D/... and Box is NOT in the list, while FBox
+					// is the alias UE::Math::TBox<double> with no StaticStruct member — so the
+					// primary template resolves to TBaseStructureBase<T,false>, which has no Get()
+					// at all and does not compile. The path string is exact identity and costs
+					// nothing here (one comparison per stateless emitter).
+					if (BoundsP->Struct && BoundsP->Struct->GetStructPathName().ToString() == TEXT("/Script/CoreUObject.Box"))
+					{
+						const FBox* SB = BoundsP->ContainerPtrToValuePtr<FBox>(EmitterBase);
+						TSharedRef<FJsonObject> BO = MakeShared<FJsonObject>();
+						BO->SetStringField(TEXT("min"), FString::Printf(TEXT("(%f,%f,%f)"), SB->Min.X, SB->Min.Y, SB->Min.Z));
+						BO->SetStringField(TEXT("max"), FString::Printf(TEXT("(%f,%f,%f)"), SB->Max.X, SB->Max.Y, SB->Max.Z));
+						SO->SetObjectField(TEXT("fixed_bounds"), BO);
+					}
+				}
+
+				// What is NOT here, said plainly rather than left to be inferred from absence.
+				TArray<TSharedPtr<FJsonValue>> NotExported;
+				auto AddNotExported = [&NotExported](const TCHAR* Item, const TCHAR* Reason)
+				{
+					TSharedRef<FJsonObject> NE = MakeShared<FJsonObject>();
+					NE->SetStringField(TEXT("item"), Item);
+					NE->SetStringField(TEXT("reason"), Reason);
+					NotExported.Add(MakeShared<FJsonValueObject>(NE));
+				};
+				AddNotExported(TEXT("stateless_module_parameters"),
+					TEXT("Each stateless module's own settings (distributions, ranges, curves) are UPROPERTYs on an "
+					     "engine-INTERNAL class; only the module's class name and enabled flag are read here."));
+				AddNotExported(TEXT("spawn_infos"),
+					TEXT("Spawn info entries are COUNTED, not described (rate/burst/loop values are not serialized)."));
+				AddNotExported(TEXT("emitter_state"),
+					TEXT("Loop behaviour and lifecycle (EmitterState: loop duration, loop count, scalability) is not "
+					     "serialized."));
+				SO->SetArrayField(TEXT("unexported"), NotExported);
+
+				SO->SetStringField(TEXT("reason"),
+					TEXT("STATELESS (lightweight) emitter — ENiagaraEmitterMode::Stateless, backed by a "
+					     "UNiagaraStatelessEmitter with a fixed module list and NO script graph. It has no stack "
+					     "modules, no rapid-iteration values and no emitter/particle scripts, so the 'modules' array a "
+					     "standard emitter carries does not exist for it and its module objects are reported under "
+					     "'stateless_modules' instead. import_system_spec CANNOT recreate it: add_emitter takes a "
+					     "NiagaraEmitter asset and a stateless emitter is an inner object of its owning system. This "
+					     "entry exists for FIDELITY, not for round-tripping. Previously the emitter was omitted "
+					     "entirely and the system reported as empty."));
+			}
+			else
+			{
+				UndescribedEmitterCount++;
+				SO->SetStringField(TEXT("reason"), FString::Printf(
+					TEXT("This emitter handle produced no emitter data (GetEmitterData() returned null). Emitter mode is "
+					     "%s and %s, so NOTHING about its contents could be read — most likely its emitter object failed "
+					     "to load or its version does not resolve. It is reported here rather than omitted, because "
+					     "omitting it is what made an empty export look like a clean answer."),
+					bStateless ? TEXT("Stateless") : TEXT("Standard"),
+					EmitterBase ? TEXT("the emitter object is present") : TEXT("the emitter object is null")));
+			}
+
+			EmittersArr.Add(MakeShared<FJsonValueObject>(SO));
+			continue;
+		}
 
 		TSharedRef<FJsonObject> EO = MakeShared<FJsonObject>();
 		EO->SetStringField(TEXT("name"), Handle.GetName().ToString());
+		// Additive (gap #64): standard emitters now say so, so a consumer can filter on one key
+		// instead of inferring the kind from which arrays happen to be present.
+		EO->SetStringField(TEXT("mode"), TEXT("standard"));
 		EO->SetStringField(TEXT("sim_target"), ED->SimTarget == ENiagaraSimTarget::GPUComputeSim ? TEXT("GPU") : TEXT("CPU"));
 		if (UNiagaraEmitter* EmitterObj = Handle.GetInstance().Emitter)
 		{
@@ -13234,13 +13816,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 		for (UNiagaraRendererProperties* Rend : ED->GetRenderers())
 		{
 			if (!Rend) continue;
-			TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
-			RO->SetStringField(TEXT("class"), Rend->GetClass()->GetName());
-			UMaterialInterface* Mat = nullptr;
-			if (UNiagaraSpriteRendererProperties* S = Cast<UNiagaraSpriteRendererProperties>(Rend)) Mat = S->Material;
-			else if (UNiagaraRibbonRendererProperties* Rib = Cast<UNiagaraRibbonRendererProperties>(Rend)) Mat = Rib->Material;
-			if (Mat) RO->SetStringField(TEXT("material"), Mat->GetPathName());
-			RendArr.Add(MakeShared<FJsonValueObject>(RO));
+			RendArr.Add(MakeShared<FJsonValueObject>(NA_SerializeRendererForSpec(Rend)));
 		}
 		EO->SetArrayField(TEXT("renderers"), RendArr);
 
@@ -13250,6 +13826,21 @@ FMonolithActionResult FMonolithNiagaraActions::HandleExportSystemSpec(const TSha
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetObjectField(TEXT("spec"), Spec);
+	// Gap #64. Emitted only when there is something to say, and built from the same counters the
+	// entries were built from — there is no second traversal that could disagree with the array.
+	if (StatelessEmitterCount > 0 || UndescribedEmitterCount > 0)
+	{
+		R->SetNumberField(TEXT("non_importable_emitter_count"), StatelessEmitterCount + UndescribedEmitterCount);
+		R->SetStringField(TEXT("emitters_note"), FString::Printf(
+			TEXT("%d of %d emitter(s) in this system are reported with importable:false — %d stateless (lightweight) "
+			     "and %d whose emitter data could not be read. They are DESCRIBED, not exported: each carries a "
+			     "'reason' and an 'unexported' list naming what is missing and why. Until this fix they were dropped "
+			     "silently, so a system consisting only of such emitters exported as \"emitters\": [] and looked empty. "
+			     "import_system_spec skips them and counts each as a failed step, because an import of this spec does "
+			     "NOT reproduce the system."),
+			StatelessEmitterCount + UndescribedEmitterCount, System->GetEmitterHandles().Num(),
+			StatelessEmitterCount, UndescribedEmitterCount));
+	}
 	// Gap #43. Stated in the response because the previous behaviour was a SILENT omission —
 	// the export looked complete and was not, so nothing prompted anyone to check.
 	R->SetStringField(TEXT("values_note"),
@@ -19875,6 +20466,39 @@ int32 FMonolithNiagaraActions::ApplySpecToSystem(UNiagaraSystem* System, const F
 			TSharedPtr<FJsonObject> EO = EV->AsObject();
 			if (!EO) continue;
 
+			// GAP #64 — export now REPORTS the emitters it cannot express (stateless/lightweight
+			// ones, and any handle whose data would not read) instead of dropping them silently,
+			// each marked importable:false with no `asset` key. Import must not hand those to
+			// add_emitter: there is no emitter asset to add — a stateless emitter is an inner
+			// object of its owning system — so it would fail on an empty path with a message about
+			// the wrong thing. Skipped explicitly, and COUNTED AS A FAILURE, because an import that
+			// silently leaves an emitter out has not reproduced the system.
+			//
+			// `importable` is read by JSON TYPE, not with TryGetBoolField: that helper returns true
+			// for EVERY string (JsonValue.h:493-497), so a schema-shaped read of it is never a real
+			// check.
+			bool bEmitterImportable = true;
+			if (const TSharedPtr<FJsonValue> ImportableVal = EO->TryGetField(TEXT("importable")))
+			{
+				if (ImportableVal->Type == EJson::Boolean) bEmitterImportable = ImportableVal->AsBool();
+			}
+			FString EmitterModeStr;
+			EO->TryGetStringField(TEXT("mode"), EmitterModeStr);
+			if (!bEmitterImportable || EmitterModeStr.Equals(TEXT("stateless"), ESearchCase::IgnoreCase))
+			{
+				FString SkippedName;
+				EO->TryGetStringField(TEXT("name"), SkippedName);
+				OutErrors.Add(FString::Printf(
+					TEXT("add_emitter: SKIPPED emitter '%s' — the spec marks it non-importable%s. There is no route to "
+					     "create it: add_emitter takes a NiagaraEmitter ASSET, and this kind of emitter is an inner "
+					     "object of its owning system. Recreate it by hand; the exported entry's 'reason' says what it "
+					     "was."),
+					SkippedName.IsEmpty() ? TEXT("(unnamed)") : *SkippedName,
+					EmitterModeStr.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" (mode: %s)"), *EmitterModeStr)));
+				FailCount++;
+				continue;
+			}
+
 			TSharedRef<FJsonObject> AEP = MakeShared<FJsonObject>();
 			AEP->SetStringField(TEXT("system_path"), SystemPath);
 			AEP->SetStringField(TEXT("emitter_asset"), EO->GetStringField(TEXT("asset")));
@@ -22257,9 +22881,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAuditStackWiring(const TSha
 						O->SetStringField(TEXT("script_path"), FuncNode->FunctionScript->GetPathName());
 					}
 				}
+				// GAP #35 — the opening clause used to read "but whose ParameterMap links keep it in the
+				// compiled traversal", which contradicts this string's own closing "this node is inert".
+				// The engine settles it: on a fixture with four nodes flagged this way, get_stage_graph's
+				// engine BuildTraversal listed NONE of them (2026-08-09). The links explain why it is
+				// reported here rather than as 'disconnected'; they do not put it in the traversal. Stale
+				// wording inherited from the #31 replace-leak description, which its fix made obsolete.
 				O->SetStringField(TEXT("reason"),
-					TEXT("dynamic input node whose value output feeds nothing, but whose ParameterMap links keep it in the compiled traversal — "
-					     "a displaced chain node. NOT AUTOMATICALLY REPAIRABLE: remove_dynamic_input's unrooted-by-guid teardown is DISABLED "
+					TEXT("dynamic input node whose value output feeds nothing — a displaced chain node. Its ParameterMap links are why it is "
+					     "reported here instead of as 'disconnected'; they do NOT put it in the compiled traversal (check with get_stage_graph: "
+					     "a node flagged this way is absent from the engine's own BuildTraversal). NOT AUTOMATICALLY REPAIRABLE: "
+					     "remove_dynamic_input's unrooted-by-guid teardown is DISABLED "
 					     "(gap #37 — it deleted three live nodes and flattened a live chain that still compiled 0/0), and it is invisible to "
 					     "clean_stack_orphans. This node is inert, so leaving it costs graph clutter and nothing else. To remove it, delete the "
 					     "node by hand in the Niagara graph editor, then re-run audit_stack_wiring and request_compile."));
@@ -22626,6 +23258,31 @@ namespace MonolithNiagaraGraphAuthoring
 		return nullptr;
 	}
 
+	/**
+	 * Resolve a UEnum from a full object path ("/Script/Niagara.ENiagaraCoordinateSpace") OR a
+	 * bare name ("ENiagaraCoordinateSpace"). The two forms need DIFFERENT engine calls:
+	 * FindFirstObject converts its ENTIRE argument into a single FName, so a path can only ever
+	 * miss there, and LoadObject is the only form that pulls in an unloaded UserDefinedEnum asset.
+	 *
+	 * Shared by node_type=static_switch (switch_type=enum) and add_map_parameter_pin (gap #65) so
+	 * the two spell "give me an enum" the same way. Deliberately re-derived rather than including
+	 * MonolithCore's MonolithPinTypeGrammar::ResolveEnumByNameOrPath: that header states its own
+	 * linkage invariant — it is header-only against BlueprintGraph symbols and lists the modules
+	 * allowed to include it from a .cpp, and MonolithNiagara is not one of them.
+	 */
+	static UEnum* ResolveEnumByPathOrName(const FString& NameOrPath)
+	{
+		const FString Trimmed = NameOrPath.TrimStartAndEnd();
+		if (Trimmed.IsEmpty()) return nullptr;
+
+		if (Trimmed.Contains(TEXT("/")) || Trimmed.Contains(TEXT(".")))
+		{
+			if (UEnum* Found = FindObject<UEnum>(nullptr, *Trimmed)) return Found;
+			return LoadObject<UEnum>(nullptr, *Trimmed, nullptr, LOAD_NoWarn | LOAD_Quiet);
+		}
+		return FindFirstObject<UEnum>(*Trimmed, EFindFirstObjectOptions::NativeFirst);
+	}
+
 	// Pins are addressed by name or by index WITHIN a direction (the graph exposes several
 	// unnamed/duplicate-named pins, so index addressing is the reliable fallback).
 	static UEdGraphPin* ResolvePin(UEdGraphNode* Node, const FString& PinName, int32 PinIndex, EEdGraphPinDirection Direction, bool bHasIndex, FString& OutError)
@@ -22836,8 +23493,48 @@ namespace MonolithNiagaraGraphAuthoring
 		TArray<FString>& OutNames, bool& bOutAll, FString& OutError)
 	{
 		bOutAll = false;
+
+		const TSharedPtr<FJsonValue> Raw = Params->TryGetField(Field);
+		if (!Raw.IsValid())
+		{
+			OutError = FString::Printf(TEXT("'%s' is missing. Pass one or more switch names, or \"all\"."), Field);
+			return false;
+		}
+		if (Raw->Type == EJson::Object || Raw->Type == EJson::Null)
+		{
+			OutError = FString::Printf(
+				TEXT("'%s' must be an array of switch names, a single name, or \"all\" — an object is not a switch list."), Field);
+			return false;
+		}
+
+		// ------------------------------------------------------------------------
+		// GAP #59 — WHY THIS TESTS THE JSON TYPE INSTEAD OF CALLING TryGetBoolField.
+		//
+		// TJsonValueString::TryGetBool returns TRUE UNCONDITIONALLY, handing back
+		// FString::ToBool() (JsonValue.h:493-497). TryGetBoolField therefore SUCCEEDS for every
+		// string field, so the string "all" reached this function as `false` and never got as far
+		// as the string branch below. That is the whole of #59: the documented "all" affordance
+		// was unreachable on BOTH set_propagated_switches and add_graph_node, and the caller who
+		// passed it got the BOOLEAN branch's message — "'switches' was false. Omit it entirely to
+		// propagate nothing." — describing a request they had not made.
+		//
+		// Only a REAL JSON boolean takes the boolean branch. A string-encoded boolean still works,
+		// because MCP double-encodes, but by an explicit two-value match rather than by
+		// FString::ToBool()'s whole grammar — in which "all" is one of the false values.
+		// ------------------------------------------------------------------------
 		bool bBool = false;
-		if (Params->TryGetBoolField(Field, bBool))
+		bool bIsBool = (Raw->Type == EJson::Boolean);
+		if (bIsBool)
+		{
+			Raw->TryGetBool(bBool);
+		}
+		else if (Raw->Type == EJson::String)
+		{
+			const FString S = Raw->AsString().TrimStartAndEnd();
+			if (S.Equals(TEXT("true"), ESearchCase::IgnoreCase))       { bBool = true;  bIsBool = true; }
+			else if (S.Equals(TEXT("false"), ESearchCase::IgnoreCase)) { bBool = false; bIsBool = true; }
+		}
+		if (bIsBool)
 		{
 			bOutAll = bBool;
 			if (!bOutAll)
@@ -22849,17 +23546,16 @@ namespace MonolithNiagaraGraphAuthoring
 		}
 
 		TArray<TSharedPtr<FJsonValue>> Arr;
-		const TArray<TSharedPtr<FJsonValue>>* ArrPtr = nullptr;
-		if (Params->TryGetArrayField(Field, ArrPtr) && ArrPtr)
+		if (Raw->Type == EJson::Array)
 		{
-			Arr = *ArrPtr;
+			Arr = Raw->AsArray();
 		}
 		else
 		{
-			const FString Trimmed = Params->GetStringField(Field).TrimStartAndEnd();
-			if (Trimmed.Equals(TEXT("all"), ESearchCase::IgnoreCase)) { bOutAll = true; return true; }
+			const FString Trimmed = Raw->AsString().TrimStartAndEnd();
 			if (Trimmed.StartsWith(TEXT("[")))
 			{
+				// MCP double-encodes: a string-serialized array.
 				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Trimmed);
 				if (!FJsonSerializer::Deserialize(Reader, Arr))
 				{
@@ -22869,8 +23565,7 @@ namespace MonolithNiagaraGraphAuthoring
 			}
 			else if (!Trimmed.IsEmpty())
 			{
-				OutNames.Add(Trimmed);   // a single bare switch name
-				return true;
+				Arr.Add(MakeShared<FJsonValueString>(Trimmed));   // a single bare switch name, or "all"
 			}
 		}
 
@@ -22880,6 +23575,29 @@ namespace MonolithNiagaraGraphAuthoring
 			const FString Name = V->AsString().TrimStartAndEnd();
 			if (!Name.IsEmpty()) OutNames.AddUnique(Name);
 		}
+
+		// "all" is honoured in EVERY shape it can arrive in — bare "all", ["all"], "[\"all\"]",
+		// any casing — because an affordance that works in one spelling only is the same defect as
+		// one that does not work at all. Mixed with real names it is REFUSED rather than silently
+		// widened to everything: "all" already covers them, so the two readings disagree and only
+		// the caller knows which was meant.
+		const int32 AllIdx = OutNames.IndexOfByPredicate(
+			[](const FString& N) { return N.Equals(TEXT("all"), ESearchCase::IgnoreCase); });
+		if (AllIdx != INDEX_NONE)
+		{
+			if (OutNames.Num() > 1)
+			{
+				OutError = FString::Printf(
+					TEXT("'%s' mixes \"all\" with individual switch names [%s]. \"all\" already covers every switch the "
+						 "called script exposes — pass \"all\" on its own, or list the names without it. NOTHING WAS CHANGED."),
+					Field, *FString::Join(OutNames, TEXT(", ")));
+				return false;
+			}
+			OutNames.Reset();
+			bOutAll = true;
+			return true;
+		}
+
 		if (OutNames.Num() == 0)
 		{
 			OutError = FString::Printf(
@@ -23701,12 +24419,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddGraphNode(const TSharedP
 		else if (SwitchType == TEXT("enum"))
 		{
 			const FString EnumPath = Params->HasField(TEXT("enum_path")) ? Params->GetStringField(TEXT("enum_path")) : FString();
-			UEnum* SwitchEnum = EnumPath.IsEmpty() ? nullptr : LoadObject<UEnum>(nullptr, *EnumPath);
+			// Gap #65 — shared resolver, so a bare enum name works here exactly as it does on
+			// add_map_parameter_pin. Strictly a widening: every path that resolved before still does.
+			UEnum* SwitchEnum = ResolveEnumByPathOrName(EnumPath);
 			if (!SwitchEnum)
 			{
 				Graph->RemoveNode(N);
 				GEditor->EndTransaction();
-				return FMonolithActionResult::Error(TEXT("switch_type=enum requires a loadable 'enum_path'"));
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("switch_type=enum requires a resolvable 'enum_path' — '%s' did not resolve. Pass a full object "
+						 "path ('/Script/Niagara.ENiagaraCoordinateSpace') or a bare enum name ('ENiagaraCoordinateSpace')."),
+					*EnumPath));
 			}
 			N->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
 			N->SwitchTypeData.Enum = SwitchEnum;
@@ -24704,6 +25427,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleListGraphNodePins(const TSh
 	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 	R->SetStringField(TEXT("class"), Node->GetClass()->GetName());
 	R->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+
+	// GAP #61 — a function specifier is NOT a pin, so a pin listing that omits it cannot answer
+	// "which node holds the Identifier?" at all. Same emission rule as get_module_graph: only when
+	// the node actually carries specifiers, so every other node's response is unchanged.
+	if (UNiagaraNodeFunctionCall* FnNode = Cast<UNiagaraNodeFunctionCall>(Node))
+	{
+		if (FnNode->FunctionSpecifiers.Num() > 0)
+		{
+			TSharedRef<FJsonObject> SpecObj = MakeShared<FJsonObject>();
+			for (const TPair<FName, FName>& Pair : FnNode->FunctionSpecifiers)
+			{
+				SpecObj->SetStringField(Pair.Key.ToString(), Pair.Value.ToString());
+			}
+			R->SetObjectField(TEXT("function_specifiers"), SpecObj);
+		}
+	}
+
 	R->SetArrayField(TEXT("input_pins"), InputsArr);
 	R->SetArrayField(TEXT("output_pins"), OutputsArr);
 
@@ -24963,11 +25703,71 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	if (!Node) return FMonolithActionResult::Error(TEXT("node_guid not found"));
 
 	const FString ParamName = Params->GetStringField(TEXT("parameter"));
-	const FString TypeStr = Params->GetStringField(TEXT("type"));
+	const FString TypeStr = Params->HasField(TEXT("type")) ? Params->GetStringField(TEXT("type")) : FString();
 	const bool bExisting = Params->HasField(TEXT("existing")) && Params->GetBoolField(TEXT("existing"));
-	bool bFellBack = false;
-	FNiagaraTypeDefinition TypeDef = ResolveNiagaraType(TypeStr, &bFellBack);
-	if (bFellBack) return FMonolithActionResult::Error(FString::Printf(TEXT("Unknown Niagara type '%s'"), *TypeStr));
+
+	// --- Type resolution (gap #65). Everything here refuses BEFORE any transaction opens. ------
+	//
+	// ResolveNiagaraType knows no enum at all, so "ENiagaraCoordinateSpace" AND the full
+	// "/Script/Niagara.ENiagaraCoordinateSpace" both fell back to float and were refused as
+	// "Unknown Niagara type" — and existing=true could not rescue it, because the type is resolved
+	// before the registry lookup, so it never reached the parameter that was already there.
+	//
+	// The route is the one add_graph_node's switch_type=enum already takes: name the UEnum and
+	// build the type from it (FNiagaraTypeDefinition(UEnum*), NiagaraTypes.h:729-738). The wizard
+	// utility below needs no change — the engine's own wizard already calls it with an enum type:
+	// AddReadParameterPin(FNiagaraTypeDefinition(StaticEnum<ENDIDataChannelSpawnMode>()), ...)
+	// (NiagaraDataChannelWizard.cpp:998).
+	FNiagaraTypeDefinition TypeDef;
+	const FString EnumPath = Params->HasField(TEXT("enum_path"))
+		? Params->GetStringField(TEXT("enum_path")).TrimStartAndEnd() : FString();
+
+	// GAP #69 — 'type' and 'enum_path' are EXACTLY-ONE-OF, and that enforcement never shipped:
+	// the enum branch below simply won, so a caller who passed both got a pin of a type they did
+	// not ask for with nothing said about it. Refused here, ahead of the reuse check and ahead of
+	// any transaction — per #36 a cancelled transaction does not roll back, so refusing before one
+	// is opened is the only reliable pattern.
+	if (!EnumPath.IsEmpty() && !TypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Pass EITHER 'type' ('%s') OR 'enum_path' ('%s') — not both. They name two different pin types and "
+			     "there is no defensible way to pick one; the previous behaviour was to let 'enum_path' win silently. "
+			     "Drop 'type' for an enum-typed pin, or drop 'enum_path' for any other type. NOTHING WAS CHANGED."),
+			*TypeStr, *EnumPath));
+	}
+
+	if (!EnumPath.IsEmpty())
+	{
+		UEnum* PinEnum = ResolveEnumByPathOrName(EnumPath);
+		if (!PinEnum)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'enum_path' ('%s') did not resolve to a UEnum. Pass a full object path "
+				     "('/Script/Niagara.ENiagaraCoordinateSpace') or a bare enum name ('ENiagaraCoordinateSpace'). "
+				     "NOTHING WAS CHANGED."),
+				*EnumPath));
+		}
+		TypeDef = FNiagaraTypeDefinition(PinEnum);
+	}
+	else if (TypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"Give the pin a type: either 'type' (float, int, bool, vec3, position, a data interface class name, ...) "
+			"or 'enum_path' for an enum-typed pin. NOTHING WAS CHANGED."));
+	}
+	else
+	{
+		bool bFellBack = false;
+		TypeDef = ResolveNiagaraType(TypeStr, &bFellBack);
+		if (bFellBack)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown Niagara type '%s'. NOTE: enum types are NOT resolvable through 'type' — name the enum in "
+				     "'enum_path' instead (e.g. enum_path=\"/Script/Niagara.ENiagaraCoordinateSpace\"), which is the same "
+				     "route add_graph_node's switch_type=enum takes. NOTHING WAS CHANGED."),
+				*TypeStr));
+		}
+	}
 
 	UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
 	UNiagaraNodeParameterMapSet* SetNode = Cast<UNiagaraNodeParameterMapSet>(Node);
@@ -25697,6 +26497,1072 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRemoveScriptParameter(const
 	R->SetNumberField(TEXT("references_found"), 0);
 	R->SetArrayField(TEXT("references"), RefArr);
 	R->SetStringField(TEXT("note"), TEXT("Registry entry only — no node and no pin was deleted."));
+	return NA_SuccessObj(R);
+}
+
+// ============================================================================
+// Module-script I/O surgery (gap #7)
+//
+// Renaming a parameter, removing a map pin and retyping a parameter were the three edits
+// that had no route through Monolith, so every one of them forced a RECREATE of the module
+// script. The recreate itself was never the expensive part: recreating a script obsoletes
+// every PLACED instance of it, and re-adding those is the I-19 churn that produced incidents
+// #13/C14 and #2/C6. All three edits below are thin calls onto already-exported engine APIs.
+//
+// Three rules govern this whole block:
+//
+//  1. REFUSE BEFORE THE TRANSACTION OPENS (#36, proven). CancelTransaction discards the undo
+//     record, not the changes, so every validation here runs before BeginTransaction and every
+//     refusal message ends by saying nothing was changed.
+//
+//  2. NEVER ANSWER WITH THE REQUEST (defect pattern 2). Types, names and pin lists in the
+//     responses are read back off the graph after the edit, not echoed from the parameters.
+//
+//  3. WARN ABOUT PLACED CALLERS, DO NOT PRETEND TO FIX THEM (I-20 / gap #62). Rename and
+//     retype both change the script's parameter SURFACE, and a UNiagaraNodeFunctionCall that
+//     is already placed in a stack keeps the pins it was built with. #62 established that no
+//     Monolith action refreshes a placed caller. Saying so loudly is the honest maximum.
+//
+// Deliberately NOT in scope, and deliberately a different action: remove_script_parameter,
+// which sweeps a REGISTRY entry, deletes no pin ever, and refuses whenever any pin still
+// names the parameter. remove_map_parameter_pin below is its exact complement — it deletes a
+// pin and leaves the registry alone — and the two compose: remove the pins, then sweep.
+// ============================================================================
+
+namespace MonolithNiagaraIOSurgery
+{
+	/**
+	 * Cross-namespace root cause (2026-08-10): TJsonValueString::TryGetBool returns true
+	 * UNCONDITIONALLY and hands back FString::ToBool (JsonValue.h:493-497), so TryGetBoolField
+	 * never fails on a string — it silently yields false for anything that is not "true"/"1"/"yes".
+	 * Every optional flag in this block selects a genuinely different operation (break the links
+	 * or refuse; merge or refuse), so a silently-false flag is a silently different edit. Dispatch
+	 * on the value's TYPE, and refuse a string that is not a boolean spelling rather than guessing.
+	 */
+	static bool ReadStrictBool(const TSharedPtr<FJsonObject>& Params, const TCHAR* Field, bool bDefault,
+		bool& bOutValue, FString& OutError)
+	{
+		bOutValue = bDefault;
+		OutError.Reset();
+
+		const TSharedPtr<FJsonValue> Value = Params->TryGetField(Field);
+		if (!Value.IsValid() || Value->Type == EJson::Null) return true;
+
+		if (Value->Type == EJson::Boolean) { bOutValue = Value->AsBool(); return true; }
+		if (Value->Type == EJson::Number)  { bOutValue = Value->AsNumber() != 0.0; return true; }
+		if (Value->Type == EJson::String)
+		{
+			const FString S = Value->AsString().TrimStartAndEnd();
+			if (S.Equals(TEXT("true"), ESearchCase::IgnoreCase) || S == TEXT("1"))  { bOutValue = true;  return true; }
+			if (S.Equals(TEXT("false"), ESearchCase::IgnoreCase) || S == TEXT("0")) { bOutValue = false; return true; }
+			OutError = FString::Printf(
+				TEXT("'%s' must be a boolean, but the string \"%s\" is neither true nor false. Refusing rather than "
+				     "reading it as false — which is exactly what TryGetBoolField would have done silently. "
+				     "NOTHING WAS CHANGED."),
+				Field, *S);
+			return false;
+		}
+
+		OutError = FString::Printf(
+			TEXT("'%s' must be a boolean (true/false). NOTHING WAS CHANGED."), Field);
+		return false;
+	}
+
+	/**
+	 * The script-variable map is keyed by FNiagaraVariable — NAME **and** TYPE — and both exported
+	 * mutators used here (RenameParameter, ChangeParameterType) look their target up by that exact
+	 * key (NiagaraGraph.cpp:2808, :1025). GetScriptVariable(FName) matches on name alone, so its
+	 * result cannot be turned back into a key without guessing the type. Read the key straight off
+	 * the map instead. The plural return is not defensive padding: RenameParameter's merge detection
+	 * is keyed on (type, name), so a name CAN legitimately end up registered under two types, and
+	 * that state must be reported rather than silently resolved to whichever entry iterates first.
+	 *
+	 * Matching is CASE-SENSITIVE, like CollectParameterReferences and RemoveScriptVariableEntries
+	 * above — FName lookups are not, and that difference is itself a trap worth surfacing.
+	 */
+	static int32 FindRegistryEntriesByName(UNiagaraGraph* Graph, const FString& ParamName,
+		TArray<FNiagaraVariable>& OutKeys, TArray<UNiagaraScriptVariable*>& OutVars)
+	{
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+		{
+			if (!P.Value) continue;
+			if (P.Key.GetName().ToString().Equals(ParamName, ESearchCase::CaseSensitive))
+			{
+				OutKeys.Add(P.Key);
+				OutVars.Add(P.Value);
+			}
+		}
+		return OutKeys.Num();
+	}
+
+	/** Every registered parameter name, for "no such parameter" errors. */
+	static FString ListKnownParameters(UNiagaraGraph* Graph, int32 MaxShown = 24)
+	{
+		TArray<FString> Known;
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+		{
+			Known.Add(P.Key.GetName().ToString());
+		}
+		Known.Sort();
+		if (Known.Num() > MaxShown)
+		{
+			const int32 Extra = Known.Num() - MaxShown;
+			Known.SetNum(MaxShown);
+			Known.Add(FString::Printf(TEXT("+%d more"), Extra));
+		}
+		return FString::Join(Known, TEXT(", "));
+	}
+
+	/**
+	 * "You spelled it with the wrong case" is otherwise an unhelpfully silent miss here, because the
+	 * lookups in this block are case-sensitive while FName — and therefore the engine's own
+	 * GetScriptVariable(FName) — is not.
+	 */
+	static FString FindCaseInsensitiveMatch(UNiagaraGraph* Graph, const FString& ParamName)
+	{
+		for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& P : Graph->GetAllMetaData())
+		{
+			const FString Name = P.Key.GetName().ToString();
+			if (Name.Equals(ParamName, ESearchCase::IgnoreCase) && !Name.Equals(ParamName, ESearchCase::CaseSensitive))
+			{
+				return Name;
+			}
+		}
+		return FString();
+	}
+
+	/** Rows describing what a pin is currently wired to — so a refusal can name what it would break. */
+	static void DescribeLinks(const UEdGraphPin* Pin, TArray<TSharedPtr<FJsonValue>>& OutRows, TArray<FString>& OutText)
+	{
+		if (!Pin) return;
+		for (const UEdGraphPin* LP : Pin->LinkedTo)
+		{
+			if (!LP || !LP->GetOwningNode()) continue;
+			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("node_guid"), LP->GetOwningNode()->NodeGuid.ToString());
+			O->SetStringField(TEXT("node"), LP->GetOwningNode()->GetNodeTitle(ENodeTitleType::ListView).ToString());
+			O->SetStringField(TEXT("pin"), LP->PinName.ToString());
+			OutRows.Add(MakeShared<FJsonValueObject>(O));
+			OutText.Add(FString::Printf(TEXT("%s.%s (%s)"),
+				*LP->GetOwningNode()->GetNodeTitle(ENodeTitleType::ListView).ToString(),
+				*LP->PinName.ToString(),
+				*LP->GetOwningNode()->NodeGuid.ToString()));
+		}
+	}
+
+	/** Snapshot of every orphaned pin in the graph, so a retype can report the ones IT created. */
+	static void CollectOrphanedPinKeys(UNiagaraGraph* Graph, TSet<FString>& OutKeys)
+	{
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			for (UEdGraphPin* P : Node->Pins)
+			{
+				if (P && P->bOrphanedPin)
+				{
+					OutKeys.Add(FString::Printf(TEXT("%s|%s|%s"),
+						*Node->NodeGuid.ToString(), *P->PersistentGuid.ToString(), *P->PinName.ToString()));
+				}
+			}
+		}
+	}
+
+	/**
+	 * I-20 / gap #62 — the hazard both surface-changing actions share.
+	 *
+	 * A UNiagaraNodeFunctionCall that is ALREADY PLACED in a system's stack keeps the pins it was
+	 * built with; nothing about editing the called script updates it. #62 measured the cost of the
+	 * analogous case (a static switch added to a placed module: 72 compile errors, "Ensure condition
+	 * failed: SelectorValue != INDEX_NONE") and established that NO action refreshes a placed
+	 * caller — saving, re-opening the system editor and toggling the module's enabled flag were all
+	 * tried and all failed. So this warns, names the assets, and states the only remedy that is
+	 * known to work; it does not offer a refresh, because there is none to offer (defect pattern 5:
+	 * never suggest a fix without something that verifies the fix exists).
+	 *
+	 * The referencer list comes from the asset-registry PACKAGE graph — the same call
+	 * find_niagara_references makes (IAssetRegistry.h:592). It loads nothing, so it is safe to run
+	 * mid-edit, and it is a SUPERSET: a package referencing this script's package is very nearly
+	 * always a placed call, but this has not proven that and does not claim to.
+	 */
+	static void AppendPlacedCallerWarning(UNiagaraScript* Script, const FString& ScriptPath,
+		const TCHAR* WhatChanged, const TCHAR* WhatCallersSee,
+		const TSharedRef<FJsonObject>& R, TArray<FString>& Warnings)
+	{
+		UPackage* Pkg = Script ? Script->GetOutermost() : nullptr;
+		if (!Pkg) return;
+
+		// An embedded scratch-pad / event / sim-stage script is not its package's asset, so the
+		// referencer graph would answer about the OWNING system instead — a different question.
+		const bool bEmbedded = !(Script->GetOuter() == Pkg && Script->HasAnyFlags(RF_Public | RF_Standalone));
+		if (bEmbedded)
+		{
+			R->SetBoolField(TEXT("embedded_script"), true);
+			Warnings.Add(FString::Printf(TEXT(
+				"PLACED CALLER: '%s' is EMBEDDED in '%s' (scratch-pad / event / simulation-stage script), so its one "
+				"caller is that asset and it is placed by definition. %s does not update the placed call — %s "
+				"Re-open that system and check the module in the stack."),
+				*ScriptPath, *Pkg->GetName(), WhatChanged, WhatCallersSee));
+			return;
+		}
+
+		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		TArray<FName> Referencers;
+		AR.GetReferencers(FName(*Pkg->GetName()), Referencers);
+
+		R->SetNumberField(TEXT("referencing_package_count"), Referencers.Num());
+		if (Referencers.Num() == 0)
+		{
+			R->SetStringField(TEXT("placed_callers_note"), TEXT(
+				"The asset registry lists no package referencing this script, so there should be no placed caller to go "
+				"stale. That is an asset-registry answer, not a traversal — an unsaved system open in the editor would "
+				"not appear."));
+			return;
+		}
+
+		TArray<TSharedPtr<FJsonValue>> RefArr;
+		TArray<FString> Shown;
+		for (const FName& Ref : Referencers)
+		{
+			RefArr.Add(MakeShared<FJsonValueString>(Ref.ToString()));
+			if (Shown.Num() < 6) Shown.Add(Ref.ToString());
+		}
+		R->SetArrayField(TEXT("referencing_packages"), RefArr);
+
+		Warnings.Add(FString::Printf(TEXT(
+			"PLACED CALLERS: %d package(s) reference this script (%s%s). %s does NOT update a placed module node — it "
+			"keeps the pins it was built with, so %s No action refreshes a placed caller today (gap #62: saving, "
+			"re-opening the system editor and toggling the module's enabled flag were all measured and all failed). The "
+			"only remedy known to work is the engine's own remove-and-re-add — remove_module then add_module on each "
+			"placed instance — and that DISCARDS every non-default value set on it, which is precisely the I-19 churn "
+			"this action exists to avoid. Open each system and check its stack. find_niagara_references on this script "
+			"lists them all; that list is the asset-registry package graph, so it is a superset — a referencing package "
+			"is not proof of a placed call."),
+			Referencers.Num(),
+			*FString::Join(Shown, TEXT(", ")),
+			Referencers.Num() > Shown.Num() ? *FString::Printf(TEXT(", +%d more"), Referencers.Num() - Shown.Num()) : TEXT(""),
+			WhatChanged, WhatCallersSee));
+	}
+
+	/** Attach collected advisories to a response under the usual key. */
+	static void AttachWarnings(const TSharedRef<FJsonObject>& R, const TArray<FString>& Warnings)
+	{
+		if (Warnings.Num() == 0) return;
+		TArray<TSharedPtr<FJsonValue>> Arr;
+		for (const FString& W : Warnings) Arr.Add(MakeShared<FJsonValueString>(W));
+		R->SetArrayField(TEXT("warnings"), Arr);
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	using namespace MonolithNiagaraParamPins;
+	using namespace MonolithNiagaraIOSurgery;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	const FString ParamName = Params->GetStringField(TEXT("parameter"));
+	const FString NewName   = Params->HasField(TEXT("new_name")) ? Params->GetStringField(TEXT("new_name")).TrimStartAndEnd() : FString();
+
+	// --- everything below refuses BEFORE the transaction opens (gap #36) --------------------
+	if (ParamName.IsEmpty() || NewName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"Both 'parameter' (the current name) and 'new_name' are required. NOTHING WAS CHANGED."));
+	}
+
+	bool bAllowMerge = false;
+	FString BoolError;
+	if (!ReadStrictBool(Params, TEXT("allow_merge"), false, bAllowMerge, BoolError))
+	{
+		return FMonolithActionResult::Error(BoolError);
+	}
+
+	// A rename that only changes CASE is not a rename. FName comparison is case-insensitive, so
+	// UNiagaraGraph::RenameParameter's first line — `if (Parameter.GetName() == NewName) return true;`
+	// (NiagaraGraph.cpp:2791-2792) — early-outs and reports SUCCESS having changed nothing. Refuse
+	// it here rather than ship that lie.
+	if (FName(*ParamName) == FName(*NewName))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' -> '%s' is not a rename this path can perform: FName comparison is case-INSENSITIVE, so "
+			     "UNiagaraGraph::RenameParameter early-outs at NiagaraGraph.cpp:2791-2792 and returns success without "
+			     "touching anything. %s NOTHING WAS CHANGED."),
+			*ParamName, *NewName,
+			ParamName.Equals(NewName, ESearchCase::CaseSensitive)
+				? TEXT("The two names are identical.")
+				: TEXT("They differ only in capitalisation, which the engine treats as the same name.")));
+	}
+
+	// --- locate the exact registry key -----------------------------------------------------
+	TArray<FNiagaraVariable> Keys;
+	TArray<UNiagaraScriptVariable*> Vars;
+	FindRegistryEntriesByName(Graph, ParamName, Keys, Vars);
+
+	if (Keys.Num() == 0)
+	{
+		const FString CaseHint = FindCaseInsensitiveMatch(Graph, ParamName);
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No script parameter '%s'.%s Known: %s"),
+			*ParamName,
+			CaseHint.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" Did you mean '%s'? (the match here is case-sensitive)"), *CaseHint),
+			*ListKnownParameters(Graph)));
+	}
+	if (Keys.Num() > 1)
+	{
+		TArray<FString> Types;
+		for (const FNiagaraVariable& K : Keys) Types.Add(K.GetType().GetName());
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is registered %d times, under types [%s]. A rename is keyed on (type, name), so there is no "
+			     "defensible way to pick one. Sweep the stale entry with remove_script_parameter first. "
+			     "NOTHING WAS CHANGED."),
+			*ParamName, Keys.Num(), *FString::Join(Types, TEXT(", "))));
+	}
+
+	const FNiagaraVariable OldKey = Keys[0];
+	UNiagaraScriptVariable* SV = Vars[0];
+	const FNiagaraTypeDefinition ParamType = OldKey.GetType();
+
+	// Interlock 1: static switch parameters. The engine refuses this exact rename itself —
+	// RenameParameter returns false for a static switch variable unless the request came FROM the
+	// switch (NiagaraGraph.cpp:2814-2819) — and it does so AFTER calling Modify(), i.e. letting it
+	// fail would dirty the package for nothing.
+	if (SV->GetIsStaticSwitch())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is a STATIC SWITCH parameter. UNiagaraGraph::RenameParameter refuses these unless the request "
+			     "comes from the switch node itself (NiagaraGraph.cpp:2814-2819), and the engine's own route for it, "
+			     "UNiagaraGraph::RenameStaticSwitch (NiagaraGraph.h:404), carries no export macro so it cannot be "
+			     "called from here. There is no action that renames a static switch today. NOTHING WAS CHANGED."),
+			*ParamName));
+	}
+
+	// Interlock 2: is the destination name taken?
+	//   * same type  -> RenameParameter MERGES: the target's metadata wins and this parameter's is
+	//                   discarded (NiagaraGraph.cpp:2859-2874). Opt-in only.
+	//   * other type -> RenameParameter's merge lookup is keyed on (OLD type, new name), so it does
+	//                   NOT see the clash: it would add a SECOND entry under the same name with a
+	//                   different type. Always refused — that state breaks every by-name lookup,
+	//                   including this action's own.
+	TArray<FNiagaraVariable> DestKeys;
+	TArray<UNiagaraScriptVariable*> DestVars;
+	FindRegistryEntriesByName(Graph, NewName, DestKeys, DestVars);
+
+	bool bWillMerge = false;
+	for (const FNiagaraVariable& DestKey : DestKeys)
+	{
+		if (DestKey.GetType() == ParamType)
+		{
+			bWillMerge = true;
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' already exists with type '%s'; '%s' is '%s'. RenameParameter looks its merge target up as "
+				     "(old type, new name) (NiagaraGraph.cpp:2823), so it would NOT merge them — it would leave two "
+				     "parameters sharing one name under two types, which breaks every by-name lookup including this "
+				     "action's. Rename to a free name, or retype one of them first with set_script_parameter_type. "
+				     "NOTHING WAS CHANGED."),
+				*NewName, *DestKey.GetType().GetName(), *ParamName, *ParamType.GetName()));
+		}
+	}
+
+	TArray<FParamReference> DestRefs;
+	CollectParameterReferences(Graph, NewName, DestRefs);
+	if ((bWillMerge || DestRefs.Num() > 0) && !bAllowMerge)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is already in use in this script%s%s, so this rename would MERGE the two: the pins that carry "
+			     "'%s' would be repointed at it, the TARGET's metadata (description, default mode, widget limits) would "
+			     "be kept and the metadata on '%s' DISCARDED (NiagaraGraph.cpp:2859-2874). That is often what you want when "
+			     "consolidating duplicates and never what you want by accident. Pass allow_merge=true to proceed, or "
+			     "pick a free name. NOTHING WAS CHANGED."),
+			*NewName,
+			bWillMerge ? TEXT(" as a registered parameter of the same type") : TEXT(""),
+			DestRefs.Num() > 0 ? *FString::Printf(TEXT(" (referenced by: %s)"), *SummarizeReferences(DestRefs)) : TEXT(""),
+			*ParamName, *ParamName));
+	}
+
+	// Pre-flight the save target while the asset is still untouched (gap #26b ordering).
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to edit '%s': the result could not be saved. %s NOTHING WAS CHANGED."), *ScriptPath, *PreflightError));
+		}
+	}
+
+	TArray<FString> Warnings;
+
+	// A name with no namespace is legal and is very rarely what was meant: 'Amount' and
+	// 'Module.Amount' are two different parameters, and only the namespaced one is a module input.
+	// Warn rather than refuse — Local.* and reserved engine names are legitimate targets too.
+	if (!NewName.Contains(TEXT(".")))
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"'%s' has no namespace. Unlike the pin-creation path, a graph-level rename does NOT auto-namespace "
+			"(UNiagaraNodeParameterMapGet::CreateDefaultPin does that, NiagaraNodeParameterMapGet.cpp:104-108), so this "
+			"is now a bare parameter, not a module input. If you meant a module input, rename it again to 'Module.%s'."),
+			*NewName, *NewName));
+	}
+
+	// What the pins looked like before, so the response can report what actually moved.
+	TArray<FParamReference> RefsBefore;
+	CollectParameterReferences(Graph, ParamName, RefsBefore);
+
+	// --- apply ------------------------------------------------------------------------------
+	// RenameParameter does its own Modify() (NiagaraGraph.cpp:2803) and its own NotifyGraphChanged
+	// (:2883), and renames every referencing pin through CommitEditablePinName
+	// (FixupReferenceCollectionsPostRename, :2748-2781). Nothing else needs doing here — which is
+	// the whole point of gap #7 being three thin actions.
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "RenameScriptParam", "Rename Niagara Script Parameter"));
+	bool bMerged = false;
+	const bool bRenamed = Graph->RenameParameter(OldKey, FName(*NewName), /*bRenameRequestedFromStaticSwitch=*/false,
+		&bMerged, /*bSuppressEvents=*/false);
+	GEditor->EndTransaction();
+
+	if (!bRenamed)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("UNiagaraGraph::RenameParameter refused '%s' -> '%s' and every condition it refuses on was checked "
+			     "first, so the graph is in an unexpected state — report this. The only remaining path is the "
+			     "re-entrancy guard bIsRenamingParameter (NiagaraGraph.cpp:2795-2798). The package may have been "
+			     "dirtied; inspect the parameter with get_script_parameters before doing anything else."),
+			*ParamName, *NewName));
+	}
+
+	Graph->NotifyGraphChanged();
+	Graph->ConditionalRefreshParameterReferences();
+	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	// --- verify off the GRAPH, not off the request (defect pattern 2) -----------------------
+	TArray<FNiagaraVariable> NewKeys;
+	TArray<UNiagaraScriptVariable*> NewVars;
+	FindRegistryEntriesByName(Graph, NewName, NewKeys, NewVars);
+
+	TArray<FNiagaraVariable> LeftoverKeys;
+	TArray<UNiagaraScriptVariable*> LeftoverVars;
+	FindRegistryEntriesByName(Graph, ParamName, LeftoverKeys, LeftoverVars);
+
+	TArray<FParamReference> RefsAfterNew, RefsAfterOld;
+	CollectParameterReferences(Graph, NewName, RefsAfterNew);
+	CollectParameterReferences(Graph, ParamName, RefsAfterOld);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("parameter"), ParamName);
+	R->SetStringField(TEXT("new_name"), NewName);
+	R->SetStringField(TEXT("type"), NewKeys.Num() > 0 ? NewKeys[0].GetType().GetName() : ParamType.GetName());
+	R->SetBoolField(TEXT("merged_with_existing_parameter"), bMerged);
+	R->SetBoolField(TEXT("new_name_registered"), NewKeys.Num() > 0);
+	R->SetBoolField(TEXT("old_name_registered"), LeftoverKeys.Num() > 0);
+	R->SetNumberField(TEXT("pins_before"), RefsBefore.Num());
+	R->SetNumberField(TEXT("pins_now_carrying_new_name"), RefsAfterNew.Num());
+	R->SetNumberField(TEXT("pins_still_carrying_old_name"), RefsAfterOld.Num());
+
+	TArray<TSharedPtr<FJsonValue>> RefArr;
+	for (const FParamReference& Ref : RefsAfterNew) RefArr.Add(MakeShared<FJsonValueObject>(ParamReferenceToJson(Ref)));
+	R->SetArrayField(TEXT("references"), RefArr);
+
+	if (LeftoverKeys.Num() > 0 || RefsAfterOld.Num() > 0)
+	{
+		// Not expected on any path: FixupReferenceCollectionsPostRename renames every pin the
+		// reference map knows about. Report it as an anomaly instead of asserting the happy case.
+		Warnings.Add(FString::Printf(TEXT(
+			"INCOMPLETE RENAME: '%s' still has %d registry entr%s and %d pin reference(s) after the rename (%s). The "
+			"reference map may have been stale. Re-read with get_script_parameters and list_graph_node_pins before "
+			"trusting this script."),
+			*ParamName, LeftoverKeys.Num(), LeftoverKeys.Num() == 1 ? TEXT("y") : TEXT("ies"),
+			RefsAfterOld.Num(), *SummarizeReferences(RefsAfterOld)));
+	}
+	if (bMerged)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"MERGED: '%s' no longer exists as its own parameter — its pins now carry '%s' and use THAT parameter's "
+			"metadata (description, default mode, min/max). The metadata that was on '%s' is gone."),
+			*ParamName, *NewName, *ParamName));
+	}
+
+	AppendPlacedCallerWarning(Script, ScriptPath,
+		TEXT("A rename"),
+		TEXT("a placed module keeps an input pin named after the OLD parameter, which nothing in the script writes any "
+		     "more — a dead read that compiles clean and returns a default forever, and any value set on it in the "
+		     "stack is silently orphaned."),
+		R, Warnings);
+
+	AttachWarnings(R, Warnings);
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
+	return NA_SuccessObj(R);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleRemoveMapParameterPin(const TSharedPtr<FJsonObject>& Params)
+{
+#if !WITH_NIAGARA_WIZARD_PRIVATE
+	return FMonolithActionResult::Error(TEXT("remove_map_parameter_pin requires WITH_NIAGARA_WIZARD_PRIVATE=1 (the engine-private ParameterMapGet/Set node classes); unavailable in release builds."));
+#else
+	using namespace MonolithNiagaraGraphAuthoring;
+	using namespace MonolithNiagaraParamPins;
+	using namespace MonolithNiagaraIOSurgery;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveScriptGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	// --- everything below refuses BEFORE the transaction opens (gap #36) --------------------
+	const FString NodeGuidStr = Params->HasField(TEXT("node_guid")) ? Params->GetStringField(TEXT("node_guid")) : FString();
+	UEdGraphNode* Node = NodeGuidStr.IsEmpty() ? nullptr : FindNodeByGuid(Graph, NodeGuidStr);
+	if (!Node)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("node_guid '%s' not found in '%s'. NOTHING WAS CHANGED."), *NodeGuidStr, *ScriptPath));
+	}
+
+	const FString ParamName = Params->HasField(TEXT("parameter")) ? Params->GetStringField(TEXT("parameter")) : FString();
+	if (ParamName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"'parameter' is required: the name of the pin to remove, exactly as list_graph_node_pins reports it. "
+			"NOTHING WAS CHANGED."));
+	}
+
+	bool bBreakLinks = false;
+	FString BoolError;
+	if (!ReadStrictBool(Params, TEXT("break_links"), false, bBreakLinks, BoolError))
+	{
+		return FMonolithActionResult::Error(BoolError);
+	}
+
+	UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
+	UNiagaraNodeParameterMapSet* SetNode = Cast<UNiagaraNodeParameterMapSet>(Node);
+	if (!GetNode && !SetNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node is a %s — remove_map_parameter_pin only applies to ParameterMapGet / ParameterMapSet nodes. To "
+			     "delete a whole node use remove_graph_node. NOTHING WAS CHANGED."),
+			*Node->GetClass()->GetName()));
+	}
+
+	// A MapGet carries its parameters on OUTPUT pins and a MapSet on INPUT pins — the same
+	// direction split add_map_parameter_pin creates them on.
+	const EEdGraphPinDirection PinDir = GetNode ? EGPD_Output : EGPD_Input;
+	const TCHAR* Kind = GetNode ? TEXT("read") : TEXT("write");
+
+	UEdGraphPin* Pin = FindPinByName(Node, ParamName, PinDir);
+	if (!Pin)
+	{
+		// Naming a pin that exists in the OTHER direction is the common mistake, and on a MapGet it
+		// is specifically the paired DEFAULT pin — which the engine will not let you remove on its
+		// own (UNiagaraNodeParameterMapGet::CanModifyPin refuses every input pin,
+		// NiagaraNodeParameterMapGet.cpp:201-209) and which goes automatically with its output pin.
+		UEdGraphPin* Opposite = FindPinByName(Node, ParamName, PinDir == EGPD_Output ? EGPD_Input : EGPD_Output);
+		TArray<FString> Available;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (P && P->Direction == PinDir && !P->PinName.ToString().IsEmpty()) Available.Add(P->PinName.ToString());
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No %s pin named '%s' on this %s.%s Available %s pins: [%s]. The match is CASE-SENSITIVE. "
+			     "NOTHING WAS CHANGED."),
+			PinDir == EGPD_Output ? TEXT("output") : TEXT("input"),
+			*ParamName, *Node->GetClass()->GetName(),
+			Opposite != nullptr
+				? TEXT(" A pin of that name exists in the OTHER direction; on a ParameterMapGet that is the paired "
+				       "default-value pin, which cannot be removed on its own — remove the output pin and the engine "
+				       "takes the default pin with it.")
+				: TEXT(""),
+			PinDir == EGPD_Output ? TEXT("output") : TEXT("input"),
+			*FString::Join(Available, TEXT(", "))));
+	}
+
+	// Re-derived rather than called: UNiagaraNodeWithDynamicPins::CanRemovePin is PROTECTED
+	// (NiagaraNodeWithDynamicPins.h:82) and both IsAddPin and AddPinSubCategory are unexported, so
+	// the engine's own admission test cannot be invoked from here. These are its two clauses:
+	//   CanModifyPin := !IsAddPin(Pin) && !IsParameterMapPin(Pin)   (NiagaraNodeWithDynamicPins.cpp:152-160)
+	//   CanRemovePin := CanModifyPin(Pin) && !IsExecPin(Pin)        (:167-170)
+	// IsExecPin and IsParameterMapPin both reduce to "a ParameterMap-typed pin", which the type
+	// test below covers for either spelling.
+	if (Pin->PinType.PinCategory == UEdGraphSchema_Niagara::PinCategoryMisc
+		&& Pin->PinType.PinSubCategory == FName(TEXT("DynamicAddPin")))   // AddPinSubCategory, NiagaraNodeWithDynamicPins.cpp:23
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"That is the node's ADD pin, not a parameter pin — the engine's own CanModifyPin refuses it "
+			"(NiagaraNodeWithDynamicPins.cpp:152-160). NOTHING WAS CHANGED."));
+	}
+	if (UEdGraphSchema_Niagara::PinToTypeDefinition(Pin) == FNiagaraTypeDefinition::GetParameterMapDef())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"That pin is the PARAMETER MAP itself (the map chain in/out), not a parameter. Removing it would cut the "
+			"node out of the map history and every read through it would silently return defaults. The engine refuses "
+			"the same removal (CanRemovePin -> IsExecPin, NiagaraNodeWithDynamicPins.cpp:146-170). NOTHING WAS CHANGED."));
+	}
+
+	// Connections. Removing a connected pin silently unwires whatever fed or consumed it, so the
+	// default is to refuse and NAME the links rather than let that happen quietly.
+	TArray<TSharedPtr<FJsonValue>> LinkRows;
+	TArray<FString> LinkText;
+	DescribeLinks(Pin, LinkRows, LinkText);
+	if (LinkText.Num() > 0 && !bBreakLinks)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Pin '%s' is still connected to %d pin(s): %s. Removing it would break those links. Pass "
+			     "break_links=true to do it anyway, or disconnect them first with disconnect_graph_pins. "
+			     "NOTHING WAS CHANGED."),
+			*ParamName, LinkText.Num(), *FString::Join(LinkText, TEXT("; "))));
+	}
+
+	// Pre-flight the save target while the asset is still untouched (gap #26b ordering).
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to edit '%s': the result could not be saved. %s NOTHING WAS CHANGED."), *ScriptPath, *PreflightError));
+		}
+	}
+
+	const FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
+	const bool bWasOrphaned = Pin->bOrphanedPin;
+
+	// Snapshot every pin on the node, so what was removed is reported as a DIFF of the node rather
+	// than as an assumption. UNiagaraNodeParameterMapGet::GetDefaultPin would answer the "was there
+	// a paired default pin?" question directly, but it is a non-exported member of a class with no
+	// API macro and would not link — and the diff is better evidence anyway.
+	TMap<FString, FString> PinsBefore;   // "guid" -> "name (direction)"
+	for (UEdGraphPin* P : Node->Pins)
+	{
+		if (!P) continue;
+		PinsBefore.Add(P->PinId.ToString(), FString::Printf(TEXT("%s (%s)"),
+			*P->PinName.ToString(), P->Direction == EGPD_Input ? TEXT("input") : TEXT("output")));
+	}
+
+	// --- apply ------------------------------------------------------------------------------
+	// UEdGraphNode::RemovePin (EdGraphNode.h:623, ENGINE_API) Modify()s the node, drops the pin and
+	// then fires OnPinRemoved (EdGraphNode.cpp:464-485). On a ParameterMapGet that override removes
+	// the paired default-value input pin AND clears the output->default guid map
+	// (NiagaraNodeParameterMapGet.cpp:175-199) — it also deliberately keeps the default pin when the
+	// removed pin was ORPHANED. That is the engine's own context-menu removal reproduced exactly;
+	// UNiagaraNodeWithDynamicPins::RemoveDynamicPin, the menu's entry point, is protected and
+	// unexported, and its MapGet override removes the default pin FIRST, which means OnPinRemoved
+	// can no longer find the pair and the guid-map entry is left behind (:269-281). Going through
+	// RemovePin is therefore not a workaround — it is the tidier of the two engine paths.
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "RemoveMapPin", "Remove Map Parameter Pin"));
+	Graph->Modify();
+	Node->Modify();
+	if (LinkText.Num() > 0) Pin->BreakAllPinLinks();
+	const bool bRemoved = Node->RemovePin(Pin);
+	Pin = nullptr;   // MarkAsGarbage'd by RemovePin — never touch it again
+	if (UNiagaraNode* NN = Cast<UNiagaraNode>(Node)) NN->MarkNodeRequiresSynchronization(TEXT("MonolithRemoveMapPin"), true);
+	Graph->NotifyGraphChanged();
+	GEditor->EndTransaction();
+
+	if (!bRemoved)
+	{
+		Graph->ConditionalRefreshParameterReferences();
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("UEdGraphNode::RemovePin returned false for '%s' — the pin was not in the node's pin array (a "
+			     "sub-pin of a split pin behaves this way). The package may have been dirtied and any links were "
+			     "already broken; re-read the node with list_graph_node_pins before doing anything else."),
+			*ParamName));
+	}
+
+	Graph->ConditionalRefreshParameterReferences();
+	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	// --- verify off the NODE, not off the request (defect pattern 2) ------------------------
+	TArray<TSharedPtr<FJsonValue>> RemovedArr;
+	TArray<FString> RemovedText;
+	{
+		TSet<FString> StillPresent;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (P) StillPresent.Add(P->PinId.ToString());
+		}
+		for (const TPair<FString, FString>& Before : PinsBefore)
+		{
+			if (!StillPresent.Contains(Before.Key))
+			{
+				RemovedArr.Add(MakeShared<FJsonValueString>(Before.Value));
+				RemovedText.Add(Before.Value);
+			}
+		}
+	}
+	const bool bNameGone = (FindPinByName(Node, ParamName, PinDir) == nullptr);
+
+	TArray<FString> Warnings;
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+	R->SetStringField(TEXT("kind"), Kind);
+	R->SetStringField(TEXT("pin"), ParamName);
+	R->SetStringField(TEXT("type"), PinType.IsValid() ? PinType.GetName() : TEXT("<unresolved>"));
+	R->SetBoolField(TEXT("was_orphaned_pin"), bWasOrphaned);
+	R->SetBoolField(TEXT("links_broken"), LinkText.Num() > 0);
+	R->SetNumberField(TEXT("links_broken_count"), LinkText.Num());
+	R->SetArrayField(TEXT("broken_links"), LinkRows);
+	R->SetNumberField(TEXT("pins_before"), PinsBefore.Num());
+	R->SetNumberField(TEXT("pins_after"), Node->Pins.Num());
+	R->SetArrayField(TEXT("pins_removed"), RemovedArr);
+	R->SetBoolField(TEXT("pin_gone"), bNameGone);
+
+	if (!bNameGone)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"A %s pin named '%s' is STILL on this node after the removal — the node carried more than one. Re-read "
+			"with list_graph_node_pins."),
+			PinDir == EGPD_Output ? TEXT("output") : TEXT("input"), *ParamName));
+	}
+	if (GetNode && !bWasOrphaned && RemovedText.Num() < 2)
+	{
+		// Expected shape on a MapGet is 2 (the parameter pin + its paired default pin). Fewer means
+		// the pair guid map did not know about a default pin — worth saying, never worth asserting.
+		Warnings.Add(FString::Printf(TEXT(
+			"Only %d pin was removed. A ParameterMapGet read pin normally takes its paired default-value input pin "
+			"with it (NiagaraNodeParameterMapGet.cpp:178-186); this one had no registered pair, so check the node for "
+			"a leftover unnamed input pin."),
+			RemovedText.Num()));
+	}
+
+	// The registry entry is deliberately untouched — this action removes a PIN. Say what state the
+	// parameter is in now, and only name the follow-up call when that call would actually work
+	// (defect pattern 5).
+	TArray<FParamReference> RefsAfter;
+	CollectParameterReferences(Graph, ParamName, RefsAfter);
+	TArray<FNiagaraVariable> RegKeys;
+	TArray<UNiagaraScriptVariable*> RegVars;
+	FindRegistryEntriesByName(Graph, ParamName, RegKeys, RegVars);
+
+	R->SetBoolField(TEXT("parameter_still_registered"), RegKeys.Num() > 0);
+	R->SetNumberField(TEXT("remaining_references"), RefsAfter.Num());
+	if (RegKeys.Num() > 0 && RefsAfter.Num() == 0)
+	{
+		R->SetStringField(TEXT("note"), FString::Printf(TEXT(
+			"The pin is gone; '%s' is still in the script's parameter registry with no pin referencing it. That is "
+			"harmless (it keeps its metadata and can be re-pinned with add_map_parameter_pin existing=true). To sweep "
+			"it entirely: remove_script_parameter — which will now succeed, since it refuses only while references "
+			"remain and there are none."), *ParamName));
+	}
+	else if (RegKeys.Num() > 0)
+	{
+		R->SetStringField(TEXT("note"), FString::Printf(TEXT(
+			"The pin is gone but '%s' is still referenced by %d other pin/node(s): %s. The parameter stays registered, "
+			"and remove_script_parameter would (correctly) refuse while those remain."),
+			*ParamName, RefsAfter.Num(), *SummarizeReferences(RefsAfter)));
+	}
+	else
+	{
+		R->SetStringField(TEXT("note"), FString::Printf(TEXT(
+			"The pin is gone and '%s' has no registry entry either — nothing left to sweep."), *ParamName));
+	}
+
+	// Removing a READ pin removes a module input from the script's stack surface, which is a
+	// surface change like a rename. Removing a WRITE pin removes an output the rest of the stack
+	// may be reading — worth the same warning for a different reason.
+	AppendPlacedCallerWarning(Script, ScriptPath,
+		GetNode ? TEXT("Removing a read pin") : TEXT("Removing a write pin"),
+		GetNode
+			? TEXT("a placed module keeps the input pin for a parameter this script no longer reads, and any value set "
+			       "on it in the stack is now inert.")
+			: TEXT("anything downstream that read the parameter this pin used to write now falls back to a default, "
+			       "which compiles clean and is silent at runtime."),
+		R, Warnings);
+
+	AttachWarnings(R, Warnings);
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
+	return NA_SuccessObj(R);
+#endif
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptParameterType(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraParamMeta;
+	using namespace MonolithNiagaraParamPins;
+	using namespace MonolithNiagaraIOSurgery;
+
+	UNiagaraScript* Script = nullptr; FString ScriptPath, Err;
+	UNiagaraGraph* Graph = ResolveGraph(Params, Script, ScriptPath, Err);
+	if (!Graph) return FMonolithActionResult::Error(Err);
+
+	// --- everything below refuses BEFORE the transaction opens (gap #36) --------------------
+	const FString ParamName = Params->HasField(TEXT("parameter")) ? Params->GetStringField(TEXT("parameter")) : FString();
+	const FString TypeStr   = Params->HasField(TEXT("type")) ? Params->GetStringField(TEXT("type")).TrimStartAndEnd() : FString();
+	if (ParamName.IsEmpty() || TypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"Both 'parameter' and 'type' are required. NOTHING WAS CHANGED."));
+	}
+
+	bool bAllowOrphanedPins = true;
+	FString BoolError;
+	if (!ReadStrictBool(Params, TEXT("allow_orphaned_pins"), true, bAllowOrphanedPins, BoolError))
+	{
+		return FMonolithActionResult::Error(BoolError);
+	}
+
+	// 'enum_path' is add_map_parameter_pin's spelling for an enum type, and enums are refused here
+	// (see the target-type filter below). Answer the question the caller actually asked rather than
+	// letting an unknown field be ignored.
+	if (Params->HasField(TEXT("enum_path")))
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"'enum_path' is not accepted by set_script_parameter_type: enum types are refused as a retype target, the "
+			"same way the editor's own Change Type submenu filters them out (NiagaraParameterPanelViewModel.cpp:594, "
+			"\"only allow basic types for now\"). Build an enum-typed pin with add_map_parameter_pin's enum_path "
+			"instead. NOTHING WAS CHANGED."));
+	}
+
+	// --- locate the exact registry key -----------------------------------------------------
+	TArray<FNiagaraVariable> Keys;
+	TArray<UNiagaraScriptVariable*> Vars;
+	FindRegistryEntriesByName(Graph, ParamName, Keys, Vars);
+
+	if (Keys.Num() == 0)
+	{
+		const FString CaseHint = FindCaseInsensitiveMatch(Graph, ParamName);
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No script parameter '%s'.%s Known: %s"),
+			*ParamName,
+			CaseHint.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" Did you mean '%s'? (the match here is case-sensitive)"), *CaseHint),
+			*ListKnownParameters(Graph)));
+	}
+	if (Keys.Num() > 1)
+	{
+		TArray<FString> Types;
+		for (const FNiagaraVariable& K : Keys) Types.Add(K.GetType().GetName());
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is registered %d times, under types [%s]. ChangeParameterType is keyed on (type, name), so "
+			     "there is no defensible way to pick one. Sweep the stale entry with remove_script_parameter first. "
+			     "NOTHING WAS CHANGED."),
+			*ParamName, Keys.Num(), *FString::Join(Types, TEXT(", "))));
+	}
+
+	const FNiagaraVariable OldKey = Keys[0];
+	UNiagaraScriptVariable* SV = Vars[0];
+	const FNiagaraTypeDefinition OldType = OldKey.GetType();
+
+	// --- the engine's OWN admission rules, re-derived ----------------------------------------
+	// INiagaraParameterPanelViewModel::GetCanChangeParameterType (NiagaraParameterPanelViewModel.cpp:547-584)
+	// is what greys the editor's Change Type menu out. It is not exported (and takes panel items we
+	// do not have), so its three refusals are reproduced here rather than guessed at.
+	if (SV->GetIsStaticSwitch())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is a STATIC SWITCH parameter; its type is owned by the switch node's SwitchTypeData, not by the "
+			     "registry. ChangeParameterType only walks UNiagaraNodeParameterMapBase nodes (NiagaraGraph.cpp:820-821), "
+			     "so it would retype the registry entry and leave the switch node declaring the old type — and the graph "
+			     "re-registers switch parameters from their nodes, so the change would not even survive. The editor "
+			     "refuses this too (\"A parameter is a static switch parameter and its type cannot be changed here\"). "
+			     "Delete and re-add the switch with add_graph_node instead. NOTHING WAS CHANGED."),
+			*ParamName));
+	}
+	if (OldType.IsStatic())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is a STATIC parameter (type '%s'); the editor refuses to change its type "
+			     "(NiagaraParameterPanelViewModel.cpp:567-571) and so does this. NOTHING WAS CHANGED."),
+			*ParamName, *OldType.GetName()));
+	}
+	if (SV->GetIsSubscribedToParameterDefinitions())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is subscribed to a Parameter Definition, which owns its type — the editor refuses the change and "
+			     "directs you to the definitions asset (NiagaraParameterPanelViewModel.cpp:573-577). Change it there. "
+			     "NOTHING WAS CHANGED."),
+			*ParamName));
+	}
+
+	// --- target type -------------------------------------------------------------------------
+	bool bFellBack = false;
+	const FNiagaraTypeDefinition NewType = ResolveNiagaraType(TypeStr, &bFellBack);
+	if (bFellBack)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown Niagara type '%s'. Valid targets here: float, int, bool, vec2, vec3, vec4, color, position, "
+			     "quat, matrix. NOTHING WAS CHANGED."), *TypeStr));
+	}
+
+	// The editor's Change Type submenu offers ONLY basic types — it filters out data interfaces,
+	// enums, UObjects, registered payload types and internal types with the comment "only allow
+	// basic types for now" (NiagaraParameterPanelViewModel.cpp:588-599). ChangeParameterType would
+	// happily accept them; the retyped pins would then be things the stack has no editor for. Same
+	// filter, same reason, said out loud.
+	{
+		const TCHAR* Excluded = nullptr;
+		if (NewType.IsDataInterface())   Excluded = TEXT("a DATA INTERFACE type");
+		else if (NewType.IsEnum())       Excluded = TEXT("an ENUM type");
+		else if (NewType.IsUObject())    Excluded = TEXT("a UObject type");
+		else if (NewType.IsInternalType()) Excluded = TEXT("an INTERNAL type (parameter map and friends)");
+		else if (FNiagaraTypeRegistry::GetRegisteredPayloadTypes().Contains(NewType)) Excluded = TEXT("a registered PAYLOAD type");
+
+		if (Excluded)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' resolves to %s, which the editor's own Change Type submenu filters out "
+				     "(NiagaraParameterPanelViewModel.cpp:588-599, \"only allow basic types for now\"). Retyping onto it "
+				     "would produce pins the stack cannot edit. Delete the parameter's pins and re-create them with "
+				     "add_map_parameter_pin, which builds data-interface and enum pins properly. NOTHING WAS CHANGED."),
+				*TypeStr, Excluded));
+		}
+	}
+
+	if (NewType == OldType)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is already of type '%s'. ChangeParameterType would still Modify() the graph and broadcast a "
+			     "change, so this is refused rather than reported as a no-op success that dirtied the package. "
+			     "NOTHING WAS CHANGED."),
+			*ParamName, *OldType.GetName()));
+	}
+
+	// Pre-flight the save target while the asset is still untouched (gap #26b ordering).
+	{
+		UPackage* PreflightPkg = nullptr;
+		UObject* PreflightAsset = nullptr;
+		bool bPreflightEmbedded = false;
+		FString PreflightFilename, PreflightError;
+		if (!NA_ResolveSaveTarget(Script, PreflightPkg, PreflightAsset, bPreflightEmbedded, PreflightFilename, PreflightError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing to edit '%s': the result could not be saved. %s NOTHING WAS CHANGED."), *ScriptPath, *PreflightError));
+		}
+	}
+
+	TArray<FString> Warnings;
+	if (OldType.IsDataInterface() || OldType.IsEnum() || OldType.IsUObject())
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"'%s' was a %s ('%s'). Retyping AWAY from one is a one-way door through this action: the same filter that "
+			"refuses those as targets means you cannot retype back. Verify the graph before saving anything else."),
+			*ParamName,
+			OldType.IsDataInterface() ? TEXT("data interface") : (OldType.IsEnum() ? TEXT("enum") : TEXT("UObject")),
+			*OldType.GetName()));
+	}
+	if (!bAllowOrphanedPins)
+	{
+		Warnings.Add(TEXT(
+			"allow_orphaned_pins=false: ChangeParameterType only disconnects a link while building its orphan "
+			"replacement (NiagaraGraph.cpp:877-943), so with orphans off, connections that no longer typecheck are NOT "
+			"broken — they stay wired at mismatched types. The editor's script toolkit passes true "
+			"(NiagaraParameterPanelViewModel.cpp:2907). Check every link on the retyped pins."));
+	}
+
+	TArray<FParamReference> RefsBefore;
+	CollectParameterReferences(Graph, ParamName, RefsBefore);
+	TSet<FString> OrphansBefore;
+	CollectOrphanedPinKeys(Graph, OrphansBefore);
+
+	// --- apply ------------------------------------------------------------------------------
+	// ChangeParameterType does its own Modify() (NiagaraGraph.cpp:817), retypes every parameter pin
+	// AND its paired default pin, preserves the connections that still typecheck, orphans the rest,
+	// re-keys VariableToScriptVariable and fixes the parameter reference map (:1023-1050). The
+	// editor's script toolkit wraps it in exactly this shape — Graph->Modify() then the call with
+	// bAllowOrphanedPins=true (NiagaraParameterPanelViewModel.cpp:2891-2908).
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetScriptParamType", "Change Niagara Script Parameter Type"));
+	Graph->Modify();
+	Graph->ChangeParameterType({ OldKey }, NewType, bAllowOrphanedPins);
+	Graph->NotifyGraphChanged();
+	GEditor->EndTransaction();
+
+	Graph->ConditionalRefreshParameterReferences();
+	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	// --- verify off the GRAPH, not off the request (defect pattern 2) -----------------------
+	TArray<FNiagaraVariable> NewKeys;
+	TArray<UNiagaraScriptVariable*> NewVars;
+	FindRegistryEntriesByName(Graph, ParamName, NewKeys, NewVars);
+	const bool bRegistryRetyped = (NewKeys.Num() == 1 && NewKeys[0].GetType() == NewType);
+
+	// Pin types read back off the pins themselves, one row each.
+	TArray<TSharedPtr<FJsonValue>> PinRows;
+	int32 PinsAtNewType = 0, PinsAtOtherType = 0;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node) continue;
+		for (UEdGraphPin* P : Node->Pins)
+		{
+			if (!P || !P->PinName.ToString().Equals(ParamName, ESearchCase::CaseSensitive)) continue;
+			const FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(P);
+			if (PinType == NewType) ++PinsAtNewType; else ++PinsAtOtherType;
+
+			TSharedRef<FJsonObject> O = MakeShared<FJsonObject>();
+			O->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
+			O->SetStringField(TEXT("node"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+			O->SetStringField(TEXT("pin"), P->PinName.ToString());
+			O->SetStringField(TEXT("direction"), P->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+			O->SetStringField(TEXT("type"), PinType.IsValid() ? PinType.GetName() : TEXT("<unresolved>"));
+			O->SetBoolField(TEXT("orphaned"), P->bOrphanedPin);
+			O->SetNumberField(TEXT("link_count"), P->LinkedTo.Num());
+			PinRows.Add(MakeShared<FJsonValueObject>(O));
+		}
+	}
+
+	// Orphans created by THIS call: the diff, never the whole graph's orphan set.
+	TSet<FString> OrphansAfter;
+	CollectOrphanedPinKeys(Graph, OrphansAfter);
+	TArray<TSharedPtr<FJsonValue>> NewOrphans;
+	for (const FString& Key : OrphansAfter)
+	{
+		if (!OrphansBefore.Contains(Key)) NewOrphans.Add(MakeShared<FJsonValueString>(Key));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetStringField(TEXT("parameter"), ParamName);
+	R->SetStringField(TEXT("old_type"), OldType.GetName());
+	R->SetStringField(TEXT("type"), NewKeys.Num() == 1 ? NewKeys[0].GetType().GetName() : TEXT("<not registered>"));
+	R->SetStringField(TEXT("requested_type"), NewType.GetName());
+	R->SetBoolField(TEXT("registry_retyped"), bRegistryRetyped);
+	R->SetBoolField(TEXT("allow_orphaned_pins"), bAllowOrphanedPins);
+	R->SetNumberField(TEXT("pins_before"), RefsBefore.Num());
+	R->SetNumberField(TEXT("pins_at_new_type"), PinsAtNewType);
+	R->SetNumberField(TEXT("pins_at_other_type"), PinsAtOtherType);
+	R->SetArrayField(TEXT("pins"), PinRows);
+	R->SetNumberField(TEXT("orphaned_pins_created"), NewOrphans.Num());
+	R->SetArrayField(TEXT("orphaned_pins"), NewOrphans);
+
+	if (!bRegistryRetyped)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"The registry entry for '%s' does NOT read back as '%s' (%d entr%s found). ChangeParameterType only re-keys "
+			"VariableToScriptVariable when it finds the exact old key (NiagaraGraph.cpp:1025-1036) — re-read with "
+			"get_script_parameters before trusting this script."),
+			*ParamName, *NewType.GetName(), NewKeys.Num(), NewKeys.Num() == 1 ? TEXT("y") : TEXT("ies")));
+	}
+	if (PinsAtOtherType > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d pin(s) named '%s' are NOT at the new type — orphaned pins keep the old type by design "
+			"(NiagaraGraph.cpp:909-914) and are named after the parameter, so this is expected when orphans were "
+			"created. Anything non-orphaned in that list is not."),
+			PinsAtOtherType, *ParamName));
+	}
+	if (NewOrphans.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d ORPHANED pin(s) were created: connections that no longer typecheck were moved onto them rather than "
+			"silently dropped. They are not connectable and do not compile; re-wire what they hold and remove them "
+			"(remove_graph_node on the whole node, or clean_stack_orphans where it applies). Until then the graph "
+			"carries a visible reminder of what this retype broke."),
+			NewOrphans.Num()));
+	}
+
+	AppendPlacedCallerWarning(Script, ScriptPath,
+		TEXT("A type change"),
+		TEXT("a placed module keeps an input pin of the OLD type, so its stack value is read at the old type or lost "
+		     "entirely — and a type mismatch between a placed caller and its script is the shape that produced 72 "
+		     "compile errors in gap #62."),
+		R, Warnings);
+
+	AttachWarnings(R, Warnings);
+	NA_ReportSave(R, SaveOutcome, ScriptPath);
 	return NA_SuccessObj(R);
 }
 

@@ -53,11 +53,12 @@ void FMonolithBlueprintActions::RegisterActions()
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_variables"),
-		TEXT("Get all variables defined in a Blueprint. Set include_bind_widgets=true on a Widget Blueprint to also enumerate, under a 'bind_widgets' array, both C++ BindWidget/BindWidgetOptional references (source=bind_widget_meta) and pure-Blueprint tree widgets exposed as variables (source=tree_variable). Neither kind appears in NewVariables."),
+		TEXT("Get all variables defined in a Blueprint. Enum-typed variables additionally carry 'enum' (UEnum path), 'display_value' and 'authored_name' beside the raw 'default_value' -- an editor-authored enum asset stores entries as 'NewEnumerator<n>', which is meaningless without them. Set include_bind_widgets=true on a Widget Blueprint to also enumerate, under a 'bind_widgets' array, both C++ BindWidget/BindWidgetOptional references (source=bind_widget_meta) and pure-Blueprint tree widgets exposed as variables (source=tree_variable). Neither kind appears in NewVariables."),
 		FMonolithActionHandler::CreateStatic(&HandleGetVariables),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
 			.Optional(TEXT("include_bind_widgets"), TEXT("boolean"), TEXT("Widget Blueprints only: also list designer-bound widgets in 'bind_widgets' -- C++ BindWidget refs (source=bind_widget_meta) and bIsVariable tree widgets (source=tree_variable) (default false)"))
+			.Optional(TEXT("include_enum_options"), TEXT("boolean"), TEXT("Enum-typed variables also carry 'valid_options' -- the full raw_value/display_value/authored_name/value table for their UEnum (default false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_execution_flow"),
@@ -457,6 +458,26 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetGraphSummary(const TSh
 
 FMonolithActionResult FMonolithBlueprintActions::HandleGetVariables(const TSharedPtr<FJsonObject>& Params)
 {
+	// Validate the caller's flags BEFORE loading anything (#36: refuse first).
+	// Both are declared boolean; TryGetBoolField would have swallowed a garbage
+	// string as `false` and silently omitted the data the caller asked for.
+	// include_enum_options (#63): opt-in full raw->display enum table per
+	// enum-typed variable. Off by default so the common read stays lean; on, one
+	// call gives a port the whole mapping it needs to reconstruct the enum.
+	bool bIncludeEnumOptions = false;
+	bool bIncludeBindWidgets = false;
+	FString FlagError;
+	if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("include_enum_options"), bIncludeEnumOptions, &FlagError)
+		&& !FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
+	if (!MonolithBlueprintInternal::TryGetStrictBool(Params, TEXT("include_bind_widgets"), bIncludeBindWidgets, &FlagError)
+		&& !FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
+
 	FString AssetPath;
 	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
 	if (!BP)
@@ -489,6 +510,18 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetVariables(const TShare
 			}
 		}
 		VObj->SetStringField(TEXT("default_value"), DefaultStr);
+
+		// #63 -- resolve an enum-typed variable's raw identifier. The pin type is
+		// authoritative here, NOT the generated FProperty: the Kismet compiler can
+		// lower a UserDefinedEnum variable to a plain int property, which would drop
+		// the UEnum entirely. default_value is left exactly as-is; the resolved names
+		// are added beside it.
+		MonolithBlueprintInternal::AddEnumDisplayFields(
+			VObj,
+			MonolithBlueprintInternal::EnumFromPinType(Var.VarType),
+			DefaultStr,
+			bIncludeEnumOptions);
+
 		VObj->SetStringField(TEXT("category"), Var.Category.ToString());
 
 		VObj->SetBoolField(TEXT("instance_editable"),
@@ -516,8 +549,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetVariables(const TShare
 	// Both passes are reflection-only (FObjectProperty/FBoolProperty + a
 	// string-resolved UWidget base + GetObjectsWithOuter), so this module needs
 	// no UMG link dependency and references no sibling/marketplace widget type.
-	bool bIncludeBindWidgets = false;
-	Params->TryGetBoolField(TEXT("include_bind_widgets"), bIncludeBindWidgets);
+	// bIncludeBindWidgets was validated up front (see the top of this handler).
 	if (bIncludeBindWidgets && GenClass)
 	{
 		// Resolve UMG's base widget class by path without compile-time UMG dep.

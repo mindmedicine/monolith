@@ -61,6 +61,122 @@
 #include "IMonolithGraphFormatter.h"
 
 // ============================================================================
+// Strict boolean parameter reads (gap M8 / the cross-namespace TryGetBoolField
+// root cause).
+//
+// TJsonValueString::TryGetBool returns true UNCONDITIONALLY, handing back
+// FString::ToBool() (JsonValue.h:493-497). FJsonObject::TryGetBoolField just
+// forwards to it (JsonObject.cpp:528-532), and GetBoolField is worse — it goes
+// through GetField<EJson::None>()->AsBool() (JsonObject.cpp:523-526), so it
+// accepts ANY json type. Net effect: a caller-supplied field read either way
+// NEVER reports failure on a string; every non-boolean spelling silently
+// becomes `false`. That is a silent no-op, not an error.
+//
+// MonolithTryGetStrictBool dispatches on FJsonValue::Type and accepts exactly
+// the spellings FString::ToBool assigns meaning to (CString.cpp:123-153):
+// true/yes/on, false/no/off, and any number (non-zero is true). Anything else
+// is a caller error and is reported as one.
+//
+// Returns false with OutError EMPTY when the field is simply absent (caller
+// keeps its default); false with OutError SET when the field is present but
+// unusable (caller should refuse).
+//
+// Deliberately duplicated from MonolithBlueprintInternal::TryGetStrictBool:
+// this pass was scoped to MonolithBlueprint + MonolithMaterial and MonolithCore
+// was out of bounds. Hoisting one copy into MonolithJsonUtils is the
+// upstreamable form.
+// ============================================================================
+
+static bool MonolithTryGetStrictBool(
+	const TSharedPtr<FJsonObject>& Params,
+	const FString& FieldName,
+	bool& OutValue,
+	FString* OutError = nullptr)
+{
+	if (!Params.IsValid())
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonValue> Field = Params->TryGetField(FieldName);
+	if (!Field.IsValid() || Field->Type == EJson::Null)
+	{
+		return false;
+	}
+
+	if (Field->Type == EJson::Boolean)
+	{
+		OutValue = Field->AsBool();
+		return true;
+	}
+
+	if (Field->Type == EJson::String)
+	{
+		const FString AsString = Field->AsString().TrimStartAndEnd();
+		if (AsString.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+			AsString.Equals(TEXT("yes"),  ESearchCase::IgnoreCase) ||
+			AsString.Equals(TEXT("on"),   ESearchCase::IgnoreCase))
+		{
+			OutValue = true;
+			return true;
+		}
+		if (AsString.Equals(TEXT("false"), ESearchCase::IgnoreCase) ||
+			AsString.Equals(TEXT("no"),    ESearchCase::IgnoreCase) ||
+			AsString.Equals(TEXT("off"),   ESearchCase::IgnoreCase))
+		{
+			OutValue = false;
+			return true;
+		}
+		// FCString::IsNumeric accepts "", "-", "+" and "." (Core/Public/Misc/CString.h:148),
+		// each of which Atoi would turn into a silent `false`. Require a real digit.
+		bool bHasDigit = false;
+		for (const TCHAR Char : AsString)
+		{
+			if (FChar::IsDigit(Char)) { bHasDigit = true; break; }
+		}
+		if (bHasDigit && AsString.IsNumeric())
+		{
+			OutValue = FCString::Atoi(*AsString) != 0;
+			return true;
+		}
+	}
+
+	if (Field->Type == EJson::Number)
+	{
+		OutValue = Field->AsNumber() != 0.0;
+		return true;
+	}
+
+	if (OutError)
+	{
+		*OutError = (Field->Type == EJson::String)
+			? FString::Printf(
+				TEXT("Parameter '%s' must be a boolean. Received the string '%s', which is not a boolean spelling ")
+				TEXT("(accepted: true/false, yes/no, on/off, or a number)."),
+				*FieldName, *Field->AsString())
+			: FString::Printf(
+				TEXT("Parameter '%s' must be a boolean. Received %s."),
+				*FieldName,
+				Field->Type == EJson::Array ? TEXT("an array") : TEXT("an object"));
+	}
+	return false;
+}
+
+// Convenience wrapper for the "HasField ? GetBoolField : Default" shape this
+// file uses in ~30 places. Returns the parsed value, or Default when absent;
+// sets OutError (and returns Default) when the field is present but unusable.
+static bool MonolithStrictBoolOr(
+	const TSharedPtr<FJsonObject>& Params,
+	const FString& FieldName,
+	bool Default,
+	FString& OutError)
+{
+	bool Value = Default;
+	MonolithTryGetStrictBool(Params, FieldName, Value, &OutError);
+	return Value;
+}
+
+// ============================================================================
 // Pin name normalization — UE's GetShortenPinName converts raw names to
 // shortened forms, so we must do the same when matching by name.
 // ============================================================================
@@ -197,12 +313,12 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("get_thumbnail"),
-		TEXT("Get material thumbnail as base64-encoded PNG"),
+		TEXT("Get material thumbnail as base64-encoded PNG, or write it to disk"),
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetThumbnail),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Material asset path"))
 			.Optional(TEXT("resolution"), TEXT("integer"), TEXT("Thumbnail resolution"), TEXT("256"))
-			.Optional(TEXT("save_to_file"), TEXT("string"), TEXT("Optional file path to save PNG to disk"))
+			.Optional(TEXT("save_to_file"), TEXT("any"), TEXT("Boolean or '.png' path. Omitted/false: PNG returned base64 in 'data'. true: written to Saved/Monolith/previews/<Asset>_<res>.png. A '.png' path: written there (relative paths resolve against the project directory); the absolute path used is returned in 'file_path'. Any other value is refused."), TEXT("false"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("create_custom_hlsl_node"),
@@ -1201,7 +1317,16 @@ FMonolithActionResult FMonolithMaterialActions::DisconnectExpression(const TShar
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 	FString ExpressionName = Params->GetStringField(TEXT("expression_name"));
 	FString InputName = Params->HasField(TEXT("input_name")) ? Params->GetStringField(TEXT("input_name")) : TEXT("");
-	bool bDisconnectOutputs = Params->HasField(TEXT("disconnect_outputs")) ? Params->GetBoolField(TEXT("disconnect_outputs")) : false;
+	// Strict: this flag widens a destructive operation. A garbage string used to
+	// resolve to `false`, so the failure was quiet in the safe direction — but
+	// "yes"/"on" resolved to TRUE, so the reverse mistake was reachable. Refuse first (#36).
+	FString FlagError;
+	const bool bDisconnectOutputs =
+		MonolithStrictBoolOr(Params, TEXT("disconnect_outputs"), false, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 	// Optional filter: only disconnect from a specific downstream expression (when disconnect_outputs=true)
 	FString TargetDownstream = Params->HasField(TEXT("target_expression")) ? Params->GetStringField(TEXT("target_expression")) : TEXT("");
 	// Optional filter: only disconnect a specific output index
@@ -1395,7 +1520,16 @@ FMonolithActionResult FMonolithMaterialActions::EndTransaction(const TSharedPtr<
 FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-	bool bClearExisting = Params->HasField(TEXT("clear_existing")) ? Params->GetBoolField(TEXT("clear_existing")) : true;
+
+	// Strict: clear_existing defaults TRUE and wipes the graph. A garbage string used
+	// to flip it either way depending on spelling ("on" -> wipe, "banana" -> keep),
+	// with no error in either case. Refuse first (#36).
+	FString FlagError;
+	const bool bClearExisting = MonolithStrictBoolOr(Params, TEXT("clear_existing"), true, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	UMaterial* Mat = LoadBaseMaterial(AssetPath);
 	if (!Mat)
@@ -1884,7 +2018,14 @@ FMonolithActionResult FMonolithMaterialActions::ImportMaterialGraph(const TShare
 FMonolithActionResult FMonolithMaterialActions::ValidateMaterial(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-	bool bFixIssues = Params->HasField(TEXT("fix_issues")) ? Params->GetBoolField(TEXT("fix_issues")) : false;
+	// Strict: fix_issues turns a read-only report into a mutation. A garbage string
+	// used to silently become `false` — the caller asked for repairs and got a report.
+	FString FlagError;
+	const bool bFixIssues = MonolithStrictBoolOr(Params, TEXT("fix_issues"), false, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	UMaterial* Mat = LoadBaseMaterial(AssetPath);
 	if (!Mat)
@@ -2289,7 +2430,24 @@ FMonolithActionResult FMonolithMaterialActions::RenderPreview(const TSharedPtr<F
 
 // ============================================================================
 // Action: get_thumbnail
-// Params: { "asset_path": "...", "resolution": 256, "save_to_file": false }
+// Params: { "asset_path": "...", "resolution": 256,
+//           "save_to_file": true | "D:/out/Probe.png" }
+//
+// Gap M8. save_to_file was DECLARED a string ("file path to save PNG to disk")
+// and READ with TryGetBoolField, which never fails on a string — so a caller
+// following the schema got `false`, i.e. no file, no error, no warning. Now the
+// field is dispatched on FJsonValue::Type and both meanings are honoured:
+//
+//   absent / false      -> base64 PNG in the response (unchanged default)
+//   true                -> Saved/Monolith/previews/<Asset>_<res>.png (unchanged)
+//   "<path>.png"        -> that exact file; relative paths resolve against the
+//                          project directory, and the absolute path used is
+//                          echoed back in file_path
+//   "true"/"no"/1/...   -> the boolean meaning, as before
+//   anything else       -> refused with the reason
+//
+// Validation happens BEFORE the render, so a bad path costs nothing and no
+// half-done work is left behind (#36).
 // ============================================================================
 
 FMonolithActionResult FMonolithMaterialActions::GetThumbnail(const TSharedPtr<FJsonObject>& Params)
@@ -2301,10 +2459,59 @@ FMonolithActionResult FMonolithMaterialActions::GetThumbnail(const TSharedPtr<FJ
 		Resolution = 256;
 	}
 
-	bool bSaveToFile = false;
+	// --- save_to_file: resolve BOTH meanings before anything is rendered. ---
+	bool bSaveToFile = false;      // write a PNG at all?
+	FString ExplicitSavePath;      // non-empty => caller named the destination
+
 	if (Params.IsValid())
 	{
-		Params->TryGetBoolField(TEXT("save_to_file"), bSaveToFile);
+		const TSharedPtr<FJsonValue> SaveField = Params->TryGetField(TEXT("save_to_file"));
+		if (SaveField.IsValid() && SaveField->Type != EJson::Null)
+		{
+			// Boolean spellings keep their old meaning; a genuine path is honoured.
+			// MonolithTryGetStrictBool accepts exactly the spellings ToBool assigns
+			// meaning to, so "true"/"1"/"no" still behave as they did, and anything
+			// left over is a path candidate rather than a silent false.
+			FString UnusedBoolError;
+			if (MonolithTryGetStrictBool(Params, TEXT("save_to_file"), bSaveToFile, &UnusedBoolError))
+			{
+				// Handled as a boolean.
+			}
+			else if (SaveField->Type == EJson::String)
+			{
+				FString RequestedPath = SaveField->AsString().TrimStartAndEnd();
+				if (RequestedPath.IsEmpty())
+				{
+					return FMonolithActionResult::Error(
+						TEXT("Parameter 'save_to_file' was an empty string. Pass true to write to the default ")
+						TEXT("previews directory, false to receive base64, or a '.png' file path."));
+				}
+
+				// PNG bytes in a file that claims to be something else would be a
+				// silent wrong answer — refuse instead of renaming the caller's intent.
+				if (!RequestedPath.EndsWith(TEXT(".png"), ESearchCase::IgnoreCase))
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("Parameter 'save_to_file' path '%s' must end in '.png' — this action only writes PNG. ")
+						TEXT("Pass true instead to use the default previews directory."),
+						*RequestedPath));
+				}
+
+				if (FPaths::IsRelative(RequestedPath))
+				{
+					RequestedPath = FPaths::Combine(FPaths::ProjectDir(), RequestedPath);
+				}
+				FPaths::NormalizeFilename(RequestedPath);
+				ExplicitSavePath = FPaths::ConvertRelativePathToFull(RequestedPath);
+				bSaveToFile = true;
+			}
+			else
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Parameter 'save_to_file' must be a boolean or a '.png' file path. Received %s."),
+					SaveField->Type == EJson::Array ? TEXT("an array") : TEXT("an object")));
+			}
+		}
 	}
 
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -2342,10 +2549,23 @@ FMonolithActionResult FMonolithMaterialActions::GetThumbnail(const TSharedPtr<FJ
 
 	if (bSaveToFile)
 	{
-		FString AssetName = FPaths::GetBaseFilename(AssetPath);
-		FString SaveDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Monolith"), TEXT("previews"));
-		IFileManager::Get().MakeDirectory(*SaveDir, true);
-		FString FullPath = FPaths::Combine(SaveDir, FString::Printf(TEXT("%s_%d.png"), *AssetName, Resolution));
+		FString FullPath;
+		if (!ExplicitSavePath.IsEmpty())
+		{
+			FullPath = ExplicitSavePath;
+		}
+		else
+		{
+			const FString AssetName = FPaths::GetBaseFilename(AssetPath);
+			const FString SaveDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Monolith"), TEXT("previews"));
+			FullPath = FPaths::Combine(SaveDir, FString::Printf(TEXT("%s_%d.png"), *AssetName, Resolution));
+		}
+
+		const FString SaveDirectory = FPaths::GetPath(FullPath);
+		if (!SaveDirectory.IsEmpty())
+		{
+			IFileManager::Get().MakeDirectory(*SaveDirectory, /*Tree=*/true);
+		}
 
 		if (!FFileHelper::SaveArrayToFile(PngData, *FullPath))
 		{
@@ -3741,12 +3961,22 @@ namespace MonolithMaterialValue
 		FDefaultConstructedPropertyElement Imported;
 	};
 
-	/** Resolve `value` for `Prop`, or explain why it cannot be. Never mutates anything. */
+	/**
+	 * Resolve `value` for `Prop`, or explain why it cannot be. Never mutates anything.
+	 *
+	 * InIntactSuffix tails every refusal message with the reassurance the CALLER can
+	 * honestly make. The default is set_expression_property's ("refused before the
+	 * transaction opened"). BuildGraphFromSpec runs inside an open transaction on a
+	 * freshly-created node, so it passes its own wording rather than inheriting a
+	 * claim that is not true there.
+	 */
 	static bool ParseForProperty(FProperty* Prop, const TSharedPtr<FJsonValue>& JsonValue,
-		UObject* Owner, FParsedValue& Out, FString& OutError)
+		UObject* Owner, FParsedValue& Out, FString& OutError,
+		const TCHAR* InIntactSuffix = nullptr)
 	{
-		static const TCHAR* IntactSuffix =
-			TEXT(" Refused before the transaction opened — the property still holds its previous value.");
+		const TCHAR* IntactSuffix = InIntactSuffix
+			? InIntactSuffix
+			: TEXT(" Refused before the transaction opened — the property still holds its previous value.");
 
 		if (!JsonValue.IsValid() || JsonValue->Type == EJson::Null
 			|| JsonValue->Type == EJson::Array || JsonValue->Type == EJson::Object)
@@ -5536,7 +5766,14 @@ FMonolithActionResult FMonolithMaterialActions::ClearInstanceParameter(const TSh
 FMonolithActionResult FMonolithMaterialActions::SaveMaterial(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-	bool bOnlyIfDirty = Params->HasField(TEXT("only_if_dirty")) ? Params->GetBoolField(TEXT("only_if_dirty")) : true;
+	// Strict: only_if_dirty defaults TRUE; a garbage string used to become `false`
+	// and force an unconditional save of someone else's asset.
+	FString FlagError;
+	const bool bOnlyIfDirty = MonolithStrictBoolOr(Params, TEXT("only_if_dirty"), true, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	// Verify asset exists
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -5769,8 +6006,15 @@ FMonolithActionResult FMonolithMaterialActions::ReplaceExpression(const TSharedP
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 	FString ExprName = Params->GetStringField(TEXT("expression_name"));
 	FString NewClassName = Params->GetStringField(TEXT("new_class"));
-	bool bPreserveConnections = Params->HasField(TEXT("preserve_connections"))
-		? Params->GetBoolField(TEXT("preserve_connections")) : true;
+	// Strict: this flag defaults TRUE and a garbage string used to silently flip it
+	// to false, i.e. discard every wire on the replaced expression. Refuse first (#36).
+	FString FlagError;
+	const bool bPreserveConnections =
+		MonolithStrictBoolOr(Params, TEXT("preserve_connections"), true, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	UMaterial* Mat = LoadBaseMaterial(AssetPath);
 	if (!Mat)
@@ -6513,50 +6757,27 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 						continue;
 					}
 
-					// Derive a string representation regardless of JSON value type
-					FString ValueStr;
-					switch (Pair.Value->Type)
+					// --- Gap M9 -------------------------------------------------------
+					// This dispatch used to coerce silently and warn about nothing:
+					// AsNumber() answered 0 for {"ConstMipValue": "banana"} on a property
+					// defaulting to -1 (measured), the enum rows fell back to Atoi, and the
+					// two trailing ImportText_Direct calls discarded their return value.
+					// MonolithMaterialValue::ParseForProperty already resolves a JSON value
+					// against a property's REAL type, imports into a temporary element so a
+					// parse failure never touches the live object, and explains refusals --
+					// it is what set_expression_property uses. Route the loop through it.
+					//
+					// One deliberate exception below: FObjectProperty keeps its existing
+					// StaticLoadObject path, because ParseForProperty's ImportText grammar
+					// requires a full object path (/Game/P/T_Foo.T_Foo) while this builder
+					// has always accepted the bare package path (/Game/P/T_Foo). That branch
+					// is not one of M9's silent rows -- it already warns on failure -- so
+					// tightening it here would be an untested regression, not a fix.
+					if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
 					{
-						case EJson::Number:  ValueStr = FString::SanitizeFloat(Pair.Value->AsNumber()); break;
-						case EJson::Boolean: ValueStr = Pair.Value->AsBool() ? TEXT("true") : TEXT("false"); break;
-						default:             ValueStr = Pair.Value->AsString(); break;
-					}
+						const FString ValueStr = MonolithMaterialValue::JsonValueToDisplayString(Pair.Value);
+						void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(NewExpr);
 
-					void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(NewExpr);
-
-					if (FFloatProperty* FloatProp = CastField<FFloatProperty>(Prop))
-					{
-						FloatProp->SetPropertyValue(ValuePtr, static_cast<float>(Pair.Value->AsNumber()));
-					}
-					else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(Prop))
-					{
-						DoubleProp->SetPropertyValue(ValuePtr, Pair.Value->AsNumber());
-					}
-					else if (FIntProperty* IntProp = CastField<FIntProperty>(Prop))
-					{
-						IntProp->SetPropertyValue(ValuePtr, static_cast<int32>(Pair.Value->AsNumber()));
-					}
-					else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
-					{
-						// Gap M2's twin, in the graph builder: this used to compare the
-						// SanitizeFloat'd string against "1", so props {"Flag": 1} (a JSON
-						// number, stringified to "1.0") set FALSE. Resolve from the JSON
-						// value's real type instead, and refuse rather than guess.
-						bool bVal = false;
-						if (!MonolithMaterialValue::TryResolveBool(Pair.Value, bVal))
-						{
-							auto ErrJson = MakeShared<FJsonObject>();
-							ErrJson->SetStringField(TEXT("node_id"), Id);
-							ErrJson->SetStringField(TEXT("warning"), FString::Printf(
-								TEXT("Property '%s' on '%s' is a bool and '%s' is not a recognised boolean (accepted: %s) — left at its default."),
-								*Pair.Key, *FullClassName, *ValueStr, MonolithMaterialValue::DescribeBoolSpellings()));
-							OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
-							continue;
-						}
-						BoolProp->SetPropertyValue(ValuePtr, bVal);
-					}
-					else if (FObjectProperty* ObjProp = CastField<FObjectProperty>(Prop))
-					{
 						// ValueStr is a plain asset path like "/Game/Textures/T_Foo" — load and assign directly.
 						// StaticLoadObject works with either bare paths or full class-prefix reference notation.
 						UObject* LoadedObj = StaticLoadObject(ObjProp->PropertyClass, nullptr, *ValueStr);
@@ -6573,47 +6794,27 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 								*ValueStr, *Pair.Key, *FullClassName));
 							OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
 						}
+						continue;
 					}
-					else if (FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+
+					MonolithMaterialValue::FParsedValue Parsed;
+					FString ParseError;
+					if (!MonolithMaterialValue::ParseForProperty(Prop, Pair.Value, NewExpr, Parsed, ParseError,
+							TEXT(" The node was still created; this property keeps its class default.")))
 					{
-						// Covers TEnumAsByte<EFoo> — try enum name lookup first, fall back to integer
-						if (ByteProp->Enum)
-						{
-							int64 EnumVal = ByteProp->Enum->GetValueByNameString(ValueStr);
-							if (EnumVal == INDEX_NONE)
-							{
-								EnumVal = FCString::Atoi(*ValueStr);
-							}
-							ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(EnumVal));
-						}
-						else
-						{
-							ByteProp->SetPropertyValue(ValuePtr, static_cast<uint8>(FCString::Atoi(*ValueStr)));
-						}
+						// A per-node warning rather than a hard error: this is a batch
+						// builder and the surrounding nodes are still worth creating. The
+						// property keeps its default, and the caller is TOLD so -- which is
+						// the whole of M9 ("emits no warning at all").
+						auto ErrJson = MakeShared<FJsonObject>();
+						ErrJson->SetStringField(TEXT("node_id"), Id);
+						ErrJson->SetStringField(TEXT("warning"), FString::Printf(
+							TEXT("Property '%s' on '%s' was not set: %s"),
+							*Pair.Key, *FullClassName, *ParseError));
+						OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
+						continue;
 					}
-					else if (FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
-					{
-						// Scoped enum (UENUM class) — try enum name lookup first, fall back to integer
-						UEnum* Enum = EnumProp->GetEnum();
-						FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-						if (Enum && UnderlyingProp)
-						{
-							int64 EnumVal = Enum->GetValueByNameString(ValueStr);
-							if (EnumVal == INDEX_NONE)
-							{
-								EnumVal = FCString::Atoi64(*ValueStr);
-							}
-							UnderlyingProp->SetIntPropertyValue(ValuePtr, EnumVal);
-						}
-						else
-						{
-							Prop->ImportText_Direct(*ValueStr, ValuePtr, NewExpr, PPF_None);
-						}
-					}
-					else
-					{
-						Prop->ImportText_Direct(*ValueStr, ValuePtr, NewExpr, PPF_None);
-					}
+					MonolithMaterialValue::ApplyToProperty(Prop, NewExpr, Parsed);
 				}
 			}
 
@@ -7030,7 +7231,14 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSh
 FMonolithActionResult FMonolithMaterialActions::BuildFunctionGraph(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-	bool bClearExisting = Params->HasField(TEXT("clear_existing")) ? Params->GetBoolField(TEXT("clear_existing")) : false;
+
+	// Strict: clear_existing wipes the function graph. Refuse first (#36).
+	FString FlagError;
+	const bool bClearExisting = MonolithStrictBoolOr(Params, TEXT("clear_existing"), false, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	// Load the material function
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
@@ -9763,8 +9971,16 @@ FMonolithActionResult FMonolithMaterialActions::RenameFunctionParameterGroup(con
 FMonolithActionResult FMonolithMaterialActions::ClearGraph(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
-	bool bPreserveParams = false;
-	Params->TryGetBoolField(TEXT("preserve_parameters"), bPreserveParams);
+
+	// Strict: clear_graph is destructive, and a garbage string used to become
+	// `false` here — i.e. delete the parameters the caller asked to keep. Refuse first (#36).
+	FString FlagError;
+	const bool bPreserveParams =
+		MonolithStrictBoolOr(Params, TEXT("preserve_parameters"), false, FlagError);
+	if (!FlagError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FlagError);
+	}
 
 	UMaterial* Mat = LoadBaseMaterial(AssetPath);
 	if (!Mat)

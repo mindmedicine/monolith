@@ -32,6 +32,9 @@
 #include "Dom/JsonValue.h"
 #include "Editor.h"
 #include "UObject/Package.h"
+#include "UObject/Class.h"
+#include "UObject/UnrealType.h"
+#include "UObject/EnumProperty.h"
 
 namespace MonolithBlueprintInternal
 {
@@ -200,6 +203,256 @@ namespace MonolithBlueprintInternal
 		return MonolithPinTypeGrammar::ContainerPrefix(PinType);
 	}
 
+	// ============================================================
+	//  Strict boolean parameter reads
+	//
+	//  TJsonValueString::TryGetBool returns true UNCONDITIONALLY, handing back
+	//  FString::ToBool() (JsonValue.h:493-497). So FJsonObject::TryGetBoolField
+	//  NEVER fails on a string -- every non-"true"/"1"/"yes" string silently
+	//  becomes false, and the caller gets a no-op instead of an error. Dispatch
+	//  on FJsonValue::Type instead of trusting the return.
+	//
+	//  Returns false (and leaves OutValue untouched) when the field is absent.
+	//  Returns false and fills OutError when the field is present but not a
+	//  boolean and not a recognised boolean spelling -- callers should refuse.
+	//
+	//  Lives here rather than MonolithCore only because this pass was scoped to
+	//  MonolithBlueprint/MonolithMaterial; hoisting it into MonolithJsonUtils and
+	//  collapsing the near-identical material-side copy is the upstreamable form.
+	// ============================================================
+	inline bool TryGetStrictBool(
+		const TSharedPtr<FJsonObject>& Params,
+		const FString& FieldName,
+		bool& OutValue,
+		FString* OutError = nullptr)
+	{
+		if (!Params.IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonValue> Field = Params->TryGetField(FieldName);
+		if (!Field.IsValid() || Field->Type == EJson::Null)
+		{
+			return false;
+		}
+
+		if (Field->Type == EJson::Boolean)
+		{
+			OutValue = Field->AsBool();
+			return true;
+		}
+
+		// Tolerate exactly the spellings FString::ToBool assigns MEANING to
+		// (CString.cpp:123-153: true/yes/on, false/no/off, plus any numeric where
+		// non-zero is true). Everything else -- "banana", a file path -- is where
+		// ToBool falls through to Atoi and invents `false`; that is the silent
+		// no-op, so it becomes a caller error here instead. This is strictly more
+		// permissive than the old behaviour for every value it used to accept.
+		if (Field->Type == EJson::String)
+		{
+			const FString AsString = Field->AsString().TrimStartAndEnd();
+			if (AsString.Equals(TEXT("true"), ESearchCase::IgnoreCase) ||
+				AsString.Equals(TEXT("yes"),  ESearchCase::IgnoreCase) ||
+				AsString.Equals(TEXT("on"),   ESearchCase::IgnoreCase))
+			{
+				OutValue = true;
+				return true;
+			}
+			if (AsString.Equals(TEXT("false"), ESearchCase::IgnoreCase) ||
+				AsString.Equals(TEXT("no"),    ESearchCase::IgnoreCase) ||
+				AsString.Equals(TEXT("off"),   ESearchCase::IgnoreCase))
+			{
+				OutValue = false;
+				return true;
+			}
+			// FCString::IsNumeric accepts "", "-", "+" and "." (Core/Public/Misc/CString.h:148),
+			// each of which Atoi would turn into a silent `false`. Require a real digit.
+			bool bHasDigit = false;
+			for (const TCHAR Char : AsString)
+			{
+				if (FChar::IsDigit(Char)) { bHasDigit = true; break; }
+			}
+			if (bHasDigit && AsString.IsNumeric())
+			{
+				OutValue = FCString::Atoi(*AsString) != 0;
+				return true;
+			}
+		}
+
+		// A JSON number is unambiguous in the same way.
+		if (Field->Type == EJson::Number)
+		{
+			OutValue = Field->AsNumber() != 0.0;
+			return true;
+		}
+
+		if (OutError)
+		{
+			*OutError = (Field->Type == EJson::String)
+				? FString::Printf(
+					TEXT("Parameter '%s' must be a boolean. Received the string '%s', which is not a boolean spelling ")
+					TEXT("(accepted: true/false, yes/no, on/off, or a number)."),
+					*FieldName, *Field->AsString())
+				: FString::Printf(
+					TEXT("Parameter '%s' must be a boolean. Received %s."),
+					*FieldName,
+					Field->Type == EJson::Array ? TEXT("an array") : TEXT("an object"));
+		}
+		return false;
+	}
+
+	// ============================================================
+	//  Enum display-name resolution (gap #63)
+	//
+	//  Editor-authored enum assets (UUserDefinedEnum) name their entries with
+	//  auto-generated identifiers -- "NewEnumerator31" -- and every raw read path
+	//  reports that token verbatim: FProperty::ExportTextItem_Direct,
+	//  FBPVariableDescription::DefaultValue, UEdGraphPin::DefaultValue. The name
+	//  the author actually typed lives in UUserDefinedEnum::DisplayNameMap and is
+	//  reachable only through the UEnum virtuals GetDisplayNameTextByIndex /
+	//  GetAuthoredNameStringByIndex, which UUserDefinedEnum overrides
+	//  (Engine/Classes/Engine/UserDefinedEnum.h:67-68). C++ UENUMs are unaffected
+	//  -- their raw name IS the authored name -- so these fields are additive
+	//  everywhere and only carry new information for asset enums.
+	//
+	//  Mirrors the Niagara half of #63 (export_system_spec emits enum +
+	//  display_value per static switch). The raw identifier is what a WRITE
+	//  takes, so it is never replaced -- these fields sit ALONGSIDE it.
+	// ============================================================
+
+	// The UEnum behind a compiled property, or null. Covers both shapes an enum
+	// can take on the generated class: FEnumProperty (enum class / UserDefinedEnum)
+	// and FByteProperty carrying an Enum (TEnumAsByte<E>).
+	inline const UEnum* EnumFromProperty(const FProperty* Prop)
+	{
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
+		{
+			return EnumProp->GetEnum();
+		}
+		if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop))
+		{
+			return ByteProp->Enum;
+		}
+		return nullptr;
+	}
+
+	// The UEnum behind a pin / Blueprint-variable type, or null. Enum-typed pins
+	// are PC_Byte with a UEnum sub-object in practice; PC_Enum is the type-picker
+	// category and is accepted too (see MonolithPinTypeGrammarTest / #115).
+	inline const UEnum* EnumFromPinType(const FEdGraphPinType& PinType)
+	{
+		if (PinType.PinCategory != UEdGraphSchema_K2::PC_Byte &&
+			PinType.PinCategory != UEdGraphSchema_K2::PC_Enum)
+		{
+			return nullptr;
+		}
+		return Cast<UEnum>(PinType.PinSubCategoryObject.Get());
+	}
+
+	// Resolve a raw enum token to its numeric value, or INDEX_NONE.
+	// Accepts the short or the fully-qualified entry name (GetValueByNameString
+	// handles both) and, as a fallback, a bare integer -- which is what ExportText
+	// produces when the Kismet compiler has lowered a UserDefinedEnum variable to a
+	// plain int property. The integer form is accepted only when the enum actually
+	// declares that value, so a stray number never invents a display name.
+	// Known edge: an enum that legitimately declares the value -1 is indistinguishable
+	// from "not found" here, because GetValueByNameString reports failure as INDEX_NONE.
+	inline int64 ResolveEnumValueFromRaw(const UEnum* Enum, const FString& RawValue)
+	{
+		if (!Enum || RawValue.IsEmpty())
+		{
+			return INDEX_NONE;
+		}
+
+		const int64 ByName = Enum->GetValueByNameString(RawValue, EGetByNameFlags::None);
+		if (ByName != INDEX_NONE)
+		{
+			return ByName;
+		}
+
+		// FCString::IsNumeric accepts "-", "+" and "." with no digits at all, and Atoi64
+		// answers 0 for each — which IsValidEnumValue would then happily accept as entry 0.
+		bool bHasDigit = false;
+		for (const TCHAR Char : RawValue)
+		{
+			if (FChar::IsDigit(Char)) { bHasDigit = true; break; }
+		}
+		if (bHasDigit && RawValue.IsNumeric())
+		{
+			const int64 AsInt = FCString::Atoi64(*RawValue);
+			if (Enum->IsValidEnumValue(AsInt))
+			{
+				return AsInt;
+			}
+		}
+		return INDEX_NONE;
+	}
+
+	// The full raw->display table for an enum: one entry per declared name.
+	// Includes the autogenerated _MAX entry that UUserDefinedEnum always appends --
+	// not filtered, because filtering it would be a guess about shape rather than a
+	// question asked of the engine.
+	inline TArray<TSharedPtr<FJsonValue>> BuildEnumOptions(const UEnum* Enum)
+	{
+		TArray<TSharedPtr<FJsonValue>> Options;
+		if (!Enum)
+		{
+			return Options;
+		}
+		for (int32 Index = 0; Index < Enum->NumEnums(); ++Index)
+		{
+			TSharedPtr<FJsonObject> OptionObj = MakeShared<FJsonObject>();
+			OptionObj->SetStringField(TEXT("raw_value"), Enum->GetNameStringByIndex(Index));
+			OptionObj->SetStringField(TEXT("display_value"),
+				Enum->GetDisplayNameTextByIndex(Index).ToString());
+			OptionObj->SetStringField(TEXT("authored_name"),
+				Enum->GetAuthoredNameStringByIndex(Index));
+			OptionObj->SetNumberField(TEXT("value"), static_cast<double>(Enum->GetValueByIndex(Index)));
+			Options.Add(MakeShared<FJsonValueObject>(OptionObj));
+		}
+		return Options;
+	}
+
+	// Emit the enum block onto a JSON object that already carries the raw value.
+	// Purely additive:
+	//   enum           -- the UEnum's path name (loadable; asset enums collide on short names)
+	//   display_value  -- localized display text        (Niagara-parity field name)
+	//   authored_name  -- culture-independent source string; identical to display_value
+	//                     in a default-culture editor, and the form a C++ port carries
+	//   valid_options  -- opt-in full raw->display table (includes the autogenerated
+	//                     _MAX entry that UUserDefinedEnum always appends; not filtered,
+	//                     because filtering it would be a guess about shape, not identity)
+	// display_value / authored_name are omitted when the raw token names no declared
+	// entry, so their absence is itself a readable signal.
+	inline void AddEnumDisplayFields(
+		const TSharedPtr<FJsonObject>& Obj,
+		const UEnum* Enum,
+		const FString& RawValue,
+		bool bIncludeOptions = false)
+	{
+		if (!Obj.IsValid() || !Enum)
+		{
+			return;
+		}
+
+		Obj->SetStringField(TEXT("enum"), Enum->GetPathName());
+
+		const int64 Value = ResolveEnumValueFromRaw(Enum, RawValue);
+		if (Value != INDEX_NONE)
+		{
+			Obj->SetStringField(TEXT("display_value"),
+				Enum->GetDisplayNameTextByValue(Value).ToString());
+			Obj->SetStringField(TEXT("authored_name"),
+				Enum->GetAuthoredNameStringByValue(Value));
+		}
+
+		if (bIncludeOptions)
+		{
+			Obj->SetArrayField(TEXT("valid_options"), BuildEnumOptions(Enum));
+		}
+	}
+
 	inline TSharedPtr<FJsonObject> SerializePin(const UEdGraphPin* Pin)
 	{
 		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
@@ -213,6 +466,12 @@ namespace MonolithBlueprintInternal
 		if (!Pin->DefaultValue.IsEmpty())
 		{
 			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+
+			// #63 -- an enum-typed pin's literal is the raw entry identifier, which
+			// for a UserDefinedEnum is "NewEnumerator<n>". Emit the resolved names
+			// alongside it; default_value itself is untouched because it is what a
+			// write takes back.
+			AddEnumDisplayFields(PinObj, EnumFromPinType(Pin->PinType), Pin->DefaultValue);
 		}
 		if (Pin->DefaultObject)
 		{
