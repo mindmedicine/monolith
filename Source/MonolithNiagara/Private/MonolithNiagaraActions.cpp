@@ -4401,13 +4401,14 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 	// real cost was never the recreate: it was the I-19 churn on every PLACED instance, which is
 	// what produced incidents #13/C14 and #2/C6. All three refuse before opening a transaction
 	// (#36) and warn — never silently — when the script is placed somewhere (I-20 / #62).
-	Registry.RegisterAction(TEXT("niagara"), TEXT("rename_script_parameter"), TEXT("Rename a module script's parameter AND every pin that references it, in one operation (UNiagaraGraph::RenameParameter — the editor's own Parameters-panel rename). Refuses static switch parameters (the engine refuses them too), refuses a target name that is already taken unless allow_merge=true (a merge keeps the TARGET's metadata and discards this parameter's), and always refuses when the target name exists with a DIFFERENT type, because that would silently produce two parameters sharing one name. WARNS when the script is already placed in a system: placed callers keep the pins they were built with and no action refreshes them today (gap #62). Not exposed through batch_execute — batch does not abort or roll back, and a half-applied rename is worse than a failed one."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("rename_script_parameter"), TEXT("Rename a module script's parameter AND every pin that references it, in one operation (UNiagaraGraph::RenameParameter — the editor's own Parameters-panel rename). Refuses static switch parameters (the engine refuses them too), refuses a target name that is already taken unless allow_merge=true (a merge keeps the TARGET's metadata and discards this parameter's), and always refuses when the target name exists with a DIFFERENT type, because that would silently produce two parameters sharing one name. ALSO REPAIRS PLACED CALLERS by default (gap #93): every referencing system/emitter is traversed down to the placed module node and its stale override pin is RENAMED in place — the engine's own repair (NiagaraStackGraphUtilities.cpp:4236) — which preserves links, default values, dynamic-input chains and data interfaces because only the pin name changes. All-or-nothing: if any caller cannot be repaired, nothing is changed at all. It CANNOT verify its own work — per I-37 an in-session compile does not re-translate a dependent system, so reload each caller to confirm. Not exposed through batch_execute — batch does not abort or roll back, and a half-applied rename is worse than a failed one."),
 		FMonolithActionHandler::CreateStatic(&HandleRenameScriptParameter),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Current parameter name, exactly as get_script_parameters reports it (e.g. 'Module.Amount')"))
 			.Required(TEXT("new_name"), TEXT("string"), TEXT("New fully-namespaced name (e.g. 'Module.Intensity'). A name with no namespace is accepted but warned about — a bare name is a different parameter from the namespaced one."))
 			.Optional(TEXT("allow_merge"), TEXT("bool"), TEXT("Default false. true = permit renaming ONTO a parameter that already exists with the same type; the two merge, the TARGET's metadata wins and this parameter's is discarded (NiagaraGraph.cpp:2859-2874)."))
+			.Optional(TEXT("fix_placed_callers"), TEXT("bool"), TEXT("Default TRUE. Traverse every referencing Niagara asset (which LOADS and re-saves them) and rename each placed module's stale override pin so the caller keeps working. false = the old warn-only behaviour: the rename still happens and the callers break on next load (I-38)."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_map_parameter_pin"), TEXT("Remove one parameter pin from a ParameterMapGet (read) or ParameterMapSet (write) node — the inverse of add_map_parameter_pin, and the sweep for read pins left dangling by an earlier edit (gap #66). On a MapGet the engine's own OnPinRemoved takes the paired default-value input pin with it and clears the pin-pair guid map (NiagaraNodeParameterMapGet.cpp:175-199), so this reproduces the editor's context-menu 'Remove pin' exactly. It does NOT remove the parameter from the script's registry — that is remove_script_parameter's job, and the response says whether the parameter is now unreferenced. Refuses a pin that still has connections unless break_links=true, listing every link it would break. Requires the engine-private wizard build (dev builds only)."),
@@ -26879,6 +26880,300 @@ namespace MonolithNiagaraIOSurgery
 		}
 	}
 
+	// ====================================================================================
+	// Gap #93 / I-38 — REPAIRING the placed caller, not just warning about it.
+	//
+	// A rename changes the script's parameter SURFACE. The placed caller keeps an override pin
+	// named after the OLD parameter; nothing in the script declares it any more. That compiles
+	// clean in-session and fails on the NEXT LOAD with "Error compiling Pin - Node: Output
+	// Particle Update Pin: Out -" (I-38). Until now the only remedy was remove-and-re-add, which
+	// discards every override (I-19 churn).
+	//
+	// THE ENGINE ALREADY SOLVES THIS, and its solution is a PIN RENAME, not a copy:
+	// FNiagaraStackGraphUtilities::SynchronizeReferencingMapPinsWithFunctionCall
+	// (NiagaraStackGraphUtilities.cpp:4184-4265) does exactly
+	//
+	//     OverridePin->Modify();
+	//     OverridePin->PinName = UpdatedOverrideHandle.GetParameterHandleString();   // :4236
+	//
+	// That is the whole repair, and it is the RIGHT one: renaming a pin touches neither its
+	// links, nor its DefaultValue, nor the dynamic-input subgraph hanging off it, nor a data
+	// interface bound to it. Every one of those survives BY CONSTRUCTION — which is precisely
+	// what clone_module_overrides drops or misreports (gap #90).
+	//
+	// WHY WE CANNOT JUST CALL THE ENGINE'S VERSION. It is reached through
+	// UNiagaraNodeFunctionCall::RefreshFromExternalChanges (NiagaraNodeFunctionCall.cpp:1149),
+	// and it is driven by GUIDs, both ends of which are dead for this edit:
+	//
+	//   1. It looks the override pin up via GetBoundPinGuidsByName (:4217), whose BoundPinNames
+	//      map is only ever populated by GetOrCreateStackFunctionInputOverridePin when it is
+	//      handed a VALID InputScriptVariableId (NiagaraStackGraphUtilities.cpp:1998-2001).
+	//      Every Monolith call site passes FGuid() — so the map is empty and the loop body never
+	//      runs. (Logged as gap #94; fixing it is worthwhile but out of scope here.)
+	//   2. Even with the binding armed it would still miss, because UNiagaraGraph::RenameParameter
+	//      mints a BRAND NEW guid for the renamed parameter — NewScriptVariable->Metadata
+	//      .CreateNewGuid() (NiagaraGraph.cpp:2846) — and drops the old registry entry (:2854).
+	//      GetVariableIdToVariableMap keys on Metadata.GetVariableGuid()
+	//      (NiagaraStackGraphUtilities.cpp:3929), so the old guid is simply not in the map.
+	//      (Gap #95.) This is the mechanical explanation for I-38 and for gap #62's "nothing
+	//      refreshes a placed caller".
+	//
+	// So we do the rename BY STRING, which is sound because this action already knows both
+	// names exactly. Two consequences settled from source rather than assumed:
+	//
+	//   * RefreshFromExternalChanges() is NOT called afterwards, and must not be. A module input
+	//     declared as "Module.X" on a ParameterMapGet is not a pin on the function-call node at
+	//     all: UNiagaraNodeFunctionCall::AllocateDefaultPins builds that node's pins from exposed
+	//     UNiagaraNodeInput nodes (NiagaraNodeFunctionCall.cpp:399-403), static switch inputs
+	//     (:435-441) and graph outputs (:448) — never from map-get parameters. The caller's node
+	//     pin set is therefore UNCHANGED by this rename, and ReallocatePins(false)
+	//     (NiagaraNode.cpp:264-273, which discards and rebuilds every pin, rematching by guid
+	//     then by name) is a strictly larger and riskier operation with nothing to gain. The one
+	//     thing skipping it leaves stale is CachedChangeId, whose only reader is the bReload test
+	//     at NiagaraNodeFunctionCall.cpp:1114 — leaving it stale merely means a later refresh
+	//     correctly decides to reload. Conservative and correct agree here.
+	//   * An input that was never overridden needs NOTHING. Its value does not exist anywhere on
+	//     the caller — there is no override pin, because override pins only come into being when
+	//     GetOrCreateStackFunctionInputOverridePin creates one. The module simply reads the newly
+	//     named parameter and gets its default.
+	//
+	// ALL-OR-NOTHING (gap #36, proven 0 -> 17 -> 17): every caller is located and vetted BEFORE
+	// BeginTransaction, because CancelTransaction discards the undo record and not the changes.
+	// If any caller cannot be repaired, nothing is touched at all.
+	// ====================================================================================
+
+	/** One placed call of the edited script, and what this action can do about it. */
+	struct FPlacedCaller
+	{
+		UNiagaraNodeFunctionCall* Node = nullptr;
+		UNiagaraGraph*  OwnerGraph = nullptr;
+		UObject*        OwnerAsset = nullptr;     // the UNiagaraSystem / UNiagaraEmitter to re-save
+		FString         AssetPath;
+		FString         FunctionName;             // the placed module's unique name in its stack
+		UEdGraphNode*   OverrideNode = nullptr;   // the ParameterMapSet carrying the override pin
+		UEdGraphPin*    OverridePin = nullptr;    // null == this caller never overrode the parameter
+		FString         OldPinName;
+		FString         NewPinName;
+		FString         Blocker;                  // non-empty == unrepairable; abort everything
+	};
+
+	/**
+	 * Every node graph inside a Niagara asset. A system keeps the system spawn/update graph on its
+	 * spawn script and one shared graph per emitter handle on FVersionedNiagaraEmitterData::GraphSource
+	 * (the same access path FindModuleNode uses, :3491-3505) — event and simulation-stage modules live
+	 * in that shared emitter graph too, so enumerating graphs covers them without enumerating usages.
+	 */
+	static void CollectCallerGraphs(UObject* Asset, TArray<UNiagaraGraph*>& OutGraphs)
+	{
+		auto AddSource = [&OutGraphs](UNiagaraScriptSourceBase* SourceBase)
+		{
+			UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(SourceBase);
+			if (Source && Source->NodeGraph) OutGraphs.AddUnique(Source->NodeGraph);
+		};
+
+		if (UNiagaraSystem* System = Cast<UNiagaraSystem>(Asset))
+		{
+			if (UNiagaraScript* SysSpawn = System->GetSystemSpawnScript())
+			{
+				AddSource(SysSpawn->GetLatestSource());
+			}
+			for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+			{
+				if (const FVersionedNiagaraEmitterData* ED = Handle.GetEmitterData())
+				{
+					AddSource(ED->GraphSource);
+				}
+			}
+		}
+		else if (UNiagaraEmitter* Emitter = Cast<UNiagaraEmitter>(Asset))
+		{
+			// A versioned emitter asset carries one graph PER VERSION, and a placed call in a
+			// non-exposed version breaks on load exactly like one in the exposed version.
+			const TArray<FNiagaraAssetVersion> Versions = Emitter->GetAllAvailableVersions();
+			if (Versions.Num() == 0)
+			{
+				if (FVersionedNiagaraEmitterData* ED = Emitter->GetLatestEmitterData())
+				{
+					AddSource(ED->GraphSource);
+				}
+			}
+			for (const FNiagaraAssetVersion& Version : Versions)
+			{
+				if (FVersionedNiagaraEmitterData* ED = Emitter->GetEmitterData(Version.VersionGuid))
+				{
+					AddSource(ED->GraphSource);
+				}
+			}
+		}
+	}
+
+	/**
+	 * The override pin for one input of one placed module.
+	 *
+	 * Replicates GetStackFunctionOverrideNode (NiagaraStackGraphUtilities.cpp:1918-1926), which
+	 * carries no export macro: the override node is whatever single node feeds the function call's
+	 * parameter-map INPUT pin. Deliberately typed as UEdGraphNode rather than
+	 * UNiagaraNodeParameterMapSet so this path keeps working in release builds, where
+	 * WITH_NIAGARA_WIZARD_PRIVATE=0 and that class is not even declared. The pin name is the only
+	 * identification needed and it is unambiguous — override pins are the only pins on that node
+	 * named "<FunctionName>.<Leaf>".
+	 */
+	static UEdGraphPin* FindFunctionOverridePin(UNiagaraNodeFunctionCall& Caller, const FName PinName,
+		UEdGraphNode*& OutOverrideNode)
+	{
+		OutOverrideNode = nullptr;
+		UEdGraphPin* MapIn = MonolithNiagaraHelpers::GetParameterMapPin(Caller, EGPD_Input);
+		if (!MapIn || MapIn->LinkedTo.Num() != 1 || !MapIn->LinkedTo[0]) return nullptr;
+
+		UEdGraphNode* OverrideNode = MapIn->LinkedTo[0]->GetOwningNode();
+		if (!OverrideNode) return nullptr;
+
+		for (UEdGraphPin* P : OverrideNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Input && P->PinName == PinName)
+			{
+				OutOverrideNode = OverrideNode;
+				return P;
+			}
+		}
+		return nullptr;
+	}
+
+	/** True if any input pin on this node already carries Name — a rename onto it would collide. */
+	static bool NodeHasInputPinNamed(const UEdGraphNode* Node, const FName Name)
+	{
+		if (!Node) return false;
+		for (const UEdGraphPin* P : Node->Pins)
+		{
+			if (P && P->Direction == EGPD_Input && P->PinName == Name) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Walk package -> asset -> graph -> placed UNiagaraNodeFunctionCall.
+	 *
+	 * The referencer list is the asset-registry PACKAGE graph, which is a SUPERSET and is all the
+	 * warning path has ever had (it loads nothing and traverses nothing). Repairing requires the
+	 * real thing, so this LOADS each referencing Niagara asset. Only assets whose registry class is
+	 * UNiagaraSystem or UNiagaraEmitter are loaded — a referencing level or Blueprint is counted
+	 * and skipped, never loaded.
+	 *
+	 * OutUnreadable collects Niagara packages that could not be resolved to an asset. Those are
+	 * BLOCKERS when repair is on: a caller we cannot see is a caller we cannot promise about.
+	 */
+	static void CollectPlacedCallers(UNiagaraScript* Script, const FString& OldFullName, const FString& NewFullName,
+		TArray<FPlacedCaller>& OutCallers, TArray<FString>& OutUnreadable, int32& OutNonNiagaraReferencers)
+	{
+		OutNonNiagaraReferencers = 0;
+
+		UPackage* Pkg = Script ? Script->GetOutermost() : nullptr;
+		if (!Pkg) return;
+
+		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+		// An EMBEDDED script (scratch pad / event / sim stage) is not its package's asset, so its
+		// caller is the owning asset itself and the referencer graph would answer about that
+		// asset's referencers instead — a different question entirely.
+		const bool bEmbedded = !(Script->GetOuter() == Pkg && Script->HasAnyFlags(RF_Public | RF_Standalone));
+
+		TArray<FName> PackagesToInspect;
+		if (bEmbedded)
+		{
+			PackagesToInspect.Add(FName(*Pkg->GetName()));
+		}
+		else
+		{
+			AR.GetReferencers(FName(*Pkg->GetName()), PackagesToInspect);
+		}
+
+		const FTopLevelAssetPath SystemClassPath  = UNiagaraSystem::StaticClass()->GetClassPathName();
+		const FTopLevelAssetPath EmitterClassPath = UNiagaraEmitter::StaticClass()->GetClassPathName();
+
+		for (const FName& PackageName : PackagesToInspect)
+		{
+			TArray<FAssetData> Assets;
+			AR.GetAssetsByPackageName(PackageName, Assets, /*bIncludeOnlyOnDiskAssets=*/false);
+
+			bool bAnyNiagara = false;
+			for (const FAssetData& AssetData : Assets)
+			{
+				if (AssetData.AssetClassPath != SystemClassPath && AssetData.AssetClassPath != EmitterClassPath)
+				{
+					continue;
+				}
+				bAnyNiagara = true;
+
+				UObject* Asset = AssetData.GetAsset();
+				if (!Asset)
+				{
+					OutUnreadable.Add(AssetData.GetObjectPathString());
+					continue;
+				}
+
+				TArray<UNiagaraGraph*> Graphs;
+				CollectCallerGraphs(Asset, Graphs);
+				for (UNiagaraGraph* Graph : Graphs)
+				{
+					if (!Graph) continue;
+					TArray<UNiagaraNodeFunctionCall*> FunctionCalls;
+					Graph->GetNodesOfClass<UNiagaraNodeFunctionCall>(FunctionCalls);
+					for (UNiagaraNodeFunctionCall* Call : FunctionCalls)
+					{
+						if (!Call || Call->FunctionScript != Script) continue;
+
+						FPlacedCaller C;
+						C.Node         = Call;
+						C.OwnerGraph   = Graph;
+						C.OwnerAsset   = Asset;
+						C.AssetPath    = Asset->GetPathName();
+						C.FunctionName = Call->GetFunctionName();
+
+						// The override pin carries the ALIASED handle: "Module.X" on the script is
+						// "<FunctionName>.X" on the caller. CreateAliasedModuleParameterHandle
+						// returns the name UNCHANGED for anything outside the Module namespace
+						// (NiagaraParameterHandle.cpp:55-70) — which is right: a Local.*/Particles.*
+						// parameter is not a module input and has no override pin to find.
+						const FName OldAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+							FName(*OldFullName), FName(*C.FunctionName)).GetParameterHandleString();
+						const FName NewAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+							FName(*NewFullName), FName(*C.FunctionName)).GetParameterHandleString();
+						C.OldPinName = OldAliased.ToString();
+						C.NewPinName = NewAliased.ToString();
+
+						C.OverridePin = FindFunctionOverridePin(*Call, OldAliased, C.OverrideNode);
+
+						// Safety net that should never fire: a pin for this parameter on the
+						// function-call NODE itself would mean the parameter is exposed as a
+						// UNiagaraNodeInput or a static switch, and those need ReallocatePins,
+						// not a pin rename. Static switches are refused earlier by interlock 1;
+						// report anything else rather than half-repair it.
+						if (NodeHasInputPinNamed(Call, FName(*OldFullName)) || NodeHasInputPinNamed(Call, OldAliased))
+						{
+							C.Blocker = FString::Printf(TEXT(
+								"the module node itself carries a pin named '%s', so this parameter is exposed as a node "
+								"input or static switch rather than a map-get module input; that needs a pin "
+								"reallocation, which this action does not do"), *OldFullName);
+						}
+						else if (C.OverridePin != nullptr && NodeHasInputPinNamed(C.OverrideNode, NewAliased))
+						{
+							C.Blocker = FString::Printf(TEXT(
+								"its override node already has a pin named '%s', so renaming '%s' onto it would leave two "
+								"pins sharing one name"), *C.NewPinName, *C.OldPinName);
+						}
+
+						OutCallers.Add(C);
+					}
+				}
+			}
+
+			if (!bAnyNiagara)
+			{
+				++OutNonNiagaraReferencers;
+			}
+		}
+	}
+
 	/**
 	 * I-20 / gap #62 — the hazard both surface-changing actions share.
 	 *
@@ -26988,6 +27283,15 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 	bool bAllowMerge = false;
 	FString BoolError;
 	if (!ReadStrictBool(Params, TEXT("allow_merge"), false, bAllowMerge, BoolError))
+	{
+		return FMonolithActionResult::Error(BoolError);
+	}
+
+	// Gap #93. Defaults ON: a rename that leaves its callers broken on next load (I-38) is the
+	// bug, not the feature. fix_placed_callers=false restores the old warn-only behaviour, which
+	// is still the right choice when you intend to re-point the callers by hand.
+	bool bFixPlacedCallers = true;
+	if (!ReadStrictBool(Params, TEXT("fix_placed_callers"), true, bFixPlacedCallers, BoolError))
 	{
 		return FMonolithActionResult::Error(BoolError);
 	}
@@ -27110,6 +27414,41 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		}
 	}
 
+	// --- locate and vet every placed caller, still BEFORE the transaction (gap #93) ----------
+	// All-or-nothing: if any caller cannot be repaired we must refuse here, while the asset is
+	// untouched, because CancelTransaction discards the undo record and not the changes (#36).
+	TArray<FPlacedCaller> PlacedCallers;
+	TArray<FString> UnreadableCallerAssets;
+	int32 NonNiagaraReferencers = 0;
+	if (bFixPlacedCallers)
+	{
+		CollectPlacedCallers(Script, ParamName, NewName, PlacedCallers, UnreadableCallerAssets, NonNiagaraReferencers);
+
+		TArray<FString> Blocked;
+		for (const FPlacedCaller& C : PlacedCallers)
+		{
+			if (!C.Blocker.IsEmpty())
+			{
+				Blocked.Add(FString::Printf(TEXT("%s / module '%s': %s"), *C.AssetPath, *C.FunctionName, *C.Blocker));
+			}
+		}
+		for (const FString& Unreadable : UnreadableCallerAssets)
+		{
+			Blocked.Add(FString::Printf(TEXT(
+				"%s: the asset could not be loaded, so its placed calls could not be inspected"), *Unreadable));
+		}
+		if (Blocked.Num() > 0)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing '%s' -> '%s': %d placed caller(s) could not be repaired, and this action is all-or-nothing "
+				     "because CancelTransaction discards the undo record rather than the changes. %s. Pass "
+				     "fix_placed_callers=false to rename anyway and get the old warn-only behaviour — but then those "
+				     "callers keep an override pin naming a parameter the script no longer declares, which compiles clean "
+				     "in-session and fails on the NEXT LOAD (I-38). NOTHING WAS CHANGED."),
+				*ParamName, *NewName, Blocked.Num(), *FString::Join(Blocked, TEXT("; "))));
+		}
+	}
+
 	TArray<FString> Warnings;
 
 	// A name with no namespace is legal and is very rarely what was meant: 'Amount' and
@@ -27137,6 +27476,50 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 	bool bMerged = false;
 	const bool bRenamed = Graph->RenameParameter(OldKey, FName(*NewName), /*bRenameRequestedFromStaticSwitch=*/false,
 		&bMerged, /*bSuppressEvents=*/false);
+
+	// The caller repair rides INSIDE the same transaction as the rename, so undo restores both or
+	// neither. This is the engine's own repair, by string: NiagaraStackGraphUtilities.cpp:4235-4236.
+	// Renaming the pin leaves its links, DefaultValue, dynamic-input subgraph and bound data
+	// interface untouched — that is the entire reason this beats a copy-and-reapply.
+	int32 CallersRepaired = 0;
+	int32 CallersWithNoOverride = 0;
+	TArray<UNiagaraGraph*> TouchedCallerGraphs;
+	TArray<UObject*> TouchedCallerAssets;
+	TArray<TSharedPtr<FJsonValue>> RepairRows;
+	if (bRenamed)
+	{
+		for (FPlacedCaller& C : PlacedCallers)
+		{
+			TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("asset"), C.AssetPath);
+			Row->SetStringField(TEXT("module"), C.FunctionName);
+
+			if (C.OverridePin == nullptr || C.OverrideNode == nullptr)
+			{
+				// Nothing was ever overridden on this input, so there is no stale pin and nothing
+				// to repair — the module now reads the new name and gets its default.
+				++CallersWithNoOverride;
+				Row->SetBoolField(TEXT("repaired"), false);
+				Row->SetStringField(TEXT("status"), TEXT("no_override_pin"));
+				RepairRows.Add(MakeShared<FJsonValueObject>(Row));
+				continue;
+			}
+
+			C.OverrideNode->Modify();
+			C.OverridePin->Modify();
+			C.OverridePin->PinName = FName(*C.NewPinName);
+			++CallersRepaired;
+
+			TouchedCallerGraphs.AddUnique(C.OwnerGraph);
+			TouchedCallerAssets.AddUnique(C.OwnerAsset);
+
+			Row->SetBoolField(TEXT("repaired"), true);
+			Row->SetStringField(TEXT("status"), TEXT("override_pin_renamed"));
+			Row->SetStringField(TEXT("pin_before"), C.OldPinName);
+			Row->SetStringField(TEXT("pin_after"), C.NewPinName);
+			RepairRows.Add(MakeShared<FJsonValueObject>(Row));
+		}
+	}
 	GEditor->EndTransaction();
 
 	if (!bRenamed)
@@ -27151,7 +27534,44 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 
 	Graph->NotifyGraphChanged();
 	Graph->ConditionalRefreshParameterReferences();
+
+	// Bump each repaired caller graph's ChangeID. MarkGraphRequiresSynchronization — what the
+	// engine calls here (NiagaraStackGraphUtilities.cpp:4335) — carries no export macro and is
+	// non-virtual, so it cannot be called from this module; NotifyGraphChanged is virtual, is
+	// reachable through the vtable, and updates the ChangeID too (NiagaraGraph.h:325-326).
+	for (UNiagaraGraph* CallerGraph : TouchedCallerGraphs)
+	{
+		if (CallerGraph && CallerGraph != Graph)
+		{
+			CallerGraph->NotifyGraphChanged();
+		}
+	}
+
 	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
+
+	// A repaired caller that is never written back is worse than no repair at all: the script
+	// rename IS on disk, so an unsaved caller reverts to the broken state on restart.
+	TArray<FString> CallerAssetsSaved;
+	TArray<FString> CallerAssetsUnsaved;
+	for (UObject* CallerAsset : TouchedCallerAssets)
+	{
+		if (!CallerAsset) continue;
+		if (CallerAsset->GetOutermost() == Script->GetOutermost())
+		{
+			// Embedded script: the caller and the script share one package, already saved above.
+			continue;
+		}
+		const FMonolithSaveOutcome CallerOutcome = NA_SaveObjectPackage(CallerAsset);
+		if (CallerOutcome.bSaved)
+		{
+			CallerAssetsSaved.Add(CallerAsset->GetPathName());
+		}
+		else
+		{
+			CallerAssetsUnsaved.Add(FString::Printf(TEXT("%s (%s)"),
+				*CallerAsset->GetPathName(), *CallerOutcome.Error));
+		}
+	}
 
 	// --- verify off the GRAPH, not off the request (defect pattern 2) -----------------------
 	TArray<FNiagaraVariable> NewKeys;
@@ -27201,12 +27621,66 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 			*ParamName, *NewName, *ParamName));
 	}
 
-	AppendPlacedCallerWarning(Script, ScriptPath,
-		TEXT("A rename"),
-		TEXT("a placed module keeps an input pin named after the OLD parameter, which nothing in the script writes any "
-		     "more — a dead read that compiles clean and returns a default forever, and any value set on it in the "
-		     "stack is silently orphaned."),
-		R, Warnings);
+	R->SetBoolField(TEXT("fix_placed_callers"), bFixPlacedCallers);
+	if (bFixPlacedCallers)
+	{
+		R->SetNumberField(TEXT("placed_callers_found"), PlacedCallers.Num());
+		R->SetNumberField(TEXT("placed_callers_repaired"), CallersRepaired);
+		R->SetNumberField(TEXT("placed_callers_without_override"), CallersWithNoOverride);
+		R->SetArrayField(TEXT("placed_caller_repairs"), RepairRows);
+		if (NonNiagaraReferencers > 0)
+		{
+			R->SetNumberField(TEXT("non_niagara_referencing_packages"), NonNiagaraReferencers);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> SavedArr;
+		for (const FString& S : CallerAssetsSaved) SavedArr.Add(MakeShared<FJsonValueString>(S));
+		R->SetArrayField(TEXT("placed_caller_assets_saved"), SavedArr);
+
+		if (CallerAssetsUnsaved.Num() > 0)
+		{
+			Warnings.Add(FString::Printf(TEXT(
+				"PLACED CALLERS REPAIRED BUT NOT SAVED: %s. The rename itself IS on disk, so these assets are repaired "
+				"only in memory and will revert to the broken state when the editor restarts. Save them by hand before "
+				"closing."),
+				*FString::Join(CallerAssetsUnsaved, TEXT(", "))));
+		}
+
+		if (CallersRepaired > 0)
+		{
+			Warnings.Add(FString::Printf(TEXT(
+				"PLACED CALLERS REPAIRED: %d override pin(s) across %d placed module(s) were renamed from '<module>.%s' to "
+				"'<module>.%s' in place, which is what the engine's own repair does "
+				"(NiagaraStackGraphUtilities.cpp:4236) — links, default values, dynamic-input chains and data interfaces "
+				"are preserved because only the pin NAME changed. %d placed module(s) had never overridden this input and "
+				"needed nothing. THIS ACTION CANNOT VERIFY ITS OWN WORK: per I-37 an in-session compile does not "
+				"re-translate a dependent system, so a clean compile right now proves nothing either way. RELOAD each "
+				"listed asset and check its compile status before trusting this."),
+				CallersRepaired, CallersRepaired, *ParamName, *NewName, CallersWithNoOverride));
+		}
+		else if (PlacedCallers.Num() == 0)
+		{
+			R->SetStringField(TEXT("placed_callers_note"), TEXT(
+				"No placed call of this script was found in any referencing Niagara asset. Unlike the warn-only path this "
+				"is a real traversal (package -> system/emitter -> graph -> function-call node), not an asset-registry "
+				"guess — but it can still only see what the asset registry lists, so an unsaved system open in the editor "
+				"would not appear."));
+		}
+	}
+	else
+	{
+		// Opt-out path: unchanged behaviour, and it remains the only true thing this action can
+		// say about the callers when it has not touched them.
+		AppendPlacedCallerWarning(Script, ScriptPath,
+			TEXT("A rename"),
+			TEXT("a placed module keeps an input pin named after the OLD parameter, which nothing in the script writes any "
+			     "more — a dead read that compiles clean and returns a default forever, and any value set on it in the "
+			     "stack is silently orphaned."),
+			R, Warnings);
+		Warnings.Add(TEXT(
+			"fix_placed_callers=false was passed, so no caller was repaired. Re-run with fix_placed_callers=true (the "
+			"default) to rename the stale override pins in place."));
+	}
 
 	AttachWarnings(R, Warnings);
 	NA_ReportSave(R, SaveOutcome, ScriptPath);
