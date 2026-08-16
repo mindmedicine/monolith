@@ -8248,14 +8248,20 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	}
 	else if (bIsModule)
 	{
-		OutputNode->Outputs.Add(FNiagaraVariable(FNiagaraTypeDefinition::GetParameterMapDef(), TEXT("Output")));
-		for (const FPinDef& Output : ParsedOutputs)
-		{
-			// Namespaced outputs (System.X etc.) flow through the MapSet only — adding them
-			// here would leave a dangling typed pin on the OutputNode.
-			if (!Output.WritePinName.IsEmpty()) continue;
-			OutputNode->Outputs.Add(FNiagaraVariable(Output.Type, FName(*Output.Name)));
-		}
+		// A module's Output node carries the ParameterMap and NOTHING else. The engine is explicit:
+		// FNiagaraScriptOutputCollectionViewModel::SupportsType
+		// (NiagaraScriptOutputCollectionViewModel.cpp:213-223) rejects every non-map type when the
+		// usage is Module — "We only support parameter map outputs for modules."
+		//
+		// EVERY module output leaves through the MapSet below, bare or namespaced alike. A typed
+		// pin here produces a module the editor can neither author nor repair: the Outputs array
+		// refuses new entries and renders any existing one greyed out, so a human cannot even
+		// delete it. Typed outputs on the Output node belong to dynamic-input and function scripts.
+		//
+		// Named "OutputMap" to match Epic's stock modules exactly (verified on
+		// /Niagara/Modules/Collision/Collision). Cosmetic only — GetParameterMapPin resolves by
+		// type, never by name.
+		OutputNode->Outputs.Add(FNiagaraVariable(FNiagaraTypeDefinition::GetParameterMapDef(), TEXT("OutputMap")));
 	}
 	else if (ParsedOutputs.Num() > 0)
 	{
@@ -8533,18 +8539,12 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 			}
 			else if (HlslPin->Direction == EGPD_Output)
 			{
+				// The MapSet write is the module's ONLY output path. There is deliberately no
+				// second wire to the OutputNode: it has just the ParameterMap pin (see its
+				// construction above), which the MapSet already feeds.
 				if (UEdGraphPin* const* SetPin = MapSetPinsByShortName.Find(HlslPin->PinName))
 				{
 					Schema->TryCreateConnection(HlslPin, *SetPin);
-				}
-
-				for (UEdGraphPin* OutPin : OutputNode->Pins)
-				{
-					if (OutPin->Direction == EGPD_Input && OutPin->PinName == HlslPin->PinName)
-					{
-						Schema->TryCreateConnection(HlslPin, OutPin);
-						break;
-					}
 				}
 			}
 		}
