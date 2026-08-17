@@ -995,7 +995,15 @@ FMonolithActionResult FMonolithMeshAccessibilityActions::ValidateInteractiveReac
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("actors_checked"), AllItems.Num());
 	Result->SetNumberField(TEXT("errors"), ErrorCount);
-	Result->SetNumberField(TEXT("warnings"), WarningCount);
+	// Gap #111 — this COUNT used to be parked on the key `warnings`, which belongs to the
+	// framework's warning ARRAY. FMonolithToolRegistry::ExecuteAction merges dispatch-layer
+	// warnings with TryGetArrayField(TEXT("warnings")) followed by SetArrayField: the read
+	// fails on a number, so the merge starts from empty and the write REPLACES the count
+	// with an array. One mistyped param on this action (its schema declares region_min /
+	// region_max / tags, so any other key trips the unknown-param soft-warn) was enough to
+	// make the count vanish with no trace. Renamed rather than defended — the key is not
+	// this action's to use.
+	Result->SetNumberField(TEXT("warning_count"), WarningCount);
 	Result->SetNumberField(TEXT("ok"), OKCount);
 	Result->SetBoolField(TEXT("all_pass"), ErrorCount == 0 && WarningCount == 0);
 	Result->SetArrayField(TEXT("items"), ItemsArr);

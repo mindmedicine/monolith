@@ -10453,9 +10453,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetStringField(TEXT("resolved_type"), ResolvedTypeName);
 
+	// Gap #111 — these two cautions BOTH used to be written to a singular `warning` STRING
+	// on this same object, so whichever fired second silently erased the first, and neither
+	// was visible to the framework's `warnings[]` merge or to any reader following gap #88.
+	// They are appended to the array channel now: two independent cautions, both delivered.
 	if (bTypeFellBack)
 	{
-		ResultObj->SetStringField(TEXT("warning"), FString::Printf(TEXT("Unknown type '%s' — defaulted to float. Valid types: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix"), *TypeName));
+		FMonolithJsonUtils::AddWarning(ResultObj, FString::Printf(TEXT("Unknown type '%s' — defaulted to float. Valid types: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix"), *TypeName));
 	}
 
 	// Gap #106 — "with default" is claimed ONLY for a value that reached the runtime store.
@@ -10465,7 +10469,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	// data and IS NOT in the store, and a caller reading it back will see the difference.
 	if (bDefaultSet && !bStoreValueWritten)
 	{
-		ResultObj->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(ResultObj, FString::Printf(
 			TEXT("Default for '%s' (%s) parsed and was stored as the editor-data default, but no runtime "
 				 "store write path covers this type — get_parameter_value may report the type default "
 				 "until the system is recompiled. Verify before relying on it."),
@@ -11707,6 +11711,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 				NearMatches.Num() > 0
 					? *FString::Printf(TEXT(" Did you mean: %s?"), *FString::Join(NearMatches, TEXT(", ")))
 					: TEXT("")));
+		}
+
+		// GAP #111 — a sub-op dispatched through this table never passes through
+		// FMonolithToolRegistry::ExecuteAction, so nothing merges its structured
+		// FMonolithActionResult::Warnings the way a top-level call does. Fold them in here
+		// with the same two rules ExecuteAction uses (array on success, message text on
+		// refusal) so a handler that adopts the structured channel is not silently mute
+		// inside a batch — and so the warned-step detection below can see them.
+		// INERT for every handler that does not populate Warnings, which today is all of them.
+		if (SubResult.bSuccess && SubResult.Result.IsValid())
+		{
+			FMonolithJsonUtils::AddWarnings(SubResult.Result, SubResult.Warnings);
+		}
+		else if (!SubResult.bSuccess)
+		{
+			SubResult.ErrorMessage += FMonolithActionResult::FormatWarningBlock(SubResult.Warnings);
 		}
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
@@ -22365,7 +22385,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleImportSystemSpec(const TSha
 		TEXT("export->import round trip looks like it does, use duplicate_system (templating), diff_systems ")
 		TEXT("(comparison) or source control (backup) instead.");
 
-	Final->SetStringField(TEXT("warning"), Warning);
+	// Gap #111 — this was a singular `warning` STRING sitting eight lines from an `errors`
+	// ARRAY on the same object: both conventions, one response. The array is the documented
+	// channel (gap #88), so the caution goes there and the two advisory shapes agree.
+	FMonolithJsonUtils::AddWarning(Final, Warning);
 
 	if (Errors.Num() > 0)
 	{

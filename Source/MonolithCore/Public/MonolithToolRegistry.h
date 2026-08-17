@@ -19,6 +19,22 @@ struct FMonolithActionResult
 	// errors that don't carry structured data.
 	TSharedPtr<FJsonValue> ErrorData;
 
+	// Gap #111 — the ONE structured channel for non-fatal cautions.
+	//
+	// Before this existed there was no way for a handler to say "attach this warning":
+	// 168 emission sites hand-rolled it, 58 of them onto a singular `warning` STRING that
+	// FMonolithToolRegistry::ExecuteAction's merge (which reads `warnings` as an ARRAY)
+	// cannot see, and gap #88 tells every reader to check the array. Anything added here
+	// is merged into the response's `warnings[]` on success and APPENDED TO ErrorMessage
+	// on refusal — see the merge block in ExecuteAction for why the refusal path is text.
+	//
+	// Deliberately NOT a replacement for writing `warnings[]` onto the Result object: a
+	// handler reachable through niagara.batch_execute's direct function-pointer table
+	// bypasses ExecuteAction entirely, and only the batch's own merge (which folds this
+	// array in) makes the structured channel visible there. When in doubt for a batchable
+	// action, FMonolithJsonUtils::AddWarning onto the Result object is the safer channel.
+	TArray<FString> Warnings;
+
 	static FMonolithActionResult Success(const TSharedPtr<FJsonObject>& InResult)
 	{
 		FMonolithActionResult R;
@@ -42,6 +58,57 @@ struct FMonolithActionResult
 		if (Data.IsValid()) { ErrorData = MakeShared<FJsonValueObject>(Data); }
 		else { ErrorData.Reset(); }
 		return *this;
+	}
+
+	/**
+	 * Gap #111 — attach a non-fatal caution to this result. Fluent, so it chains onto
+	 * either factory:
+	 *
+	 *     return FMonolithActionResult::Success(Obj).WithWarning(TEXT("coerced X to Y"));
+	 *     return FMonolithActionResult::Error(TEXT("refused")).WithWarning(TEXT("...also, X"));
+	 *
+	 * Empty strings are IGNORED, so a call site may pass a conditionally-built string
+	 * without guarding it. Order is preserved and duplicates are NOT collapsed: two
+	 * warnings that happen to read alike are usually about two different things, and
+	 * silently dropping the second is exactly the clobber this channel exists to end.
+	 */
+	FMonolithActionResult& WithWarning(const FString& InWarning)
+	{
+		if (!InWarning.IsEmpty()) { Warnings.Add(InWarning); }
+		return *this;
+	}
+
+	/** Gap #111 — attach several cautions at once. Empty entries are ignored, as above. */
+	FMonolithActionResult& WithWarnings(const TArray<FString>& InWarnings)
+	{
+		for (const FString& W : InWarnings) { WithWarning(W); }
+		return *this;
+	}
+
+	/**
+	 * Gap #110/#111 — render warnings as a text block for the REFUSAL path.
+	 *
+	 * A failed action has no `Result` object to hang `warnings[]` on, and the tools/call
+	 * transport gives an error response no structured field at all (MonolithHttpServer's
+	 * error branch emits `ErrorMessage` and `isError` and nothing else), so on that path
+	 * the warnings ride in the message. Text is a downgrade from structure; being silently
+	 * destroyed — which is what happened before — is worse.
+	 *
+	 * Returns an EMPTY string when there are no warnings, so call sites can append
+	 * unconditionally without manufacturing an empty "Warnings (0)" suffix.
+	 */
+	static FString FormatWarningBlock(const TArray<FString>& InWarnings)
+	{
+		if (InWarnings.Num() == 0) { return FString(); }
+		FString Block;
+		for (const FString& W : InWarnings)
+		{
+			Block += TEXT("\n  - ");
+			Block += W;
+		}
+		return FString::Printf(
+			TEXT("\n\nWarnings also raised on this call (%d) — carried in this message because a FAILED call has no warnings[] channel:%s"),
+			InWarnings.Num(), *Block);
 	}
 };
 

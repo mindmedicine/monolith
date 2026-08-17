@@ -89,6 +89,35 @@ TSharedRef<FJsonValueArray> FMonolithJsonUtils::StringArrayToJson(const TArray<F
 	return MakeShared<FJsonValueArray>(JsonArray);
 }
 
+void FMonolithJsonUtils::AddWarning(const TSharedPtr<FJsonObject>& Obj, const FString& Warning)
+{
+	if (!Obj.IsValid() || Warning.IsEmpty())
+	{
+		return;
+	}
+
+	// Read-then-rewrite, matching FMonolithToolRegistry::ExecuteAction's merge exactly:
+	// TryGetArrayField fails on a non-array (including a number), leaving Existing empty,
+	// and the SetArrayField below then replaces it. Same semantics in both places by
+	// design — two copies of one rule is how the defect class this fixes got started.
+	TArray<TSharedPtr<FJsonValue>> Existing;
+	const TArray<TSharedPtr<FJsonValue>>* Found = nullptr;
+	if (Obj->TryGetArrayField(TEXT("warnings"), Found) && Found)
+	{
+		Existing = *Found;
+	}
+	Existing.Add(MakeShared<FJsonValueString>(Warning));
+	Obj->SetArrayField(TEXT("warnings"), Existing);
+}
+
+void FMonolithJsonUtils::AddWarnings(const TSharedPtr<FJsonObject>& Obj, const TArray<FString>& Warnings)
+{
+	for (const FString& W : Warnings)
+	{
+		AddWarning(Obj, W);
+	}
+}
+
 // =============================================================================
 //  Survivor B — Universal Response Shaping
 //

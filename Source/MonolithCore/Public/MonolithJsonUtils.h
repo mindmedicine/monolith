@@ -68,6 +68,31 @@ public:
 	/** Create a JSON array from a TArray of strings */
 	static TSharedRef<FJsonValueArray> StringArrayToJson(const TArray<FString>& Strings);
 
+	/**
+	 * Gap #111 — append a caution to a response object's `warnings[]` array, creating the
+	 * array if absent. THE ONLY correct way to put a warning on a response object.
+	 *
+	 * Exists because there was no helper at all: 168 sites hand-rolled the channel and 58
+	 * of them landed on a singular `warning` STRING which nothing merges and no documented
+	 * reader looks at (gap #88 tells readers to check the array). Two writes to the same
+	 * string key silently clobber each other — measured at MonolithNiagaraActions.cpp:10458
+	 * / :10468, where the second warning erased the first. Appending to an array cannot
+	 * do that.
+	 *
+	 * Preferred over FMonolithActionResult::WithWarning for any action reachable through
+	 * niagara.batch_execute's direct dispatch table, because that table bypasses
+	 * FMonolithToolRegistry::ExecuteAction and therefore also bypasses its merge; a
+	 * warnings[] array written here is visible on EVERY dispatch path.
+	 *
+	 * No-op on an invalid object or an empty string. If `warnings` exists but is not an
+	 * array (someone parked a COUNT there) it is REPLACED — that key belongs to this
+	 * channel, and a count on it was going to be destroyed by the registry merge anyway.
+	 */
+	static void AddWarning(const TSharedPtr<FJsonObject>& Obj, const FString& Warning);
+
+	/** Gap #111 — append several cautions to `warnings[]`. See AddWarning. */
+	static void AddWarnings(const TSharedPtr<FJsonObject>& Obj, const TArray<FString>& Warnings);
+
 	// --- JSON-RPC 2.0 Error Codes ---
 	static constexpr int32 ErrParseError = -32700;
 	static constexpr int32 ErrInvalidRequest = -32600;

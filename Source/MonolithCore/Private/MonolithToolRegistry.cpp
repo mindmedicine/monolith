@@ -586,24 +586,43 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	//   1. K3 unknown-param soft-warn (pre-existing behaviour)
 	//   2. Survivor D — AssetPath \→/ rewrite warnings (plan §3.D)
 	//   3. Survivor B — response-shaping warnings (plan §3.B, e.g. _fields/_omit collision)
-	if (ActionResult.bSuccess && ActionResult.Result.IsValid())
+	//   4. Gap #111 — FMonolithActionResult::Warnings, the handler's own structured channel
+	//
+	// GAP #110/#111 — this collection is NO LONGER GATED ON bSuccess, and that is the whole
+	// point of the change. It used to be, and the consequence was that a refusal destroyed
+	// every warning the call had produced: the rewrite and unknown-param warnings below were
+	// computed BEFORE the handler ran (lines ~503-576) and then thrown away the moment the
+	// handler said no. A call that both misspelled a param AND failed was told only that it
+	// failed — with no hint that the misspelling was the reason the param never arrived.
+	TArray<FString> AllWarnings;
+	AllWarnings.Append(PathParamWarnings);
+	for (const FString& K : Unknown)
 	{
-		TArray<FString> AllWarnings;
-		AllWarnings.Append(PathParamWarnings);
-		for (const FString& K : Unknown)
+		AllWarnings.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action));
+	}
+
+	if (ActionResult.bSuccess)
+	{
+		if (ActionResult.Result.IsValid())
 		{
-			AllWarnings.Add(FString::Printf(TEXT("Unknown param '%s' for action '%s:%s'"), *K, *Namespace, *Action));
+			// Survivor B post-filter — mutates ActionResult.Result in-place and may
+			// append its own warnings (e.g., mutually-exclusive _fields + _omit).
+			// Runs BEFORE attaching the warnings array so its warnings get included
+			// in the final emit; runs AFTER warning collection so the filter cannot
+			// strip the warnings[] key out from under us via _fields whitelist.
+			// (We attach warnings to ActionResult.Result AFTER ApplyResponseShaping.)
+			ApplyResponseShaping(ActionResult.Result, EffectiveParams, AllWarnings);
+		}
+		else if (ActionResult.Warnings.Num() > 0)
+		{
+			// A handler that explicitly attached a warning but returned no result object
+			// has nowhere to put it. Materialise the envelope rather than drop it —
+			// but ONLY for the new structured channel, so a Success(nullptr) carrying no
+			// handler warnings still serialises to exactly `{}` as it always has.
+			ActionResult.Result = MakeShared<FJsonObject>();
 		}
 
-		// Survivor B post-filter — mutates ActionResult.Result in-place and may
-		// append its own warnings (e.g., mutually-exclusive _fields + _omit).
-		// Runs BEFORE attaching the warnings array so its warnings get included
-		// in the final emit; runs AFTER warning collection so the filter cannot
-		// strip the warnings[] key out from under us via _fields whitelist.
-		// (We attach warnings to ActionResult.Result AFTER ApplyResponseShaping.)
-		ApplyResponseShaping(ActionResult.Result, EffectiveParams, AllWarnings);
-
-		if (AllWarnings.Num() > 0 && ActionResult.Result.IsValid())
+		if (ActionResult.Result.IsValid() && (AllWarnings.Num() > 0 || ActionResult.Warnings.Num() > 0))
 		{
 			TArray<TSharedPtr<FJsonValue>> Existing;
 			const TArray<TSharedPtr<FJsonValue>>* Found = nullptr;
@@ -611,12 +630,29 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 			{
 				Existing = *Found;
 			}
+			// Handler-origin first (the warnings[] it wrote itself, then its structured
+			// ones), dispatch-origin last: the caller should read what the ACTION has to
+			// say before the framework's commentary on the CALL.
+			for (const FString& W : ActionResult.Warnings)
+			{
+				Existing.Add(MakeShared<FJsonValueString>(W));
+			}
 			for (const FString& W : AllWarnings)
 			{
 				Existing.Add(MakeShared<FJsonValueString>(W));
 			}
 			ActionResult.Result->SetArrayField(TEXT("warnings"), Existing);
 		}
+	}
+	else
+	{
+		// REFUSAL PATH. There is no Result object here and the transport's error branch
+		// carries no structured field, so the warnings are appended to the message.
+		// FormatWarningBlock returns "" when there is nothing to say, so an ordinary
+		// error message is byte-for-byte unchanged.
+		TArray<FString> ErrWarnings = ActionResult.Warnings;
+		ErrWarnings.Append(AllWarnings);
+		ActionResult.ErrorMessage += FMonolithActionResult::FormatWarningBlock(ErrWarnings);
 	}
 
 	return ActionResult;
