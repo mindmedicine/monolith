@@ -320,8 +320,9 @@ bool FMonolithBatchSubOpAliasAcceptedTest::RunTest(const FString& /*Parameters*/
 
 // ---------------------------------------------------------------------------
 // Test 4: validation fails OPEN on an action the registry does not know.
-// batch_execute's table carries four batch-only op spellings (set_module_input,
-// set_module_binding, add_user_param, remove_user_param) that are not registered actions.
+// batch_execute's table carries five batch-only op spellings (set_module_input,
+// reset_module_input, set_module_binding, add_user_param, remove_user_param) that are not
+// registered actions.
 // They are mapped to their canonical action for validation; if that map ever misses one,
 // the op must keep working unvalidated rather than start reporting "unknown action".
 // ---------------------------------------------------------------------------
@@ -342,13 +343,15 @@ bool FMonolithBatchUnknownActionFailsOpenTest::RunTest(const FString& /*Paramete
 
 	TestTrue(TEXT("unknown action must validate as OK, not be rejected here"), V.bSuccess);
 
-	// And the four real batch-only spellings: still not registered actions, still mapped.
+	// And the five real batch-only spellings: still not registered actions, still mapped.
 	// If one of these ever becomes a registered action, the map entry is redundant — that is
 	// a maintenance signal, not a failure, so this only asserts the canonical targets exist.
 	if (FMonolithToolRegistry::Get().HasAction(TEXT("niagara"), TEXT("batch_execute")))
 	{
 		TestTrue(TEXT("canonical target set_module_input_value is registered"),
 			FMonolithToolRegistry::Get().HasAction(TEXT("niagara"), TEXT("set_module_input_value")));
+		TestTrue(TEXT("canonical target reset_module_input_to_default is registered"),
+			FMonolithToolRegistry::Get().HasAction(TEXT("niagara"), TEXT("reset_module_input_to_default")));
 		TestTrue(TEXT("canonical target set_module_input_binding is registered"),
 			FMonolithToolRegistry::Get().HasAction(TEXT("niagara"), TEXT("set_module_input_binding")));
 		TestTrue(TEXT("canonical target add_user_parameter is registered"),

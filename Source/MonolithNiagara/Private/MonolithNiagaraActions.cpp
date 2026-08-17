@@ -9,6 +9,7 @@
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraScript.h"
+#include "NiagaraConvertInPlaceUtilityBase.h"  // TSubclassOf<>::Get() needs the complete type (get_script_details ConversionUtility)
 #include "NiagaraScriptSource.h"
 #include "NiagaraScriptSourceBase.h"
 #include "NiagaraGraph.h"
@@ -98,6 +99,9 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 #include "MonolithNiagaraParameterNames.h"
 #include "MonolithNiagaraEnumValue.h"
 #include "MonolithNiagaraDefaultLiteral.h"
+#include "MonolithNiagaraResetInput.h"
+#include "MonolithNiagaraDependencyUsage.h"
+#include "NiagaraValidationRule.h"
 #include "NiagaraEmitterBase.h"
 
 #if WITH_NIAGARA_WIZARD_PRIVATE
@@ -4184,6 +4188,15 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"), { TEXT("input_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Value to set. Validated against the input's ACTUAL type; a value the type's own parser rejects is refused, never written. Composites take either spelling — \"1,2,3\" or \"(X=1,Y=2,Z=3)\" / \"(R=1,G=0.5,B=0,A=1)\" — and are re-spelled to whichever one that type parses, so read-back may differ from what you sent. Component count must match exactly."))
 			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("reset_module_input_to_default"),
+		TEXT("RECOVERY: clear a module input's override so it reads the module script's declared default again — the editor's per-input revert arrow. Removes the override pin AND any dynamic-input chain hanging off it, AND the RapidIterationParameters entry on every affected script (both stores, because the pin wins at compile time while rapid iteration goes stale). Use this to escape a corrupted or stuck input instead of removing and re-adding the whole module, which discards the module's other values. Already-at-default is a no-op success with a warning, not an error."),
+		FMonolithActionHandler::CreateStatic(&HandleResetModuleInputToDefault),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
+			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name"), TEXT("module") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name to reset"), { TEXT("input_name") })
+			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_input_binding"), TEXT("Bind a module input to a parameter"),
 		FMonolithActionHandler::CreateStatic(&HandleSetModuleInputBinding),
 		FParamSchemaBuilder()
@@ -4285,6 +4298,13 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleGetScriptMetadata),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_script_details"),
+		TEXT("READ-ONLY: the whole Script Details panel of a Niagara script asset (module, dynamic input or function). Superset of get_script_metadata. Includes the REQUIRED/PROVIDED DEPENDENCY declarations that define stack ordering — each required dependency reports id, Pre/Post type (plus a plain-language ordering statement), script constraint, required version, the Only-Evaluate-In-Script-Usage bitmask decoded to phase names, and the description carrying the per-stage remedy. Also: module usage bitmask (raw + stages), category, inline overview name, suggested, deprecation + conversion, experimental/note/debug-draw messages, library visibility, numeric output mode, description, keywords, collapsed/inline formats, type-conversion flag, script metadata and validation rules. Reads the EXPOSED version by default (NOT 'the newest') and always reports which version it read plus available_versions."),
+		FMonolithActionHandler::CreateStatic(&HandleGetScriptDetails),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"), { TEXT("asset_path") })
+			.Optional(TEXT("version"), TEXT("string"), TEXT("Version GUID to read, or 'exposed' (default). Omit to read the exposed version; call once and read available_versions to discover GUIDs. A module PLACED in a stack pins its own version via SelectedScriptVersion and may differ from the exposed one."), { TEXT("version_guid") })
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_script_metadata"), TEXT("Set versioned metadata of a Niagara script asset: stages (usage bitmask), category, description, keywords, suggested/experimental/deprecated flags"),
 		FMonolithActionHandler::CreateStatic(&HandleSetScriptMetadata),
@@ -11262,6 +11282,8 @@ static const TMap<FString, FMonolithNiagaraBatchOp>& NA_GetBatchOpTable()
 		T.Add(TEXT("remove_module"), &FN::HandleRemoveModule);
 		T.Add(TEXT("set_module_input_value"), &FN::HandleSetModuleInputValue);
 		T.Add(TEXT("set_module_input"), &FN::HandleSetModuleInputValue);            // alias
+		T.Add(TEXT("reset_module_input_to_default"), &FN::HandleResetModuleInputToDefault);
+		T.Add(TEXT("reset_module_input"), &FN::HandleResetModuleInputToDefault);    // alias
 		T.Add(TEXT("set_module_input_binding"), &FN::HandleSetModuleInputBinding);
 		T.Add(TEXT("set_module_binding"), &FN::HandleSetModuleInputBinding);        // alias
 		T.Add(TEXT("set_emitter_property"), &FN::HandleSetEmitterProperty);
@@ -11292,6 +11314,7 @@ static const TMap<FString, FMonolithNiagaraBatchOp>& NA_GetBatchOpTable()
 		T.Add(TEXT("get_emitter_summary"), &FN::HandleGetEmitterSummary);
 		T.Add(TEXT("list_emitter_properties"), &FN::HandleListEmitterProperties);
 		T.Add(TEXT("get_module_input_value"), &FN::HandleGetModuleInputValue);
+		T.Add(TEXT("get_script_details"), &FN::HandleGetScriptDetails);
 		T.Add(TEXT("get_module_inputs"), &FN::HandleGetModuleInputs);
 		// Wave 3
 		T.Add(TEXT("configure_curve_keys"), &FN::HandleConfigureCurveKeys);
@@ -11454,6 +11477,7 @@ static const TMap<FString, FString>& NA_GetBatchOpSchemaNames()
 	{
 		TMap<FString, FString> M;
 		M.Add(TEXT("set_module_input"), TEXT("set_module_input_value"));
+		M.Add(TEXT("reset_module_input"), TEXT("reset_module_input_to_default"));
 		M.Add(TEXT("set_module_binding"), TEXT("set_module_input_binding"));
 		M.Add(TEXT("add_user_param"), TEXT("add_user_parameter"));
 		M.Add(TEXT("remove_user_param"), TEXT("remove_user_parameter"));
@@ -18454,6 +18478,562 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRemoveDynamicInput(const TS
 	return NA_SuccessObj(R);
 }
 
+// ============================================================================
+// reset_module_input_to_default — the editor's per-input REVERT ARROW.
+//
+// WHAT THE EDITOR ACTUALLY DOES, measured by Tim 2026-08-17 on Add Velocity's "Velocity Speed":
+// before, the row was bound to a Random Range Float dynamic input with its own Minimum/Maximum
+// children; after ONE click the row read a plain 25.0, the dynamic input node AND all its child
+// inputs were gone, and the revert arrow disappeared. Note the value: 25.0 is the SCRIPT DEFAULT,
+// not zero and not the previously-set literal.
+//
+// WHY THIS IS NOT A CONVENIENCE. It is the one move a human uses to escape a corrupted or stuck
+// module input. Monolith's only existing escape is remove-and-re-add the whole module (I-8), which
+// discards every other value on it; set_graph_pin_default is a graph-level thing entirely, and
+// clear_emitter_modules is a far bigger hammer.
+//
+// WHY NOT THE ENGINE'S OWN RESET. UNiagaraStackFunctionInput::Reset() (NiagaraStackFunctionInput.cpp
+// :2544) IS exported, and mirroring the editor beats reimplementing it — but it is unreachable from
+// here. It is an instance method on a STACK VIEW-MODEL ENTRY: it dereferences GetSystemViewModel()
+// (:2584), calls RefreshChildren() and broadcasts OnDataObjectModified. Reaching it means
+// constructing an FNiagaraSystemViewModel + UNiagaraStackViewModel and locating the entry, and
+// Monolith constructs neither anywhere in its codebase. So the semantics are mirrored at the graph
+// level instead, from the engine's own source, and the divergences are recorded below rather than
+// smoothed over.
+//
+// THE SEMANTICS BEING MIRRORED. Reset() branches on the DEFAULT's value mode:
+//   * Local (the common case)                    -> SetLocalValue(default)  (:2571)
+//   * Linked                                     -> SetLinkedParameterValue(default)  (:2566)
+//   * Data / ObjectAsset / DefaultFunction / ... -> RemoveOverridePin()  (:2553/:2560/:2577)
+// and SetLocalValue (:2284) in turn removes the linked feeder nodes (:2302), removes the override
+// pin (:2309-2315) and writes the default into RapidIterationParameters (:2322).
+//
+// This action reaches the same END STATE by a shorter route: REMOVE THE OVERRIDE (pin + any feeder
+// chain) AND REMOVE THE RAPID-ITERATION ENTRY. With neither store holding anything, the compiler
+// falls back to the module script's declared default in every default mode — which is simply the
+// state of a freshly added module whose inputs nobody has touched, so it is a well-trodden shape
+// rather than a clever one.
+//
+// ONE DELIBERATE DIVERGENCE, STATED PLAINLY: for a Local default the editor leaves an RI entry
+// CONTAINING the default value, whereas this removes the entry. Both read back as the script
+// default and both make the revert arrow disappear (CanReset compares VALUES, not presence —
+// :2492-2497). Removal is chosen because it cannot leave a stale number anywhere, and because
+// reconstructing DefaultInputValues without a view model is exactly the reimplementation this
+// comment opened by rejecting. ⚠️ The Linked-default case is the one this reasoning covers least
+// well and it needs a validator pass — see the staging note.
+//
+// GAP #42 IS THE TRAP HERE. The value lives in TWO stores and THE PIN WINS AT COMPILE TIME while RI
+// goes stale. An implementation that cleared only the pin would promote the stale RI entry to being
+// the effective value — the input would silently snap back to a number the caller just cleared.
+// Both stores are therefore cleared on their own independent evidence, and the response reports
+// which ones actually held something. The decision itself is factored out into
+// MonolithNiagaraResetInput.h so it can be unit-tested without an editor.
+// ============================================================================
+namespace
+{
+	// Mirror of FNiagaraStackGraphUtilities::FindAffectedScripts (NiagaraStackGraphUtilities.cpp:3464).
+	// Declared WITHOUT NIAGARAEDITOR_API (NiagaraStackGraphUtilities.h:332), so calling it
+	// link-errors — the same reason NA_IsRapidIterationType and NA_MakeRapidIterationParameter above
+	// are reimplementations rather than calls.
+	//
+	// THIS IS THE HALF THAT MAKES THE RI CLEAR CORRECT, and it is why NA_ResolveRapidIterationScript
+	// is not reused here. That helper answers ONE script, which is all the READ side ever needed.
+	// The write side must clear EVERY store holding a copy: the engine writes a module input's
+	// rapid-iteration parameter to every script whose usage CONTAINS the module's stage, and for a
+	// GPU emitter that set includes the GPUComputeScript. Clearing one and leaving the rest is
+	// gap #42's stale-copy failure with extra steps.
+	//
+	// The engine resolves the stage via GetEmitterOutputNodeForStackNode (also unexported). We
+	// already hold the same answer as FoundUsage/FoundUsageId from FindModuleNode, so only the
+	// SELECTION RULE is mirrored — verbatim, including the ParticleEventScript special case and the
+	// bCompilableOnly=false argument.
+	void NA_FindAffectedScriptsForInput(UNiagaraSystem* System, int32 EmitterIdx,
+		ENiagaraScriptUsage Usage, const FGuid& UsageId, TArray<UNiagaraScript*>& OutScripts)
+	{
+		OutScripts.Reset();
+		if (!System) return;
+
+		// The engine adds both system scripts unconditionally (:3476-3480).
+		if (UNiagaraScript* SpawnScript = System->GetSystemSpawnScript())   { OutScripts.AddUnique(SpawnScript); }
+		if (UNiagaraScript* UpdateScript = System->GetSystemUpdateScript()) { OutScripts.AddUnique(UpdateScript); }
+
+		if (EmitterIdx == INDEX_NONE || !System->GetEmitterHandles().IsValidIndex(EmitterIdx)) return;
+
+		TArray<UNiagaraScript*> EmitterScripts;
+		if (FVersionedNiagaraEmitterData* EmitterData = System->GetEmitterHandles()[EmitterIdx].GetEmitterData())
+		{
+			EmitterData->GetScripts(EmitterScripts, false);
+		}
+
+		for (UNiagaraScript* Script : EmitterScripts)
+		{
+			if (!Script) continue;
+			if (Usage == ENiagaraScriptUsage::ParticleEventScript)
+			{
+				if (Script->GetUsage() == ENiagaraScriptUsage::ParticleEventScript && Script->GetUsageId() == UsageId)
+				{
+					OutScripts.AddUnique(Script);
+					break;
+				}
+			}
+			else if (Script->ContainsUsage(Usage))
+			{
+				OutScripts.AddUnique(Script);
+			}
+		}
+	}
+
+	// The value the row will read once both stores are empty: the module script's OWN declared
+	// default — the 25.0 in Tim's before/after.
+	//
+	// Best-effort and honestly labelled. A default this cannot render is reported as ABSENT, never
+	// as 0 or as an "(unknown)" sentinel: gap #106 was precisely a decoder that answered 0 for
+	// everything it could not read and reported success, and gap #42's residual was a sentinel
+	// shipped with an authoritative-looking is_default flag. Only DefaultMode::Value is a literal at
+	// all — Binding and Custom defaults resolve at compile time and have no single string.
+	bool NA_TryReadScriptDeclaredDefault(UNiagaraNodeFunctionCall* ModuleNode, const FName& FullInputName,
+		const FNiagaraTypeDefinition& InputType, FString& OutValue)
+	{
+		OutValue.Reset();
+		if (!ModuleNode) return false;
+
+		UNiagaraGraph* CalledGraph = ModuleNode->GetCalledGraph();
+		if (!CalledGraph) return false;
+
+		UNiagaraScriptVariable* ScriptVariable = CalledGraph->GetScriptVariable(FullInputName);
+		if (!ScriptVariable) return false;
+		if (ScriptVariable->DefaultMode != ENiagaraDefaultMode::Value) return false;
+
+		// GetScriptVariable(FName) matches on NAME ALONE (see the note on the script-variable map
+		// elsewhere in this file), so the type is confirmed before any bytes are copied — otherwise
+		// a same-named variable of a different type would memcpy the wrong width.
+		if (ScriptVariable->Variable.GetType() != InputType) return false;
+
+		const uint8* DefaultData = ScriptVariable->GetDefaultValueData();
+		if (!DefaultData) return false;
+
+		FNiagaraEditorModule& NiagaraEditorModule = FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
+		TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(InputType);
+		if (!TypeUtilities.IsValid() || !TypeUtilities->CanHandlePinDefaults()) return false;
+
+		FNiagaraVariable Allocated(InputType, FullInputName);
+		Allocated.AllocateData();
+		Allocated.SetData(DefaultData);
+		OutValue = TypeUtilities->GetPinDefaultStringFromValue(Allocated);
+		return !OutValue.IsEmpty();
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleResetModuleInputToDefault(const TSharedPtr<FJsonObject>& Params)
+{
+	// Same parameter vocabulary as set_module_input_value / get_module_input_value — deliberately
+	// no new spellings invented for a sibling action.
+	FString SystemPath = NA_GetAssetPath(Params);
+	FString EmitterHandleId = Params->GetStringField(TEXT("emitter"));
+	FString ModuleNodeGuid = Params->GetStringField(TEXT("module_node"));
+	if (ModuleNodeGuid.IsEmpty()) ModuleNodeGuid = Params->GetStringField(TEXT("module_name"));
+	if (ModuleNodeGuid.IsEmpty()) ModuleNodeGuid = Params->GetStringField(TEXT("module"));
+	FString InputName = Params->GetStringField(TEXT("input"));
+	if (InputName.IsEmpty()) InputName = Params->GetStringField(TEXT("input_name"));
+
+	if (InputName.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: input"));
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load system '%s'"), *SystemPath));
+
+	const int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
+	if (!EmitterHandleId.IsEmpty() && EmitterIdx == INDEX_NONE)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Emitter '%s' not found. Use list_emitters to get valid emitter names or GUIDs."), *EmitterHandleId));
+
+	ENiagaraScriptUsage FoundUsage = ENiagaraScriptUsage::ParticleUpdateScript;
+	FGuid FoundUsageId;
+	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage, &FoundUsageId);
+	if (!MN)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Module node '%s' not found. Use list_modules to get valid module node names or GUIDs."), *ModuleNodeGuid));
+
+	UEdGraph* Graph = MN->GetGraph();
+	if (!Graph)
+		return FMonolithActionResult::Error(TEXT("Module node has no owning graph"));
+
+	// --- Resolve the input, exactly as the read/write siblings do -----------------------------
+	TArray<FNiagaraVariable> Inputs;
+	if (EmitterIdx != INDEX_NONE)
+	{
+		FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+		FCompileConstantResolver Resolver(VE, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
+	else
+	{
+		FCompileConstantResolver Resolver(System, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
+
+	// A CustomHlsl module returns nothing here because its typed inputs are not Module.-prefixed map
+	// entries — its values live DIRECTLY on the function-call pin's DefaultValue, with no override
+	// pin and no rapid-iteration entry. There is therefore no override to remove: the pin default IS
+	// the value, and restoring the script's declared default would need the called script's own
+	// input-node default, a different lookup this action does not do. Refused rather than
+	// half-answered.
+	if (Inputs.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Module '%s' exposes no ParameterMap module inputs (this is the shape of a CustomHlsl module, whose "
+				 "input values live directly on the function-call pin rather than in an override pin or in "
+				 "RapidIterationParameters). There is no override store to reset, so reset_module_input_to_default "
+				 "does not apply — write the value you want with set_module_input_value instead. NOTHING WAS CHANGED."),
+			*MN->GetFunctionName()));
+	}
+
+	const FName InputFName(*InputName);
+	FString InputNameNoSpaces = InputName;
+	InputNameNoSpaces.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+	FNiagaraTypeDefinition InputType;
+	FName MatchedFullName;
+	bool bInputFound = false;
+	for (const FNiagaraVariable& In : Inputs)
+	{
+		const FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
+		bool bMatch = (ShortName == InputFName || In.GetName() == InputFName);
+		if (!bMatch)
+		{
+			FString ShortStr = ShortName.ToString();
+			ShortStr.ReplaceInline(TEXT(" "), TEXT(""), ESearchCase::CaseSensitive);
+			bMatch = ShortStr.Equals(InputNameNoSpaces, ESearchCase::IgnoreCase);
+		}
+		if (bMatch) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
+	}
+	if (!bInputFound)
+	{
+		TArray<FString> ValidNames;
+		for (const FNiagaraVariable& In : Inputs)
+		{
+			ValidNames.Add(MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString());
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' not found on module '%s'. Valid inputs: [%s]. NOTHING WAS CHANGED."),
+			*InputName, *MN->GetFunctionName(), *FString::Join(ValidNames, TEXT(", "))));
+	}
+
+	// --- Static switch selectors are NOT resettable through this path -------------------------
+	// Their value is not an override pin on a MapSet and not a rapid-iteration entry; it is a pin on
+	// the function call node itself, read by the compiler as a compile-time constant. The same two
+	// tests set_module_input_value refuses on (gap #26b) are used here so detection cannot drift
+	// between the two actions.
+	{
+		const MonolithNiagaraHelpers::FStaticSwitchInput* SwitchDriver = nullptr;
+		TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
+		if (UNiagaraGraph* CalledGraph = MN->GetCalledGraph())
+		{
+			MonolithNiagaraHelpers::CollectStaticSwitchInputs(CalledGraph, SwitchInputs);
+			SwitchDriver = MonolithNiagaraHelpers::FindStaticSwitchInput(SwitchInputs, InputName);
+		}
+		if (SwitchDriver || InputType.IsStatic())
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' is a static switch selector — it has no override pin and no rapid-iteration entry to "
+					 "clear, so there is nothing for reset_module_input_to_default to reset. Its value is a "
+					 "compile-time constant on the function call node; set it with set_static_switch_value. "
+					 "NOTHING WAS CHANGED."),
+				*InputName));
+		}
+	}
+
+	// --- MEASURE STORE 1: the override pin ----------------------------------------------------
+	const FNiagaraParameterHandle AliasedHandle = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+		FNiagaraParameterHandle(MatchedFullName), MN);
+	UEdGraphPin* OverridePin = MonolithNiagaraHelpers::GetStackFunctionInputOverridePin(*MN, AliasedHandle);
+
+	MonolithNiagaraResetInput::FResetInputState StoreState;
+	StoreState.bOverridePinExists = (OverridePin != nullptr);
+	StoreState.bOverridePinLinked = (OverridePin != nullptr && OverridePin->LinkedTo.Num() > 0
+		&& OverridePin->LinkedTo[0] != nullptr);
+
+	// --- MEASURE STORE 2: RapidIterationParameters --------------------------------------------
+	// Measured INDEPENDENTLY of store 1. The whole point of gap #42 is that the two disagree, so
+	// neither may be inferred from the other.
+	TArray<UNiagaraScript*> AffectedScripts;
+	FNiagaraVariable RapidIterationVar;
+	FString RapidIterationName;
+	TArray<UNiagaraScript*> ScriptsHoldingRapidIteration;
+	if (NA_IsRapidIterationType(InputType))
+	{
+		FString UniqueEmitterName;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			if (UNiagaraEmitter* Emitter = System->GetEmitterHandles()[EmitterIdx].GetInstance().Emitter)
+			{
+				UniqueEmitterName = Emitter->GetUniqueEmitterName();
+			}
+		}
+		RapidIterationVar = NA_MakeRapidIterationParameter(
+			UniqueEmitterName, FoundUsage, AliasedHandle.GetParameterHandleString(), InputType);
+		RapidIterationName = RapidIterationVar.GetName().ToString();
+
+		NA_FindAffectedScriptsForInput(System, EmitterIdx, FoundUsage, FoundUsageId, AffectedScripts);
+		for (UNiagaraScript* Script : AffectedScripts)
+		{
+			if (!Script) continue;
+			FString Unused;
+			bool bUnusedRenderable = false;
+			if (NA_ReadRapidIterationValue(Script, RapidIterationVar, Unused, bUnusedRenderable))
+			{
+				ScriptsHoldingRapidIteration.AddUnique(Script);
+			}
+		}
+	}
+	StoreState.bRapidIterationEntryExists = (ScriptsHoldingRapidIteration.Num() > 0);
+
+	const MonolithNiagaraResetInput::FResetInputPlan ResetPlan = MonolithNiagaraResetInput::PlanReset(StoreState);
+
+	// --- ALREADY AT DEFAULT: idempotent NO-OP SUCCESS, with a warning -------------------------
+	// DECISION, made deliberately rather than by omission. Reset is a RECOVERY tool, and idempotence
+	// is a virtue in recovery tools: a caller unsticking an input should not have to first ask
+	// whether it is stuck, and a retry after a partial failure must not turn into an error. It also
+	// matches the editor, where the revert arrow is an "is overridden" INDICATOR — when the row is at
+	// default the arrow is simply absent, which is a nothing-to-do, not a failure. The warning is
+	// what keeps this from being silent: a caller who expected an override gets told there was none.
+	if (ResetPlan.bAlreadyAtDefault)
+	{
+		TSharedRef<FJsonObject> NoOp = MakeShared<FJsonObject>();
+		NoOp->SetBoolField(TEXT("success"), true);
+		NoOp->SetStringField(TEXT("input"), MonolithNiagaraHelpers::StripModulePrefix(MatchedFullName).ToString());
+		NoOp->SetStringField(TEXT("type"), InputType.GetName());
+		NoOp->SetBoolField(TEXT("changed"), false);
+		NoOp->SetBoolField(TEXT("already_at_default"), true);
+		NoOp->SetBoolField(TEXT("override_pin_existed"), false);
+		NoOp->SetBoolField(TEXT("rapid_iteration_entry_existed"), false);
+		NoOp->SetArrayField(TEXT("stores_cleared"), TArray<TSharedPtr<FJsonValue>>());
+		NoOp->SetStringField(TEXT("effective_value_source"), TEXT("script_default"));
+
+		FString DefaultValueString;
+		if (NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType, DefaultValueString))
+		{
+			NoOp->SetStringField(TEXT("effective_value"), DefaultValueString);
+		}
+
+		return FMonolithActionResult::Success(NoOp).WithWarning(FString::Printf(
+			TEXT("Input '%s' was ALREADY at its script default — neither an override pin nor a rapid-iteration entry "
+				 "existed, so nothing was changed and nothing needed to be. This is reported as success rather than a "
+				 "refusal because reset is a recovery action and is safe to repeat; if you expected an override here, "
+				 "the value you are looking at is coming from the module script's own default, not from this system."),
+			*InputName));
+	}
+
+	// --- PLAN THE OVERRIDE TEARDOWN, and refuse BEFORE any transaction opens ------------------
+	// Gap #36 settled empirically that CancelTransaction does NOT roll back, so abort-before-
+	// transaction is the only reliable pattern (#26b). Everything below this line up to
+	// BeginTransaction is read-only.
+	FDynTeardownPlan Plan;
+	bool bChainIsDynamicInput = false;
+	UEdGraphNode* SimpleFeederNode = nullptr;
+	UEdGraphNode* OverridePinOwner = OverridePin ? OverridePin->GetOwningNode() : nullptr;
+
+	if (StoreState.bOverridePinLinked)
+	{
+		UEdGraphNode* LinkedNode = OverridePin->LinkedTo[0]->GetOwningNode();
+		if (!LinkedNode)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' has an override pin whose link has no owning node — the graph is malformed. "
+					 "Inspect with get_stage_graph / audit_stack_wiring. NOTHING WAS CHANGED."), *InputName));
+		}
+
+		if (UNiagaraNodeFunctionCall* DynNode = Cast<UNiagaraNodeFunctionCall>(LinkedNode))
+		{
+			// Reuse remove_dynamic_input's gap #37 plan-first teardown rather than writing a second
+			// one. That machinery was wrong once — silently flattening a live depth-3 chain that
+			// still compiled 0/0 — and its scope proof is the repair. A private second walker here
+			// would be a fresh copy of the ORIGINAL bug, and the two would drift.
+			bChainIsDynamicInput = true;
+			Plan.EntryPin = OverridePin;
+			Plan.PinsToBreak.AddUnique(OverridePin);
+			PlanDynamicInputTeardown(*DynNode, Plan, 0);
+			ValidateDynamicInputTeardownPlan(Plan);
+
+			if (Plan.Blockers.Num() > 0)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("REFUSED — resetting '%s' would remove %s and %d node(s) with it, and %d of them cannot be "
+						 "shown to belong to this input alone:\n  - %s\n"
+						 "This is gap #37: the teardown would reach through a SHARED override MapSet (or a shared "
+						 "feeder) and silently flatten a live chain, which still compiles 0/0 afterwards. A value you "
+						 "can see is better than a live chain silently flattened. Inspect with get_dynamic_input_tree "
+						 "/ get_stage_graph and detach the live consumer first. NOTHING WAS CHANGED."),
+					*InputName, *DescribeTeardownNode(DynNode), Plan.ExpectedNodesRemoved(),
+					Plan.Blockers.Num(), *FString::Join(Plan.Blockers, TEXT("\n  - "))));
+			}
+		}
+		else if (LinkedNode->IsA<UNiagaraNodeInput>() || LinkedNode->IsA<UNiagaraNodeParameterMapGet>())
+		{
+			// A linked-parameter binding or an input-node feeder. The engine removes both of these
+			// unconditionally at this position (RemoveNodesForStackFunctionInputOverridePin,
+			// NiagaraStackGraphUtilities.cpp:2045-2053), and it is safe for the MapGet because
+			// SetLinkedParameterValueForFunctionInput creates a FRESH MapGet per binding (:2158-2160),
+			// so no other input shares this node.
+			SimpleFeederNode = LinkedNode;
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("REFUSED — input '%s' is fed by %s, which this reset does not know how to remove. Removing the "
+					 "override pin without removing its feeder would orphan live nodes in the graph, and "
+					 "remove_dynamic_input's unrooted teardown (which would be the only way to clean them up) is "
+					 "DISABLED because it destroys live nodes. Inspect with get_stage_graph. NOTHING WAS CHANGED."),
+				*InputName, *DescribeTeardownNode(LinkedNode)));
+		}
+	}
+
+	const int32 NodeCountBefore = Graph->Nodes.Num();
+	const int32 ExpectedNodesRemoved = bChainIsDynamicInput ? Plan.ExpectedNodesRemoved()
+		: (SimpleFeederNode != nullptr ? 1 : 0);
+
+	// --- EXECUTE ------------------------------------------------------------------------------
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "ResetModuleInput", "Reset Module Input To Default"));
+	System->Modify();
+
+	// STORE 1 — the override pin and everything hanging off it.
+	if (ResetPlan.bRemoveOverridePin && OverridePin != nullptr)
+	{
+		if (bChainIsDynamicInput)
+		{
+			ExecuteDynamicInputTeardownPlan(Plan, Graph);
+		}
+		else if (SimpleFeederNode != nullptr)
+		{
+			OverridePin->BreakAllPinLinks();
+			SimpleFeederNode->BreakAllNodeLinks();
+			Graph->RemoveNode(SimpleFeederNode);
+			SimpleFeederNode = nullptr;
+		}
+
+		// Then the pin itself, mirroring UNiagaraStackFunctionInput::RemoveOverridePin
+		// (NiagaraStackFunctionInput.cpp:4038-4048): the node teardown breaks the LINKS, the pin is
+		// removed separately. Without this the input would keep an empty override pin, which reads
+		// back as an override with an empty literal rather than as unset.
+		//
+		// The guard is defensive: the module's own override MapSet is normally classified SHARED by
+		// ValidateDynamicInputTeardownPlan (our entry pin's namespace is the MODULE's function name,
+		// which is never in PlanFunctionNames) and so is left in place. If it were ever spliced out,
+		// the pin died with it and touching it here would be a use-after-free.
+		const bool bOwnerWasRemoved = bChainIsDynamicInput && Plan.MapSetsToSplice.Contains(OverridePinOwner);
+		if (!bOwnerWasRemoved && OverridePinOwner != nullptr)
+		{
+			OverridePinOwner->Modify();
+			OverridePinOwner->RemovePin(OverridePin);
+		}
+		OverridePin = nullptr;   // removed above — never dereference it again
+	}
+
+	// STORE 2 — every rapid-iteration copy, on every affected script.
+	int32 RapidIterationScriptsCleared = 0;
+	if (ResetPlan.bClearRapidIteration)
+	{
+		for (UNiagaraScript* Script : ScriptsHoldingRapidIteration)
+		{
+			if (!Script) continue;
+			Script->Modify();
+			if (Script->RapidIterationParameters.RemoveParameter(RapidIterationVar))
+			{
+				++RapidIterationScriptsCleared;
+			}
+		}
+	}
+
+	GEditor->EndTransaction();
+	System->RequestCompile(false);
+
+	const int32 ActualNodesRemoved = FMath::Max(0, NodeCountBefore - Graph->Nodes.Num());
+
+	// --- REPORT WHAT ACTUALLY HAPPENED --------------------------------------------------------
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetBoolField(TEXT("success"), true);
+	R->SetStringField(TEXT("input"), MonolithNiagaraHelpers::StripModulePrefix(MatchedFullName).ToString());
+	R->SetStringField(TEXT("type"), InputType.GetName());
+	R->SetBoolField(TEXT("changed"), true);
+	R->SetBoolField(TEXT("already_at_default"), false);
+
+	R->SetBoolField(TEXT("override_pin_existed"), StoreState.bOverridePinExists);
+	R->SetBoolField(TEXT("override_pin_removed"), ResetPlan.bRemoveOverridePin);
+	R->SetBoolField(TEXT("dynamic_input_chain_removed"), bChainIsDynamicInput);
+	R->SetNumberField(TEXT("nodes_removed"), ActualNodesRemoved);
+	R->SetNumberField(TEXT("expected_nodes_removed"), ExpectedNodesRemoved);
+
+	R->SetBoolField(TEXT("rapid_iteration_entry_existed"), StoreState.bRapidIterationEntryExists);
+	R->SetBoolField(TEXT("rapid_iteration_cleared"), ResetPlan.bClearRapidIteration);
+	R->SetNumberField(TEXT("rapid_iteration_scripts_cleared"), RapidIterationScriptsCleared);
+	if (!RapidIterationName.IsEmpty())
+	{
+		R->SetStringField(TEXT("rapid_iteration_parameter"), RapidIterationName);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> StoresJson;
+	for (const FString& Store : MonolithNiagaraResetInput::StoresCleared(ResetPlan))
+	{
+		StoresJson.Add(MakeShared<FJsonValueString>(Store));
+	}
+	R->SetArrayField(TEXT("stores_cleared"), StoresJson);
+
+	R->SetStringField(TEXT("effective_value_source"), TEXT("script_default"));
+	FString DefaultValueString;
+	const bool bHaveDefault = NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType, DefaultValueString);
+	if (bHaveDefault)
+	{
+		R->SetStringField(TEXT("effective_value"), DefaultValueString);
+	}
+
+	// Warnings are accumulated and attached ONCE at the end, so no field is written to the payload
+	// after the result object has been built.
+	TArray<FString> Warnings;
+
+	if (Plan.SharedMapSets.Num() > 0)
+	{
+		R->SetNumberField(TEXT("shared_map_sets_left_in_place"), Plan.SharedMapSets.Num());
+	}
+
+	if (ActualNodesRemoved != ExpectedNodesRemoved)
+	{
+		// The plan drives the mutation, so this should be unreachable. Cancel would not have undone
+		// it (gap #36), so this is a REPORT, not a rollback.
+		R->SetBoolField(TEXT("plan_mismatch"), true);
+		Warnings.Add(FString::Printf(
+			TEXT("Removed %d node(s) but the plan expected %d. The graph did not match the plan; run "
+				 "audit_stack_wiring and get_stage_graph before saving this asset."),
+			ActualNodesRemoved, ExpectedNodesRemoved));
+	}
+
+	if (!bHaveDefault)
+	{
+		// Absence is reported as absence — never as 0 and never as a sentinel (gaps #106 / #42).
+		Warnings.Add(FString::Printf(
+			TEXT("Both stores were cleared, but the module script's declared default for '%s' could not be rendered as "
+				 "a string (its default mode may be Binding or Custom rather than Value, or %s has no pin-default "
+				 "utilities), so no 'effective_value' is reported. Do NOT read the missing field as zero or as unset — "
+				 "read the value back with get_module_input_value."),
+			*InputName, *InputType.GetName()));
+	}
+
+	if (ResetPlan.bRemoveOverridePin && !ResetPlan.bClearRapidIteration && NA_IsRapidIterationType(InputType))
+	{
+		// Worth saying out loud on an RI-eligible type: we removed the pin and found no RI entry, so
+		// the value the row now shows comes from the script default rather than from a store we
+		// missed. This is the one shape where a gap #42 half-clear would look identical from outside.
+		Warnings.Add(FString::Printf(
+			TEXT("'%s' is a rapid-iteration-eligible type, but no rapid-iteration entry existed for it — only the "
+				 "override pin was cleared. That is expected for a value written by set_module_input_value (which "
+				 "writes the pin, not the store); it would be unexpected for one set by hand in the stack UI."),
+			*InputType.GetName()));
+	}
+
+	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
+}
+
 // --------------------------------------------------------------------------
 // Task 11: get_dynamic_input_value — read a value from a DI sub-pin
 // --------------------------------------------------------------------------
@@ -23993,6 +24573,362 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptMetadata(const TSh
 	R->SetBoolField(TEXT("experimental"), (bool)SD->bExperimental);
 	R->SetBoolField(TEXT("deprecated"), SD->bDeprecated);
 	return NA_SuccessObj(R);
+}
+
+// ============================================================================
+// get_script_details — the WHOLE Script Details panel, read-only.
+//
+// WHY (I-40). A module script DECLARES its stack dependencies, and that declaration is the reason
+// the stack has an order at all. Stock GravityForce carries RequiredDependencies[0] =
+// { Id: SolveForcesAndVelocity, Type: Post Dependency, ScriptConstraint: Same Script,
+//   OnlyEvaluateInScriptUsage: Spawn|Update|Event, Description: <the per-stage remedy> }.
+// That one struct explains why forces must sit ABOVE the solver, why the offered fix differs
+// between Spawn and Update, and why the wrong alternative fails with "an acceptable location could
+// not be found".
+//
+// 🛑 Monolith could read NONE of it: no RequiredDependencies / ProvidedDependencies /
+// FNiagaraModuleDependency appears anywhere in MonolithNiagara. The only previous route to
+// dependency problems was the native GetStackIssues, which needs a compile REQUESTED first and
+// misreports its fixes.
+//
+// RELATIONSHIP TO get_script_metadata: this is a strict SUPERSET of that action's read side.
+// get_script_metadata is kept as-is because set_script_metadata mirrors its field list, and
+// splitting a read/write pair is how those two drift.
+//
+// ⚠️ VERSIONING — the trap, and the decision.
+// Script data is versioned (FVersionedNiagaraScriptData) and placed callers pin a
+// SelectedScriptVersion guid on the UNiagaraNodeFunctionCall. Two things had to be established from
+// source rather than assumed:
+//
+//   1. UNiagaraScript::GetLatestScriptData() DOES NOT mean "the newest version". Its body
+//      (NiagaraScript.cpp:443-456) returns VersionData[0] when versioning is off, and otherwise
+//      GetScriptData(ExposedVersion). GetScriptData with an INVALID guid also resolves to the
+//      exposed version (:476-487). So "Latest" == "EXPOSED", and the two spellings already in this
+//      file — GetLatestScriptData() at :8671/:9769/:24549 and
+//      GetScriptData(GetExposedVersion().VersionGuid) at :12541/:23241 — are the SAME CALL, not a
+//      divergence. GetExposedVersion() is itself implemented as GetLatestScriptData()->Version
+//      (:508-512).
+//   2. Therefore the default here is the EXPOSED version, which is what every other Monolith action
+//      reads and what the engine places when a module is added. It is NOT silently "the latest".
+//
+// The version actually read is always reported (`version` + `version_selection`), an explicit
+// `version` param is accepted, and `available_versions` is listed so a caller can re-query. When
+// versioning is enabled and the caller did not pick, a warning says so — because a PLACED instance
+// may pin a different version via SelectedScriptVersion, and then this reader is describing a
+// different script body than the one running.
+// ============================================================================
+namespace
+{
+	// Readable enum name, plus the editor's DisplayName metadata under `<field>_display` where the
+	// panel spells it differently ("PostDependency" -> "Post Dependency"). Both are emitted so a
+	// caller can match on the stable identifier while a human reads the panel wording.
+	template <typename TEnum>
+	void NA_SetEnumField(const TSharedRef<FJsonObject>& Obj, const TCHAR* Field, TEnum Value)
+	{
+		const UEnum* EnumType = StaticEnum<TEnum>();
+		if (!EnumType) return;
+
+		const int64 RawValue = static_cast<int64>(Value);
+		const FString Name = EnumType->GetNameStringByValue(RawValue);
+		Obj->SetStringField(Field, Name);
+
+		const FString Display = EnumType->GetDisplayNameTextByValue(RawValue).ToString();
+		if (!Display.IsEmpty() && Display != Name)
+		{
+			Obj->SetStringField(FString(Field) + TEXT("_display"), Display);
+		}
+	}
+
+	// FText fields are emitted ALWAYS, including when empty. An absent key would be ambiguous
+	// between "this script declares nothing here" and "this reader does not expose the field", and
+	// the panel row exists either way.
+	void NA_SetTextField(const TSharedRef<FJsonObject>& Obj, const TCHAR* Field, const FText& Value)
+	{
+		Obj->SetStringField(Field, Value.ToString());
+	}
+
+	TArray<TSharedPtr<FJsonValue>> NA_InlineFormatToJson(const TArray<FNiagaraInlineDynamicInputFormatToken>& Tokens)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FNiagaraInlineDynamicInputFormatToken& Token : Tokens)
+		{
+			TSharedRef<FJsonObject> T = MakeShared<FJsonObject>();
+			NA_SetEnumField(T, TEXT("usage"), Token.Usage);
+			T->SetStringField(TEXT("value"), Token.Value);
+			Out.Add(MakeShared<FJsonValueObject>(T));
+		}
+		return Out;
+	}
+
+	TSharedRef<FJsonObject> NA_AssetVersionToJson(const FNiagaraAssetVersion& Version, const FGuid& ExposedGuid)
+	{
+		TSharedRef<FJsonObject> V = MakeShared<FJsonObject>();
+		V->SetStringField(TEXT("guid"), Version.VersionGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		V->SetNumberField(TEXT("major"), Version.MajorVersion);
+		V->SetNumberField(TEXT("minor"), Version.MinorVersion);
+		V->SetStringField(TEXT("label"), FString::Printf(TEXT("%d.%d"), Version.MajorVersion, Version.MinorVersion));
+		V->SetBoolField(TEXT("is_exposed"), Version.VersionGuid == ExposedGuid);
+		V->SetBoolField(TEXT("visible_in_version_selector"), Version.bIsVisibleInVersionSelector);
+		return V;
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptDetails(const TSharedPtr<FJsonObject>& Params)
+{
+	// Same addressing vocabulary as get_script_metadata / set_script_metadata.
+	FString ScriptPath = Params->GetStringField(TEXT("script_path"));
+	if (ScriptPath.IsEmpty()) ScriptPath = NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required param: script_path (or asset_path)"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script)
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load script '%s'. This action reads a Niagara SCRIPT asset (module, dynamic input or "
+				 "function) — not a system or emitter."), *ScriptPath));
+
+	// Fixes up old assets that predate versioning; every existing reader in this file calls it
+	// before touching version data.
+	Script->CheckVersionDataAvailable();
+
+	TArray<FString> Warnings;
+
+	// --- VERSION SELECTION --------------------------------------------------------------------
+	const bool bVersioningEnabled = Script->IsVersioningEnabled();
+	const FNiagaraAssetVersion ExposedVersion = Script->GetExposedVersion();
+	const TArray<FNiagaraAssetVersion> AvailableVersions = Script->GetAllAvailableVersions();
+
+	FString VersionParam = Params->GetStringField(TEXT("version"));
+	if (VersionParam.IsEmpty()) VersionParam = Params->GetStringField(TEXT("version_guid"));
+	VersionParam = VersionParam.TrimStartAndEnd();
+
+	const FVersionedNiagaraScriptData* SD = nullptr;
+	FString VersionSelection;
+
+	if (!VersionParam.IsEmpty()
+		&& !VersionParam.Equals(TEXT("exposed"), ESearchCase::IgnoreCase)
+		&& !VersionParam.Equals(TEXT("default"), ESearchCase::IgnoreCase))
+	{
+		FGuid RequestedGuid;
+		if (!FGuid::Parse(VersionParam, RequestedGuid))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'version' must be a version GUID or the word 'exposed'; got '%s'. Call this action without "
+					 "'version' to read the exposed version and to list available_versions."), *VersionParam));
+		}
+		SD = Script->GetScriptData(RequestedGuid);
+		if (!SD)
+		{
+			TArray<FString> Known;
+			for (const FNiagaraAssetVersion& V : AvailableVersions)
+			{
+				Known.Add(FString::Printf(TEXT("%d.%d=%s"), V.MajorVersion, V.MinorVersion,
+					*V.VersionGuid.ToString(EGuidFormats::DigitsWithHyphens)));
+			}
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Script '%s' has no version with guid '%s'. Available: [%s]."),
+				*ScriptPath, *VersionParam, *FString::Join(Known, TEXT(", "))));
+		}
+		VersionSelection = TEXT("explicit_guid");
+	}
+	else
+	{
+		// The EXPOSED version — see the block comment: this is what GetLatestScriptData() actually
+		// returns, and what every other Monolith action reads.
+		SD = Script->GetLatestScriptData();
+		VersionSelection = bVersioningEnabled ? TEXT("exposed_default") : TEXT("unversioned");
+
+		if (bVersioningEnabled && AvailableVersions.Num() > 1)
+		{
+			Warnings.Add(FString::Printf(
+				TEXT("This script has versioning enabled with %d versions; no 'version' was supplied, so the EXPOSED "
+					 "version (%d.%d) was read. A module PLACED in a stack pins its own version via "
+					 "SelectedScriptVersion and may therefore be running a different script body than the one "
+					 "described here. Pass 'version' with a guid from available_versions to read a specific one."),
+				AvailableVersions.Num(), ExposedVersion.MajorVersion, ExposedVersion.MinorVersion));
+		}
+	}
+
+	if (!SD)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Script '%s' has no versioned script data, so no details can be read. The asset may be corrupted."),
+			*ScriptPath));
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+
+	// Which of the three script kinds this is — module, dynamic input, or function. The caller needs
+	// it because most of the panel below only means anything for a module.
+	NA_SetEnumField(R, TEXT("usage"), Script->Usage);
+
+	// --- VERSION REPORTING --------------------------------------------------------------------
+	R->SetBoolField(TEXT("versioning_enabled"), bVersioningEnabled);
+	R->SetStringField(TEXT("version_selection"), VersionSelection);
+	{
+		TSharedRef<FJsonObject> ReadVersion = NA_AssetVersionToJson(SD->Version, ExposedVersion.VersionGuid);
+		NA_SetTextField(ReadVersion, TEXT("change_description"), SD->VersionChangeDescription);
+		R->SetObjectField(TEXT("version"), ReadVersion);
+	}
+	R->SetObjectField(TEXT("exposed_version"), NA_AssetVersionToJson(ExposedVersion, ExposedVersion.VersionGuid));
+	{
+		TArray<TSharedPtr<FJsonValue>> VersionsJson;
+		for (const FNiagaraAssetVersion& V : AvailableVersions)
+		{
+			VersionsJson.Add(MakeShared<FJsonValueObject>(NA_AssetVersionToJson(V, ExposedVersion.VersionGuid)));
+		}
+		R->SetArrayField(TEXT("available_versions"), VersionsJson);
+	}
+
+	// --- MODULE USAGE ------------------------------------------------------------------------
+	// Raw value AND readable stages, per the brief: the bitmask is the one field where the number
+	// itself is load-bearing (set_script_metadata takes it back as an int).
+	R->SetNumberField(TEXT("module_usage_bitmask"), SD->ModuleUsageBitmask);
+	R->SetArrayField(TEXT("module_usage_stages"), UsageBitmaskToStages(SD->ModuleUsageBitmask));
+	{
+		// The ENGINE's own decode of the same field, kept alongside ours as a cross-check rather
+		// than trusted blindly — FVersionedNiagaraScriptData::GetSupportedUsageContexts is
+		// NIAGARA_API (NiagaraScript.h:764).
+		TArray<TSharedPtr<FJsonValue>> Contexts;
+		for (const ENiagaraScriptUsage Context : SD->GetSupportedUsageContexts())
+		{
+			Contexts.Add(MakeShared<FJsonValueString>(
+				StaticEnum<ENiagaraScriptUsage>()->GetNameStringByValue(static_cast<int64>(Context))));
+		}
+		R->SetArrayField(TEXT("supported_usage_contexts"), Contexts);
+	}
+
+	// --- PRESENTATION -------------------------------------------------------------------------
+	NA_SetTextField(R, TEXT("category"), SD->Category);
+	NA_SetTextField(R, TEXT("inline_overview_display_name"), SD->InlineOverviewDisplayName);
+	R->SetBoolField(TEXT("suggested"), SD->bSuggested);
+
+	// --- DEPENDENCIES — the reason this action exists ------------------------------------------
+	{
+		TArray<TSharedPtr<FJsonValue>> Provided;
+		for (const FName& Id : SD->ProvidedDependencies)
+		{
+			Provided.Add(MakeShared<FJsonValueString>(Id.ToString()));
+		}
+		R->SetArrayField(TEXT("provided_dependencies"), Provided);
+	}
+	{
+		TArray<TSharedPtr<FJsonValue>> Required;
+		for (const FNiagaraModuleDependency& Dep : SD->RequiredDependencies)
+		{
+			TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+			D->SetStringField(TEXT("id"), Dep.Id.ToString());
+
+			// STRUCTURED, never stringified: Pre vs Post IS the ordering rule, so it is emitted as
+			// its own field (with the panel's "Pre Dependency"/"Post Dependency" wording alongside)
+			// plus an explicit human-readable statement of what it means for placement.
+			NA_SetEnumField(D, TEXT("type"), Dep.Type);
+			D->SetStringField(TEXT("ordering"),
+				Dep.Type == ENiagaraModuleDependencyType::PreDependency
+					? TEXT("the required module must be placed BEFORE (above) this module")
+					: TEXT("the required module must be placed AFTER (below) this module"));
+
+			NA_SetEnumField(D, TEXT("script_constraint"), Dep.ScriptConstraint);
+			D->SetStringField(TEXT("script_constraint_meaning"),
+				Dep.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::SameScript
+					? TEXT("the provider must be in the SAME script/stage as this module")
+					: TEXT("the provider may be in ANY script/stage as long as the ordering holds"));
+
+			D->SetStringField(TEXT("required_version"), Dep.RequiredVersion);
+
+			// The bitmask decode with the bit-0 hazard — see MonolithNiagaraDependencyUsage.h.
+			int32 UnexpectedBits = 0;
+			const TArray<FString> Usages = MonolithNiagaraDependencyUsage::DecodeUsageBitmask(
+				Dep.OnlyEvaluateInScriptUsage, &UnexpectedBits);
+			D->SetNumberField(TEXT("only_evaluate_in_script_usage_raw"), Dep.OnlyEvaluateInScriptUsage);
+			{
+				TArray<TSharedPtr<FJsonValue>> UsageJson;
+				for (const FString& U : Usages) { UsageJson.Add(MakeShared<FJsonValueString>(U)); }
+				D->SetArrayField(TEXT("only_evaluate_in_script_usage"), UsageJson);
+			}
+			D->SetBoolField(TEXT("evaluated_in_all_usages"),
+				Dep.OnlyEvaluateInScriptUsage == MonolithNiagaraDependencyUsage::AllUsagesMask());
+			if (UnexpectedBits != 0)
+			{
+				// Reported rather than dropped: a bit no enum entry claims is a fact about the asset.
+				D->SetNumberField(TEXT("only_evaluate_in_script_usage_unrecognised_bits"), UnexpectedBits);
+				Warnings.Add(FString::Printf(
+					TEXT("Required dependency '%s' has bits (0x%X) set in OnlyEvaluateInScriptUsage that no "
+						 "ENiagaraModuleDependencyUsage entry claims. They are reported raw rather than dropped; the "
+						 "named usages are still correct."),
+					*Dep.Id.ToString(), UnexpectedBits));
+			}
+
+			// The per-stage remedy — the most useful single string in the whole struct.
+			NA_SetTextField(D, TEXT("description"), Dep.Description);
+
+			Required.Add(MakeShared<FJsonValueObject>(D));
+		}
+		R->SetArrayField(TEXT("required_dependencies"), Required);
+	}
+
+	// --- DEPRECATION / CONVERSION --------------------------------------------------------------
+	R->SetBoolField(TEXT("deprecated"), SD->bDeprecated);
+	NA_SetTextField(R, TEXT("deprecation_message"), SD->DeprecationMessage);
+	R->SetStringField(TEXT("deprecation_recommendation"),
+		SD->DeprecationRecommendation ? SD->DeprecationRecommendation->GetPathName() : FString());
+	R->SetBoolField(TEXT("use_python_script_conversion"), SD->bUsePythonScriptConversion);
+	NA_SetEnumField(R, TEXT("conversion_script_execution"), SD->ConversionScriptExecution);
+	R->SetStringField(TEXT("python_conversion_script"), SD->PythonConversionScript);
+	R->SetStringField(TEXT("conversion_script_asset"), SD->ConversionScriptAsset.FilePath);
+	R->SetStringField(TEXT("conversion_utility"),
+		SD->ConversionUtility.Get() ? SD->ConversionUtility.Get()->GetPathName() : FString());
+
+	// --- MESSAGES ------------------------------------------------------------------------------
+	R->SetBoolField(TEXT("experimental"), static_cast<bool>(SD->bExperimental));
+	NA_SetTextField(R, TEXT("experimental_message"), SD->ExperimentalMessage);
+	NA_SetTextField(R, TEXT("note_message"), SD->NoteMessage);
+	NA_SetTextField(R, TEXT("debug_draw_message"), SD->DebugDrawMessage);
+
+	// --- BEHAVIOUR / DISPLAY -------------------------------------------------------------------
+	NA_SetEnumField(R, TEXT("library_visibility"), SD->LibraryVisibility);
+	NA_SetEnumField(R, TEXT("numeric_output_type_selection_mode"), SD->NumericOutputTypeSelectionMode);
+	NA_SetTextField(R, TEXT("description"), SD->Description);
+	NA_SetTextField(R, TEXT("keywords"), SD->Keywords);
+	NA_SetTextField(R, TEXT("collapsed_view_format"), SD->CollapsedViewFormat);
+	R->SetArrayField(TEXT("inline_expression_format"), NA_InlineFormatToJson(SD->InlineExpressionFormat));
+	R->SetArrayField(TEXT("inline_graph_format"), NA_InlineFormatToJson(SD->InlineGraphFormat));
+	R->SetBoolField(TEXT("can_be_used_for_type_conversions"), static_cast<bool>(SD->bCanBeUsedForTypeConversions));
+
+	// --- SCRIPT METADATA -----------------------------------------------------------------------
+	{
+		TSharedRef<FJsonObject> Meta = MakeShared<FJsonObject>();
+		for (const TPair<FName, FString>& Pair : SD->ScriptMetaData)
+		{
+			Meta->SetStringField(Pair.Key.ToString(), Pair.Value);
+		}
+		R->SetObjectField(TEXT("script_metadata"), Meta);
+	}
+
+	// --- VALIDATION RULES ----------------------------------------------------------------------
+	// ⚠️ NOT versioned. ValidationRules is declared on UNiagaraScript itself (NiagaraScript.h:838-839),
+	// NOT on FVersionedNiagaraScriptData, so it is the same list whichever version was selected. Said
+	// out loud in the payload because every other field on this response IS version-scoped, and a
+	// caller diffing two versions would otherwise read an identical list as a meaningful match.
+	{
+		TArray<TSharedPtr<FJsonValue>> Rules;
+		for (const TObjectPtr<UNiagaraValidationRule>& Rule : Script->ValidationRules)
+		{
+			if (!Rule) continue;
+			TSharedRef<FJsonObject> Ru = MakeShared<FJsonObject>();
+			const UClass* RuleClass = Rule->GetClass();
+			Ru->SetStringField(TEXT("class"), RuleClass->GetName());
+			Ru->SetStringField(TEXT("class_path"), RuleClass->GetPathName());
+			Ru->SetStringField(TEXT("display_name"), RuleClass->GetDisplayNameText().ToString());
+			Ru->SetBoolField(TEXT("enabled"), Rule->IsEnabled());
+			Rules.Add(MakeShared<FJsonValueObject>(Ru));
+		}
+		R->SetArrayField(TEXT("validation_rules"), Rules);
+		R->SetBoolField(TEXT("validation_rules_are_versioned"), false);
+	}
+
+	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params)

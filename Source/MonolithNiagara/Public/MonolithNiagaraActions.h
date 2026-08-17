@@ -49,6 +49,11 @@ public:
 	static FMonolithActionResult HandleMoveModule(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleEnabled(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleInputValue(const TSharedPtr<FJsonObject>& Params);
+	/** Recovery: clear a module input's override so it reads the module script's declared default
+	 *  again — the editor's per-input revert arrow. Clears BOTH stores (override pin + any dynamic
+	 *  input chain hanging off it, AND RapidIterationParameters on every affected script), because
+	 *  gap #42 measured that the pin wins at compile time while RI goes stale. */
+	static FMonolithActionResult HandleResetModuleInputToDefault(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleInputBinding(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleInputDI(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateModule(const TSharedPtr<FJsonObject>& Params);
@@ -217,6 +222,11 @@ public:
 
 	// --- AISandbox local extensions (2026-08): script metadata get/set + wiring audit ---
 	static FMonolithActionResult HandleGetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
+	/** Read-only: the WHOLE Script Details panel for a module / dynamic input / function script,
+	 *  including the RequiredDependencies + ProvidedDependencies declarations (I-40) that define
+	 *  stack ordering and that nothing in Monolith could previously read. Reads the EXPOSED version
+	 *  by default and always reports which version it read. */
+	static FMonolithActionResult HandleGetScriptDetails(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAuditStackWiring(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListStackWriters(const TSharedPtr<FJsonObject>& Params);
