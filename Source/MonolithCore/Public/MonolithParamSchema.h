@@ -224,6 +224,9 @@ private:
  *
  * - ApplyAliases: rewrites alias keys in Params -> canonical schema keys before dispatch.
  *   Returns false if both alias and canonical are supplied (caller treats as ErrInvalidParams).
+ *   This is also how the legacy `system_path` spelling of `asset_path` is honoured — it is a
+ *   DECLARED alias on the Niagara schemas that historically accepted it, and only those. See
+ *   the note on ApplyAliases below.
  * - FindUnknownKeys: returns Params keys that are neither canonical nor declared aliases.
  *   Used by K3 unknown-param warnings.
  * - IsStrictParamsEnabled: env-var STRICT_PARAMS=1 promotes K3 warnings to hard errors.
@@ -231,7 +234,29 @@ private:
 class MONOLITHCORE_API FMonolithParamSchema
 {
 public:
+	/**
+	 * Rewrites declared alias keys to their canonical schema keys, in place, before dispatch.
+	 * Supplying BOTH a canonical and one of its aliases is an error rather than a silent
+	 * precedence rule.
+	 *
+	 * NOTE ON `system_path` (the legacy spelling of `asset_path`). It is a DECLARED alias,
+	 * carried on the ~110 Niagara schemas that historically accepted it and on nothing else.
+	 * It was briefly applied here centrally to every schema declaring `asset_path`, which
+	 * made a *material* action accept `system_path` and made every missing-param error in
+	 * all 25 namespaces advertise a spelling meaningful in one — the same "silently accept
+	 * an undeclared param spelling" defect the enforcement work existed to kill. Declaring
+	 * it per-schema keeps the back-compat exactly where it was earned and makes it visible
+	 * in monolith_discover output instead of being an invisible registry rule.
+	 *
+	 * Handler-side `system_path` fallbacks in MonolithNiagara are NOT redundant with this:
+	 * batch_execute and several internal callers dispatch through a direct function-pointer
+	 * table, never through FMonolithToolRegistry::ExecuteAction, so no alias rewrite runs
+	 * for them and they still arrive spelling it `system_path`.
+	 *
+	 * @return false (with OutCollision set) if a canonical and one of its aliases collide.
+	 */
 	static bool ApplyAliases(const TSharedPtr<FJsonObject>& Schema, const TSharedPtr<FJsonObject>& Params, FString& OutCollision);
+
 	static TArray<FString> FindUnknownKeys(const TSharedPtr<FJsonObject>& Schema, const TSharedPtr<FJsonObject>& Params);
 	static bool IsStrictParamsEnabled();
 };

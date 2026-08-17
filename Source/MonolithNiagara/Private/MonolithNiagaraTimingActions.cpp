@@ -34,10 +34,31 @@ namespace MonolithNiagaraTimingLocal
 		return FMonolithActionResult::Success(Obj);
 	}
 
+	// Accepts "asset_path" (preferred) with the legacy "system_path" spelling as fallback.
+	// The fallback stays even though these schemas now DECLARE "system_path" as an alias and
+	// FMonolithParamSchema::ApplyAliases rewrites it at dispatch: batch sub-ops and internal
+	// callers reach handlers WITHOUT passing through FMonolithToolRegistry::ExecuteAction, so
+	// no alias rewrite has run for them.
 	static FString GetAssetPath(const TSharedPtr<FJsonObject>& Params)
 	{
-		FString Path = Params->GetStringField(TEXT("asset_path"));
-		if (Path.IsEmpty()) Path = Params->GetStringField(TEXT("system_path"));
+		if (!Params.IsValid())
+		{
+			UE_LOG(LogMonolithNiagaraTiming, Error, TEXT("GetAssetPath called with null Params — returning empty path."));
+			return FString();
+		}
+
+		FString Path;
+		if (!Params->TryGetStringField(TEXT("asset_path"), Path) || Path.IsEmpty())
+		{
+			Params->TryGetStringField(TEXT("system_path"), Path);
+		}
+
+		if (Path.IsEmpty())
+		{
+			UE_LOG(LogMonolithNiagaraTiming, Error,
+				TEXT("No 'asset_path' (or legacy 'system_path') supplied — the caller will act on an EMPTY path and any "
+				     "result it returns is meaningless."));
+		}
 		return Path;
 	}
 
@@ -64,14 +85,14 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Read system-level timing fields (warmup time/tick count/tick delta, fixed tick delta, require current frame data)."),
 		FMonolithActionHandler::CreateStatic(&HandleGetSystemTiming),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_warmup_profile"),
 		TEXT("Composite write of warmup_time + warmup_tick_delta on a Niagara system (warmup_time snaps to nearest tick multiple)."),
 		FMonolithActionHandler::CreateStatic(&HandleSetWarmupProfile),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("warmup_time"), TEXT("number"), TEXT("Target warmup time in seconds (snaps to nearest tick_count x tick_delta multiple)"))
 			.Optional(TEXT("warmup_tick_delta"), TEXT("number"), TEXT("Tick delta in seconds (default: existing system value, typically 1/15s)"))
 			.Build());
@@ -80,7 +101,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Set bFixedTickDelta + FixedTickDeltaTime on a Niagara system."),
 		FMonolithActionHandler::CreateStatic(&HandleSetFixedTickDelta),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("enabled"), TEXT("bool"), TEXT("Enable fixed-tick substepping"))
 			.Optional(TEXT("fixed_delta_time"), TEXT("number"), TEXT("Fixed delta time in seconds (only meaningful when enabled=true; default 1/60s if unset)"))
 			.Build());
@@ -89,7 +110,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Toggle bRequireCurrentFrameData on a Niagara system (strict current-frame vs looser previous-frame tick-group dependencies)."),
 		FMonolithActionHandler::CreateStatic(&HandleSetRequireCurrentFrameData),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("require"), TEXT("bool"), TEXT("If true, tick-group dependencies use strict current-frame data; if false, looser previous-frame data permitted"))
 			.Build());
 
@@ -97,7 +118,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Composite write of EmitterState loop inputs (LoopBehavior, LoopDuration, LoopDelay, LoopCount, bLoopDelayEnabled, LoopDurationMode). Handles BOTH stateful (UNiagaraEmitter — dispatches per-field through set_module_input_value against module_name=\"EmitterState\") and stateless (UNiagaraStatelessEmitter — direct FProperty reflection on FNiagaraEmitterStateData). Stateless response includes `stateless: true`. `loop_duration_mode` only applies to the stateless branch (stateful path silently ignores it). Non-fatal coherence issues (e.g. loop_count supplied with loop_behavior='Infinite') return a warnings array; the request still succeeds. Provide at least one of the payload fields."),
 		FMonolithActionHandler::CreateStatic(&HandleSetEmitterLoopProfile),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset OR standalone UNiagaraStatelessEmitter asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset OR standalone UNiagaraStatelessEmitter asset"), { TEXT("system_path") })
 			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (required when asset_path is a UNiagaraSystem; meaningless and ignored when asset_path is a standalone UNiagaraStatelessEmitter)"))
 			.Optional(TEXT("loop_behavior"), TEXT("string"), TEXT("ENiagaraLoopBehavior name: 'Once' | 'Multiple' | 'Infinite'"))
 			.Optional(TEXT("loop_duration_mode"), TEXT("string"), TEXT("ENiagaraLoopDurationMode name: 'Fixed' | 'Infinite' (stateless-only; ignored by stateful path)"))
@@ -111,7 +132,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Aggregated read of emitter timing: EmitterState loop inputs (behavior/duration/delay/count/delay_enabled), simulation-stage list (name/num_iterations/execute_behavior), and Initialize Particle Lifetime min/max. Returns null for any field that cannot be read (missing module, missing input) — partial data is acceptable. Omit 'emitter' to aggregate across all emitters."),
 		FMonolithActionHandler::CreateStatic(&HandleGetEmitterTimingSummary),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (omit to aggregate all emitters)"))
 			.Build());
 
@@ -119,7 +140,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Alias for set_simulation_stage_property(property=\"NumIterations\"). Sets NumIterations on a UNiagaraSimulationStageGeneric (FNiagaraParameterBindingWithValue — written via reflection ImportText_Direct). Provide exactly one of stage_index / stage_name."),
 		FMonolithActionHandler::CreateStatic(&HandleSetSimStageIterationCount),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (same convention as set_simulation_stage_property)"))
 			.Optional(TEXT("stage_index"), TEXT("integer"), TEXT("0-based index into the emitter's simulation stages (use this OR stage_name)"))
 			.Optional(TEXT("stage_name"), TEXT("string"), TEXT("Simulation stage name (use this OR stage_index)"))
@@ -130,7 +151,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Alias for set_simulation_stage_property(property=\"ExecuteBehavior\"). Sets ExecuteBehavior on a UNiagaraSimulationStageGeneric. Provide exactly one of stage_index / stage_name."),
 		FMonolithActionHandler::CreateStatic(&HandleSetSimStageExecuteBehavior),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (same convention as set_simulation_stage_property)"))
 			.Optional(TEXT("stage_index"), TEXT("integer"), TEXT("0-based index into the emitter's simulation stages (use this OR stage_name)"))
 			.Optional(TEXT("stage_name"), TEXT("string"), TEXT("Simulation stage name (use this OR stage_index)"))
@@ -141,7 +162,7 @@ void FMonolithNiagaraTimingActions::RegisterActions(FMonolithToolRegistry& Regis
 		TEXT("Set particle Lifetime on the InitializeParticle module of a stateful emitter's particle_spawn script. If only 'min' supplied -> Lifetime Mode = 'Direct', writes the 'Lifetime' input. If both 'min' and 'max' supplied -> Lifetime Mode = 'Random', writes 'Lifetime Min' + 'Lifetime Max'. Dispatches through niagara::set_static_switch_value + niagara::set_module_input_value against module_node='InitializeParticle'. Returns a clean error with a hint if the InitializeParticle module is absent from the emitter."),
 		FMonolithActionHandler::CreateStatic(&HandleSetParticleLifetime),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter handle id/name (same convention as set_module_input_value)"))
 			.Required(TEXT("min"), TEXT("number"), TEXT("Lifetime in seconds (used as 'Lifetime' for Direct mode, or as 'Lifetime Min' floor for Random mode)"))
 			.Optional(TEXT("max"), TEXT("number"), TEXT("Lifetime range ceiling in seconds; when supplied, switches Lifetime Mode to 'Random' and writes 'Lifetime Max'"))

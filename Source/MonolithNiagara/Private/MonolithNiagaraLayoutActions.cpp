@@ -26,7 +26,7 @@ void FMonolithNiagaraLayoutActions::RegisterActions(FMonolithToolRegistry& Regis
 			"Asset must be open in the editor. No built-in Monolith formatter exists for Niagara graphs."),
 		FMonolithActionHandler::CreateStatic(&HandleAutoLayout),
 		FParamSchemaBuilder()
-			.RequiredAssetPath(TEXT("asset_path"), TEXT("NiagaraSystem asset path"))
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("NiagaraSystem asset path"), { TEXT("system_path") })
 			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Filter to a specific emitter's graph (by name or handle ID)"))
 			.Optional(TEXT("script_usage"), TEXT("string"),
 				TEXT("Script usage filter: 'system', 'emitter', 'particle'. "
@@ -45,11 +45,33 @@ void FMonolithNiagaraLayoutActions::RegisterActions(FMonolithToolRegistry& Regis
 
 namespace
 {
-	/** Normalize asset_path with common alias fallback */
+	/**
+	 * Normalize asset_path with the legacy "system_path" spelling as fallback.
+	 * The fallback stays even though this schema now DECLARES "system_path" as an alias and
+	 * FMonolithParamSchema::ApplyAliases rewrites it at dispatch: batch sub-ops reach handlers
+	 * WITHOUT passing through FMonolithToolRegistry::ExecuteAction (auto_layout IS batchable),
+	 * so no alias rewrite has run for them.
+	 */
 	FString NL_GetAssetPath(const TSharedPtr<FJsonObject>& Params)
 	{
-		FString Path = Params->GetStringField(TEXT("asset_path"));
-		if (Path.IsEmpty()) Path = Params->GetStringField(TEXT("system_path"));
+		if (!Params.IsValid())
+		{
+			UE_LOG(LogMonolithNiagaraLayout, Error, TEXT("NL_GetAssetPath called with null Params — returning empty path."));
+			return FString();
+		}
+
+		FString Path;
+		if (!Params->TryGetStringField(TEXT("asset_path"), Path) || Path.IsEmpty())
+		{
+			Params->TryGetStringField(TEXT("system_path"), Path);
+		}
+
+		if (Path.IsEmpty())
+		{
+			UE_LOG(LogMonolithNiagaraLayout, Error,
+				TEXT("No 'asset_path' (or legacy 'system_path') supplied — the caller will act on an EMPTY path and any "
+				     "result it returns is meaningless."));
+		}
 		return Path;
 	}
 

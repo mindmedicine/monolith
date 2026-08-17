@@ -312,7 +312,10 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	const FMonolithActionInfo& ActionInfo = RegAction->Info;
 	TSharedPtr<FJsonObject> EffectiveParams = Params.IsValid() ? Params : MakeShared<FJsonObject>();
 
-	// K2 — alias rewriting BEFORE the required-param check.
+	// K2 — alias rewriting BEFORE the required-param check. This is also what preserves the
+	// legacy `system_path` spelling of `asset_path`: it is a DECLARED alias on the Niagara
+	// schemas that historically accepted it, so enforcing `asset_path` below does not break
+	// those callers, and no other namespace silently gains the spelling.
 	if (ActionInfo.ParamSchema.IsValid())
 	{
 		FString Collision;
@@ -371,15 +374,27 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	}
 
 	// Validate required params from schema before dispatching.
-	// Skip asset_path — GetAssetPath() accepts both asset_path and system_path aliases
-	// and produces a clear error message itself.
+	//
+	// `asset_path` used to be SKIPPED here, on the stated grounds that GetAssetPath()
+	// "accepts both asset_path and system_path aliases and produces a clear error message
+	// itself". It never did: NA_GetAssetPath returned an empty FString with no error when
+	// neither key was present, so the skip documented an invariant nothing provided. The
+	// result was the defect this check now closes — a missing or misspelt path produced an
+	// empty string, and the handler built a full, plausible response around it, so a
+	// diagnostic run against a mistyped path was indistinguishable from a clean pass.
+	//
+	// The legacy `system_path` spelling is preserved by ApplyAliases above, which runs before
+	// this loop, so enforcing `asset_path` here does not break the Niagara callers that use it.
 	if (ActionInfo.ParamSchema.IsValid())
 	{
 		TArray<FString> Missing;
+		// Alias hints are read out of the SCHEMA, so the error names only the spellings this
+		// particular action actually accepts. A hardcoded `system_path` hint here would
+		// advertise it in all 25 namespaces, where it is meaningful in one.
+		TArray<FString> AliasHints;
 		for (const auto& Pair : ActionInfo.ParamSchema->Values)
 		{
 			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
-			if (PairKeyStr == TEXT("asset_path")) continue;
 
 			const TSharedPtr<FJsonObject>* ParamDef = nullptr;
 			if (Pair.Value->TryGetObject(ParamDef) && ParamDef)
@@ -393,6 +408,26 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 					if (PairKeyStr == TEXT("wbp_path") && EffectiveParams->HasField(TEXT("asset_path")))
 						continue;
 					Missing.Add(PairKeyStr);
+
+					const TArray<TSharedPtr<FJsonValue>>* AliasArr = nullptr;
+					if ((*ParamDef)->TryGetArrayField(TEXT("aliases"), AliasArr) && AliasArr)
+					{
+						TArray<FString> Spellings;
+						for (const TSharedPtr<FJsonValue>& AV : *AliasArr)
+						{
+							FString A;
+							if (AV.IsValid() && AV->TryGetString(A))
+							{
+								Spellings.Add(FString::Printf(TEXT("'%s'"), *A));
+							}
+						}
+						if (Spellings.Num() > 0)
+						{
+							AliasHints.Add(FString::Printf(
+								TEXT(" '%s' may also be spelled %s (alias); supply exactly one of them."),
+								*PairKeyStr, *FString::Join(Spellings, TEXT(" or "))));
+						}
+					}
 				}
 			}
 		}
@@ -400,10 +435,13 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		{
 			TArray<FString> Provided;
 			for (const auto& P : EffectiveParams->Values) Provided.Add(MonolithKeyToString(P.Key));
+			// The "NOTHING WAS READ OR CHANGED" clause is unconditional: it is true of every
+			// missing-param rejection, because this check runs before the handler is invoked.
 			return FMonolithActionResult::Error(
-				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields."),
+				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields.%s NOTHING WAS READ OR CHANGED — this call did not reach the action."),
 					*FString::Join(Missing, TEXT(", ")),
-					*FString::Join(Provided, TEXT(", "))));
+					*FString::Join(Provided, TEXT(", ")),
+					*FString::Join(AliasHints, TEXT(""))));
 		}
 	}
 
