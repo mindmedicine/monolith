@@ -1,6 +1,7 @@
 #include "MonolithAIStateTreeActions.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
+#include "MonolithJsonUtils.h"
 
 #if WITH_STATETREE
 #include "StateTree.h"
@@ -3070,7 +3071,8 @@ FMonolithActionResult FMonolithAIStateTreeActions::HandleBuildStateTreeFromSpec(
 	Result->SetArrayField(TEXT("skipped_states"), SkippedStates);
 	if (SkippedStates.Num() > 0)
 	{
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		// Appended to the same warnings[] channel the block above writes (gap #88).
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("%d state slots referenced unresolvable task/condition structs — see skipped_states. Use strict_mode=true to abort instead."), SkippedStates.Num()));
 	}
 

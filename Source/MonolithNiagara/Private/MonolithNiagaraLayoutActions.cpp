@@ -391,7 +391,7 @@ FMonolithActionResult FMonolithNiagaraLayoutActions::HandleAutoLayout(const TSha
 
 	if (FailCount > 0)
 	{
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("%d of %d graph(s) failed to format"), FailCount, GraphsToFormat.Num()));
 	}
 

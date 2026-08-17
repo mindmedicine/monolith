@@ -110,6 +110,28 @@ struct FMonolithActionResult
 			TEXT("\n\nWarnings also raised on this call (%d) — carried in this message because a FAILED call has no warnings[] channel:%s"),
 			InWarnings.Num(), *Block);
 	}
+
+	/**
+	 * Twin of FormatWarningBlock for the REFUSAL path — renders ErrorData as text.
+	 *
+	 * Same layer, same reason, different field. An MCP `tools/call` error response is
+	 * `content[] + isError` and NOTHING ELSE (see MonolithHttpServer's projection), so a
+	 * structured payload attached to a refusal had nowhere to go and was destroyed at the
+	 * transport on every one of the ~42 reachable error paths that set it. One of those
+	 * paths — animation.set_transition_rule's compile-error rollback — had already undone
+	 * its transaction and recompiled the Blueprint clean, so the diagnostics it harvested
+	 * existed nowhere else by the time the caller read "See compile_errors".
+	 *
+	 * Rendered as a fenced JSON block so it stays machine-parseable inside prose: a client
+	 * can lift it back out with a fence scan, which is not true of the equivalent sentence.
+	 *
+	 * Returns an EMPTY string when ErrorData is unset — call sites append unconditionally
+	 * and an ordinary error message stays byte-for-byte unchanged.
+	 *
+	 * Deliberately NOT inline: defined in MonolithToolRegistry.cpp so the JSON serializer
+	 * stays out of this header, which nearly every action .cpp includes.
+	 */
+	static MONOLITHCORE_API FString FormatErrorDataBlock(const TSharedPtr<FJsonValue>& InErrorData);
 };
 
 /** Delegate type for action handlers */

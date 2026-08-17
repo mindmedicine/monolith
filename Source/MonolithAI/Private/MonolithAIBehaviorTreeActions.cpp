@@ -3791,7 +3791,8 @@ FMonolithActionResult FMonolithAIBehaviorTreeActions::HandleBuildBTFromSpec(cons
 			SkippedArr.Add(MakeShared<FJsonValueString>(W));
 		}
 		Result->SetArrayField(TEXT("warnings"), WarnArr);
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		// Appended to the same warnings[] channel the per-item entries above use (gap #88).
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("%d spec items were skipped during build — see skipped_nodes. Use strict_mode=true to abort instead."), Ctx.Warnings.Num()));
 	}
 	Result->SetArrayField(TEXT("skipped_nodes"), SkippedArr);

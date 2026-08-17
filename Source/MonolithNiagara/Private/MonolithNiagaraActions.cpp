@@ -6828,7 +6828,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddModule(const TSharedPtr<
 	// Warn when adding ShapeLocation modules — they need InitializeParticle Position Mode set
 	if (ModuleScriptBaseName.Contains(TEXT("ShapeLocation")))
 	{
-		R->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(R,
 			TEXT("ShapeLocation requires InitializeParticle 'Position Mode' set to 'Simulation Position'. "
 			     "Call set_static_switch_value on InitializeParticle if particles fail to spawn."));
 	}
@@ -11067,7 +11067,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererProperty(const T
 		const FString VisibilityWarning = NA_DescribeInertRendererVisibility(Rend);
 		if (!VisibilityWarning.IsEmpty())
 		{
-			Out->SetStringField(TEXT("warning"), VisibilityWarning);
+			FMonolithJsonUtils::AddWarning(Out, VisibilityWarning);
 		}
 	}
 	return NA_SuccessObj(Out);
@@ -11202,7 +11202,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererBinding(const TS
 		// The engine's own verdict, surfaced rather than swallowed. This is the case that used to
 		// silently destroy a working default binding when configure_ribbon pointed *_binding at
 		// attributes the emitter never writes.
-		Out->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Out, FString::Printf(
 			TEXT("Binding now resolves to '%s', but no module on this emitter writes that attribute, ")
 			TEXT("so the renderer will fall back to its default value. Previous binding was '%s'."),
 			*ResolvedAttribute, *PreviousAttribute));
@@ -18690,19 +18690,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetDynamicInputInputs(const
 	R->SetArrayField(TEXT("inputs"), InputsArr);
 	if (ScriptUsage != ENiagaraScriptUsage::DynamicInput)
 	{
-		R->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(R,
 			TEXT("This script's usage is not DynamicInput — add_dynamic_input will refuse it. Use get_module_script_inputs for module scripts."));
 	}
 	// Same contract as get_module_script_inputs: an input we found but could not type is
-	// reported, never silently dropped (gap #83).
+	// reported, never silently dropped (gap #83). Appended through AddWarning rather than
+	// SetArrayField because the usage caution above now lives on the same key — a raw
+	// SetArrayField here would replace it.
 	if (UnresolvedInputs.Num() > 0)
 	{
-		TArray<TSharedPtr<FJsonValue>> WarnArr;
-		WarnArr.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT(
+		FMonolithJsonUtils::AddWarning(R, FString::Printf(TEXT(
 			"INCOMPLETE: %d Module.* parameter(s) could not have their type resolved and are NOT in "
 			"'inputs': %s. Cross-check with get_script_parameters before concluding they do not exist."),
-			UnresolvedInputs.Num(), *FString::Join(UnresolvedInputs, TEXT(", ")))));
-		R->SetArrayField(TEXT("warnings"), WarnArr);
+			UnresolvedInputs.Num(), *FString::Join(UnresolvedInputs, TEXT(", "))));
 	}
 	return NA_SuccessObj(R);
 }
@@ -26652,7 +26652,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetPropagatedSwitches(const
 	}
 	if (Removed.Num() > 0)
 	{
-		R->SetStringField(TEXT("warning"), FString::Printf(TEXT(
+		FMonolithJsonUtils::AddWarning(R, FString::Printf(TEXT(
 			"%d switch(es) are no longer propagated. Each one was a static switch INPUT of this script "
 			"(UNiagaraGraph::FindStaticSwitchInputs unions in propagated variables, NiagaraGraph.cpp:2198-2204), "
 			"so the containing module's parameter surface just changed and any stack value set on it is now orphaned. "

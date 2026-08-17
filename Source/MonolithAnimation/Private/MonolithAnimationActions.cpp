@@ -7625,8 +7625,18 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const T
 		for (const FString& E : Errors) { ErrArr.Add(MakeShared<FJsonValueString>(E)); }
 		TSharedPtr<FJsonObject> ErrObj = MakeShared<FJsonObject>();
 		ErrObj->SetArrayField(TEXT("compile_errors"), ErrArr);
+
+		// These diagnostics exist NOWHERE ELSE. The rollback above already undid the
+		// transaction and recompiled the Blueprint clean, so re-running the action or
+		// asking the asset for its errors returns nothing — this message is the caller's
+		// only copy. The previous wording said "See compile_errors", naming a field the
+		// transport deletes; the errors are now reproduced inline instead, by the
+		// FormatErrorDataBlock append in FMonolithToolRegistry::ExecuteAction's refusal
+		// branch, which renders ErrorData as a fenced JSON block on the end of this text.
 		return FMonolithActionResult::Error(
-			TEXT("Rule compiled with errors — rolled back, no package change. See compile_errors."))
+			FString::Printf(
+				TEXT("Rule compiled with errors — rolled back, no package change. The %d compiler error(s) are reproduced in the `compile_errors` block at the end of this message; they are not recoverable by any later call, because the rollback recompiled the Blueprint clean."),
+				Errors.Num()))
 			.WithErrorData(ErrObj);
 	}
 

@@ -286,6 +286,48 @@ void FMonolithToolRegistry::UnregisterNamespace(const FString& Namespace)
 	}
 }
 
+// =============================================================================
+//  FMonolithActionResult::FormatErrorDataBlock — see the header for WHY this is
+//  text. Kept out-of-line so MonolithToolRegistry.h (included by nearly every
+//  action .cpp) does not have to pull in the JSON serializer.
+// =============================================================================
+
+FString FMonolithActionResult::FormatErrorDataBlock(const TSharedPtr<FJsonValue>& InErrorData)
+{
+	if (!InErrorData.IsValid() || InErrorData->IsNull())
+	{
+		return FString();
+	}
+
+	// WithErrorData can only store an object today. A non-object is still WRAPPED
+	// rather than skipped: this formatter exists because a payload silently going
+	// nowhere is the defect, and a `default: return ""` would reintroduce it for
+	// any future caller that attaches an array.
+	TSharedPtr<FJsonObject> Payload;
+	const TSharedPtr<FJsonObject>* AsObject = nullptr;
+	if (InErrorData->TryGetObject(AsObject) && AsObject && AsObject->IsValid())
+	{
+		Payload = *AsObject;
+	}
+	else
+	{
+		Payload = MakeShared<FJsonObject>();
+		Payload->SetField(TEXT("value"), InErrorData);
+	}
+
+	const FString Json = FMonolithJsonUtils::Serialize(Payload);
+	if (Json.IsEmpty())
+	{
+		return FString();
+	}
+
+	// Fenced so a client can lift the payload back out with a fence scan — the one
+	// property prose does not have.
+	return FString::Printf(
+		TEXT("\n\nError detail (structured payload, carried in this message because a FAILED tools/call response has no data field):\n```json\n%s\n```"),
+		*Json);
+}
+
 FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	const FString& Namespace,
 	const FString& Action,
@@ -306,7 +348,6 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		const bool bKnownNamespace = NamespaceActions.Contains(Namespace);
 		TArray<FString> CandidateKeys;
 		FString FuzzyNeedle;
-		FString SuggestionKind; // "action" | "namespace" — drives JSON key in suggestions
 		if (bKnownNamespace)
 		{
 			// Action typo within a known namespace. Snapshot the bare action
@@ -329,14 +370,12 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 				}
 			}
 			FuzzyNeedle = Action;
-			SuggestionKind = TEXT("action");
 		}
 		else
 		{
 			// Namespace typo. Snapshot all known namespace names.
 			NamespaceActions.GetKeys(CandidateKeys);
 			FuzzyNeedle = Namespace;
-			SuggestionKind = TEXT("namespace");
 		}
 
 		// Drop the lock BEFORE the Levenshtein sweep. The snapshot is now ours.
@@ -345,22 +384,16 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 		TArray<MonolithFuzzyMatchDetail::FFuzzyCandidate> Top3 =
 			MonolithFuzzyMatchDetail::ScoreFuzzyMatches(FuzzyNeedle, CandidateKeys, /*TopN=*/3);
 
-		// Build the suggestions JSON payload regardless of whether any matched —
-		// an empty array on the wire is still informative (the agent learns the
-		// needle is novel, not just misspelled).
-		TArray<TSharedPtr<FJsonValue>> SuggestionArray;
-		for (const MonolithFuzzyMatchDetail::FFuzzyCandidate& C : Top3)
-		{
-			TSharedPtr<FJsonObject> SObj = MakeShared<FJsonObject>();
-			SObj->SetStringField(SuggestionKind, C.Key);
-			SObj->SetNumberField(TEXT("score"), C.Score);
-			SuggestionArray.Add(MakeShared<FJsonValueObject>(SObj));
-		}
-
-		TSharedPtr<FJsonObject> ErrorDataObj = MakeShared<FJsonObject>();
-		ErrorDataObj->SetArrayField(TEXT("suggestions"), SuggestionArray);
-		ErrorDataObj->SetStringField(TEXT("kind"), SuggestionKind);
-
+		// The suggestions ride in the MESSAGE, in rank order, and nowhere else.
+		//
+		// This used to also attach a `{suggestions:[{action|namespace, score}], kind}`
+		// ErrorData payload. It was deleted, not migrated: the candidate NAMES are already
+		// in the suffix below in the same top-3 order, and the discriminator the `kind`
+		// field carried is the two different messages themselves ("Unknown action:" vs
+		// "Unknown namespace:"). All the payload added over the text was numeric scores —
+		// which no caller ever read, because the transport deleted the field before it
+		// reached one. Keeping it would now append a fenced JSON block to the single most
+		// common error in the system (a typo) to restate what the sentence already says.
 		FString MsgSuffix;
 		if (Top3.Num() > 0)
 		{
@@ -375,7 +408,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 				FString::Printf(TEXT("Unknown action: %s.%s — call monolith_discover(\"%s\") to enumerate valid actions in this namespace.%s"),
 					*Namespace, *Action, *Namespace, *MsgSuffix),
 				FMonolithJsonUtils::ErrMethodNotFound
-			).WithErrorData(ErrorDataObj);
+			);
 		}
 		else
 		{
@@ -383,7 +416,7 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 				FString::Printf(TEXT("Unknown namespace: %s — call monolith_discover() to enumerate valid namespaces.%s"),
 					*Namespace, *MsgSuffix),
 				FMonolithJsonUtils::ErrMethodNotFound
-			).WithErrorData(ErrorDataObj);
+			);
 		}
 	}
 
@@ -647,9 +680,16 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	else
 	{
 		// REFUSAL PATH. There is no Result object here and the transport's error branch
-		// carries no structured field, so the warnings are appended to the message.
-		// FormatWarningBlock returns "" when there is nothing to say, so an ordinary
-		// error message is byte-for-byte unchanged.
+		// carries no structured field, so BOTH the structured error payload and the
+		// warnings are appended to the message. Each formatter returns "" when it has
+		// nothing to say, so an ordinary error message is byte-for-byte unchanged.
+		//
+		// ErrorData first, warnings second: the payload elaborates on the FAILURE the
+		// message just stated, while warnings are commentary on the CALL. This single
+		// append is what makes ErrorData reachable at all — before it, every one of the
+		// ~42 paths that set the field had it destroyed at the transport, unread.
+		ActionResult.ErrorMessage += FMonolithActionResult::FormatErrorDataBlock(ActionResult.ErrorData);
+
 		TArray<FString> ErrWarnings = ActionResult.Warnings;
 		ErrWarnings.Append(AllWarnings);
 		ActionResult.ErrorMessage += FMonolithActionResult::FormatWarningBlock(ErrWarnings);

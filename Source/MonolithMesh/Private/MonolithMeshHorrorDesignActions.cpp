@@ -5,6 +5,7 @@
 #include "MonolithMeshAcoustics.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -739,7 +740,7 @@ FMonolithActionResult FMonolithMeshHorrorDesignActions::PredictPlayerPaths(const
 
 	if (AllPaths.Num() == 0)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No paths could be generated. Verify navmesh connectivity between start and end."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No paths could be generated. Verify navmesh connectivity between start and end."));
 	}
 
 	return FMonolithActionResult::Success(Result);
@@ -1184,7 +1185,7 @@ FMonolithActionResult FMonolithMeshHorrorDesignActions::SuggestScarePositions(co
 
 	if (Selected.Num() < Count)
 	{
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("Only %d of %d requested positions could be placed with min_spacing_cm=%.0f along a %.0f cm path."),
 			Selected.Num(), Count, MinSpacing, TotalPathLen));
 	}

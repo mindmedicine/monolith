@@ -828,7 +828,7 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::PlaceSpline(const TShar
 
 	if (SegmentCount > 50)
 	{
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("%d spline mesh segments — each is a separate draw call. Consider reducing points."), SegmentCount));
 	}
 
@@ -922,7 +922,7 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::CreatePrefab(const TSha
 	Result->SetStringField(TEXT("level_path"), SavePath);
 	Result->SetStringField(TEXT("type"), TypeStr.IsEmpty() ? TEXT("LevelInstance") : TypeStr);
 	Result->SetNumberField(TEXT("source_actor_count"), Actors.Num());
-	Result->SetStringField(TEXT("warning"), TEXT("Source actors have been MOVED into the Level Instance level. They no longer exist in the original level."));
+	FMonolithJsonUtils::AddWarning(Result, TEXT("Source actors have been MOVED into the Level Instance level. They no longer exist in the original level."));
 
 	return FMonolithActionResult::Success(Result);
 }

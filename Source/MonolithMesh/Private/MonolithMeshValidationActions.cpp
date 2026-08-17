@@ -601,7 +601,7 @@ FMonolithActionResult FMonolithMeshTemplateActions::BatchValidate(const TSharedP
 
 	if (!DB)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("Mesh catalog not available — run monolith_reindex() first for SQL pre-filtering. Falling back to slower asset-load validation."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("Mesh catalog not available — run monolith_reindex() first for SQL pre-filtering. Falling back to slower asset-load validation."));
 	}
 
 	return FMonolithActionResult::Success(Result);

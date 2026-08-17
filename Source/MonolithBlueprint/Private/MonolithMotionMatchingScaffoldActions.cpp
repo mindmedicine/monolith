@@ -360,7 +360,7 @@ FMonolithActionResult FMonolithMotionMatchingScaffoldActions::HandleSetAnimClass
 	Root->SetBoolField(TEXT("motion_matching_node_found"), bHasMMNode);
 	if (!bHasMMNode)
 	{
-		Root->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Root,
 			TEXT("AnimBP graph contains no Motion Matching node — AnimClass was set anyway."));
 	}
 	return FMonolithActionResult::Success(Root);

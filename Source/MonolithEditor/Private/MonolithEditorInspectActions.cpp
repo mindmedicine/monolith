@@ -25,6 +25,7 @@
 // =============================================================================
 
 #include "MonolithEditorActions.h"
+#include "MonolithJsonUtils.h"
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
@@ -394,7 +395,7 @@ FMonolithActionResult FMonolithEditorActions::HandleInspectTextureChannels(const
 		Result->SetBoolField(TEXT("has_alpha"), false);
 		Result->SetField(TEXT("channel_stats"), MakeShared<FJsonValueNull>());
 		Result->SetField(TEXT("splits"), MakeShared<FJsonValueNull>());
-		Result->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Result,
 			TEXT("Texture has no readable source data (cooked-only?). Returning runtime dimensions; channel_stats unavailable."));
 		return FMonolithActionResult::Success(Result);
 	}
@@ -415,7 +416,7 @@ FMonolithActionResult FMonolithEditorActions::HandleInspectTextureChannels(const
 		Result->SetBoolField(TEXT("has_alpha"), false);
 		Result->SetField(TEXT("channel_stats"), MakeShared<FJsonValueNull>());
 		Result->SetField(TEXT("splits"), MakeShared<FJsonValueNull>());
-		Result->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Result,
 			FString::Printf(TEXT("Source format %d not yet supported for channel inspection (supported: TSF_BGRA8)."),
 				static_cast<int32>(SourceFormat)));
 		return FMonolithActionResult::Success(Result);
@@ -426,7 +427,7 @@ FMonolithActionResult FMonolithEditorActions::HandleInspectTextureChannels(const
 	{
 		Result->SetField(TEXT("channel_stats"), MakeShared<FJsonValueNull>());
 		Result->SetField(TEXT("splits"), MakeShared<FJsonValueNull>());
-		Result->SetStringField(TEXT("warning"), TEXT("LockMipReadOnly returned null."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("LockMipReadOnly returned null."));
 		return FMonolithActionResult::Success(Result);
 	}
 
@@ -568,7 +569,7 @@ FMonolithActionResult FMonolithEditorActions::HandleInspectTextureChannels(const
 	Result->SetBoolField(TEXT("has_alpha"), false);
 	Result->SetField(TEXT("channel_stats"), MakeShared<FJsonValueNull>());
 	Result->SetField(TEXT("splits"), MakeShared<FJsonValueNull>());
-	Result->SetStringField(TEXT("warning"), TEXT("FTextureSource is editor-only; channel_stats unavailable in non-editor builds."));
+	FMonolithJsonUtils::AddWarning(Result, TEXT("FTextureSource is editor-only; channel_stats unavailable in non-editor builds."));
 #endif
 
 	return FMonolithActionResult::Success(Result);

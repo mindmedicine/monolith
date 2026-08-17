@@ -763,7 +763,7 @@ FMonolithActionResult FMonolithPCGActions::AddPCGNode(const TSharedPtr<FJsonObje
 	Result->SetObjectField(TEXT("node"), SerializeNode(Graph, NewNode));
 	if (!bPresent)
 	{
-		Result->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Result,
 			TEXT("AddNodeOfType returned a node that is not in UPCGGraph::GetNodes(). Treat this result as unverified."));
 	}
 	Result->SetStringField(TEXT("note"), TEXT("Asset is dirty in memory; it is not saved by this action."));

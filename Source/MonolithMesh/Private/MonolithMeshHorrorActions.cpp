@@ -3,6 +3,7 @@
 #include "MonolithMeshAnalysis.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -694,7 +695,7 @@ FMonolithActionResult FMonolithMeshHorrorActions::AnalyzeEscapeRoutes(const TSha
 		auto Result = MakeShared<FJsonObject>();
 		Result->SetNumberField(TEXT("routes_found"), 0);
 		Result->SetArrayField(TEXT("escape_routes"), TArray<TSharedPtr<FJsonValue>>());
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("No actors found with tags: [%s]. Tag exit points in your level."),
 			*FString::Join(ExitTags, TEXT(", "))));
 		return FMonolithActionResult::Success(Result);
@@ -811,11 +812,11 @@ FMonolithActionResult FMonolithMeshHorrorActions::AnalyzeEscapeRoutes(const TSha
 
 	if (Routes.Num() == 0)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No navigable escape routes found. This location may be inescapable — critical accessibility concern for hospice patients."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No navigable escape routes found. This location may be inescapable — critical accessibility concern for hospice patients."));
 	}
 	else if (Routes.Num() == 1)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("Only one escape route available. Consider adding an additional exit for player safety."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("Only one escape route available. Consider adding an additional exit for player safety."));
 	}
 
 	return FMonolithActionResult::Success(Result);

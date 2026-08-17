@@ -2170,7 +2170,7 @@ FMonolithActionResult FMonolithAudioMetaSoundActions::BuildMetaSoundFromSpec(con
 	ResultJson->SetArrayField(TEXT("skipped_defaults"), SkippedDefaults);
 	if (TotalSkipped > 0)
 	{
-		ResultJson->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(ResultJson, FString::Printf(
 			TEXT("%d spec items were skipped during build — see skipped_* arrays. Use strict_mode=true to abort instead."), TotalSkipped));
 	}
 	return FMonolithActionResult::Success(ResultJson);

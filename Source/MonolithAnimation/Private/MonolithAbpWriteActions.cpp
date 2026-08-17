@@ -1,6 +1,7 @@
 #include "MonolithAbpWriteActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Animation/AnimBlueprint.h"
 #include "Animation/AnimInstance.h"
@@ -2680,7 +2681,7 @@ FMonolithActionResult ApplyAdditiveImpl(const TSharedPtr<FJsonObject>& Params, b
 	if (bAlphaSupplied)
 	{
 		Root->SetBoolField(TEXT("alpha_write_failed"), bAlphaWriteFailed);
-		if (bAlphaWriteFailed) Root->SetStringField(TEXT("warning"), AlphaWarning);
+		if (bAlphaWriteFailed) FMonolithJsonUtils::AddWarning(Root, AlphaWarning);
 	}
 	Root->SetArrayField(TEXT("pins"), BuildPinList(NewNode));
 	Root->SetBoolField(TEXT("saved"), false);
@@ -2809,7 +2810,7 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleAddSlotNode(const TSharedP
 	Root->SetStringField(TEXT("slot_name"), SlotName);
 	Root->SetBoolField(TEXT("slot_validated"), bValidateSlot);
 	Root->SetBoolField(TEXT("slot_found"), bSlotFound);
-	if (!SlotWarning.IsEmpty()) Root->SetStringField(TEXT("warning"), SlotWarning);
+	if (!SlotWarning.IsEmpty()) FMonolithJsonUtils::AddWarning(Root, SlotWarning);
 	Root->SetBoolField(TEXT("source_wired"), Src != nullptr);
 	Root->SetArrayField(TEXT("pins"), BuildPinList(NewNode));
 	Root->SetBoolField(TEXT("saved"), false);

@@ -3,6 +3,7 @@
 #include "MonolithMeshAnalysis.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -806,7 +807,7 @@ FMonolithActionResult FMonolithMeshAccessibilityActions::FindRestPoints(const TS
 
 	if (RestPoints.Num() == 0)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No rest points found along this path. Hospice patients need regular rest opportunities. Tag safe areas with 'SafeRoom' or 'RestPoint'."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No rest points found along this path. Hospice patients need regular rest opportunities. Tag safe areas with 'SafeRoom' or 'RestPoint'."));
 	}
 
 	return FMonolithActionResult::Success(Result);

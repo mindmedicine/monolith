@@ -50,10 +50,14 @@ bool DecodeRICursor(const FString& Enc, FRICursorState& Out)
 
 FMonolithActionResult RIInvalidCursorError(const FString& Reason)
 {
-	TSharedPtr<FJsonObject> Data = MakeShared<FJsonObject>();
-	Data->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
-	return FMonolithActionResult::Error(Reason, FMonolithJsonUtils::ErrInvalidParams)
-		.WithErrorData(Data);
+	// The `INVALID_CURSOR` token is prefixed onto the MESSAGE, not attached as ErrorData.
+	// This helper has 34 call sites across six RI adapters, and every one of them was
+	// setting a field the transport's error projection deletes (it carries ErrorMessage
+	// and nothing else) — so the code was machine-readable in principle and unreachable
+	// in fact. A prefixed token is matchable through the channel that actually exists.
+	return FMonolithActionResult::Error(
+		FString::Printf(TEXT("INVALID_CURSOR: %s"), *Reason),
+		FMonolithJsonUtils::ErrInvalidParams);
 }
 
 uint32 RIComputeFilterHash(std::initializer_list<FString> Parts)

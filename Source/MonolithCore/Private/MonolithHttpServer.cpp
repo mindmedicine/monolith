@@ -836,7 +836,15 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 	double DurationMs = (FPlatformTime::Seconds() - ActionStartTimeSeconds) * 1000.0;
 	UE_LOG(LogMonolith, Verbose, TEXT("Monolith action %s.%s completed in %.2f ms"), *Namespace, *Action, DurationMs);
 
-	// Build MCP tool result
+	// Build MCP tool result. The projection itself lives in a pure function so the test
+	// suite can exercise the code the server actually runs — see the header comment.
+	TSharedPtr<FJsonObject> Result = ProjectResultToToolCallPayload(ActionResult);
+
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+}
+
+TSharedPtr<FJsonObject> FMonolithHttpServer::ProjectResultToToolCallPayload(const FMonolithActionResult& ActionResult)
+{
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> Content;
 
@@ -857,6 +865,13 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 	}
 	else
 	{
+		// NOTE — this branch carries ErrorMessage and NOTHING ELSE. ErrorCode and
+		// ErrorData are not projected: ErrorCode is an in-process contract only (read by
+		// FPipelineAdapter and MonolithNiagaraQueryLibrary), and ErrorData is folded into
+		// ErrorMessage upstream by ExecuteAction's refusal branch. Anything a handler sets
+		// on FMonolithActionResult that is not reachable from these two members does not
+		// exist as far as an MCP client is concerned. If you add a member, add a row to
+		// Monolith.Transport.FieldProjectionCoverage.
 		TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
 		TextContent->SetStringField(TEXT("type"), TEXT("text"));
 		TextContent->SetStringField(TEXT("text"), ActionResult.ErrorMessage);
@@ -865,8 +880,7 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 	}
 
 	Result->SetArrayField(TEXT("content"), Content);
-
-	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+	return Result;
 }
 
 TSharedPtr<FJsonObject> FMonolithHttpServer::HandlePing(const TSharedPtr<FJsonValue>& Id)

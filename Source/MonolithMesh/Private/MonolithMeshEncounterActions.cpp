@@ -5,6 +5,7 @@
 #include "MonolithMeshAcoustics.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -1067,7 +1068,7 @@ FMonolithActionResult FMonolithMeshEncounterActions::SuggestPatrolRoute(const TS
 
 	if (OrderedWaypoints.Num() < WaypointCount)
 	{
-		Result->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Result, FString::Printf(
 			TEXT("Only %d of %d requested waypoints could be placed with adequate spacing."),
 			OrderedWaypoints.Num(), WaypointCount));
 	}

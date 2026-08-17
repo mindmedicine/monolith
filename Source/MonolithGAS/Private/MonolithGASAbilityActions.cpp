@@ -2697,7 +2697,7 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleGetAbilityTaskPins(const
 	}
 	else
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No factory function found; pin schema unavailable"));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No factory function found; pin schema unavailable"));
 	}
 
 	// List raw delegate properties from the class

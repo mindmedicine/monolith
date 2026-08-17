@@ -2,6 +2,7 @@
 #include "MonolithMeshUtils.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
@@ -1485,7 +1486,7 @@ FMonolithActionResult FMonolithMeshSpatialActions::QueryNavmesh(const TSharedPtr
 
 	if (bIsPartial)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("Path is partial - destination may not be fully reachable via navmesh"));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("Path is partial - destination may not be fully reachable via navmesh"));
 	}
 
 	return FMonolithActionResult::Success(Result);

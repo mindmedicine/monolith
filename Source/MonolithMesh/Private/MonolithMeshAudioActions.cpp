@@ -4,6 +4,7 @@
 #include "MonolithMeshAnalysis.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
 
 #include "Engine/World.h"
@@ -398,7 +399,7 @@ FMonolithActionResult FMonolithMeshAudioActions::GetAudioVolumes(const TSharedPt
 	// Flag: check if scene has uncovered regions
 	if (VolumesArr.Num() == 0)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No audio volumes in scene. All areas use global reverb defaults."));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No audio volumes in scene. All areas use global reverb defaults."));
 	}
 
 	return FMonolithActionResult::Success(Result);
@@ -579,7 +580,7 @@ FMonolithActionResult FMonolithMeshAudioActions::EstimateFootstepSound(const TSh
 	}
 	else
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("No floor detected below location (void)"));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("No floor detected below location (void)"));
 	}
 
 	return FMonolithActionResult::Success(Result);
@@ -1451,7 +1452,7 @@ FMonolithActionResult FMonolithMeshAudioActions::FindQuietPath(const TSharedPtr<
 
 	if (MainScore > MaxLoudness)
 	{
-		Result->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Result,
 			FString::Printf(TEXT("Path average loudness %.2f exceeds threshold %.2f. No quieter alternative found on navmesh."),
 				MainScore, MaxLoudness));
 	}

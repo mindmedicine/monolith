@@ -1032,23 +1032,23 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 	if (!CursorIn.IsEmpty())
 	{
 		MonolithCursorCodec::FCursorState State;
+		// The `INVALID_CURSOR` token is IN THE MESSAGE, not in ErrorData. It used to be
+		// both; the ErrorData copy was deleted because the transport's error projection
+		// carries only ErrorMessage, so no caller ever received it. Putting the token in
+		// the text keeps it matchable without a channel that does not exist.
 		if (!MonolithCursorCodec::Decode(CursorIn, State))
 		{
-			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
-			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
 			return FMonolithActionResult::Error(
-				TEXT("Cursor decode failed; restart pagination without `cursor`."),
+				TEXT("INVALID_CURSOR: cursor decode failed; restart pagination without `cursor`."),
 				FMonolithJsonUtils::ErrInvalidParams
-			).WithErrorData(ErrData);
+			);
 		}
 		if (State.QueryHash != CurrentHash)
 		{
-			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
-			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
 			return FMonolithActionResult::Error(
-				TEXT("Cursor query mismatch; restart pagination without `cursor`."),
+				TEXT("INVALID_CURSOR: cursor query mismatch; restart pagination without `cursor`."),
 				FMonolithJsonUtils::ErrInvalidParams
-			).WithErrorData(ErrData);
+			);
 		}
 		SymbolPage = State.SymbolPage;
 		SourcePage = State.SourcePage;
@@ -1676,7 +1676,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetIncludePath(const TShared
 	ResultObj->SetBoolField(TEXT("includable"), bIncludable);
 	if (!ModuleName.IsEmpty()) ResultObj->SetStringField(TEXT("module"), ModuleName);
 	if (!BuildCsNote.IsEmpty()) ResultObj->SetStringField(TEXT("build_cs_note"), BuildCsNote);
-	if (!Warning.IsEmpty()) ResultObj->SetStringField(TEXT("warning"), Warning);
+	if (!Warning.IsEmpty()) FMonolithJsonUtils::AddWarning(ResultObj, Warning);
 
 	// Human-readable content envelope, matching the other source handlers.
 	FString Text = FString::Printf(TEXT("#include \"%s\""), *Include);
@@ -2156,12 +2156,11 @@ FMonolithActionResult FMonolithSourceActions::HandleFindExampleUsage(const TShar
 		MonolithCursorCodec::FCursorState State;
 		if (!MonolithCursorCodec::Decode(CursorIn, State) || State.QueryHash != CurrentHash)
 		{
-			TSharedPtr<FJsonObject> ErrData = MakeShared<FJsonObject>();
-			ErrData->SetStringField(TEXT("error_code"), TEXT("INVALID_CURSOR"));
+			// Token in the message — see the note on the search_source cursor guard above.
 			return FMonolithActionResult::Error(
-				TEXT("Cursor decode/query mismatch; restart pagination without `cursor`."),
+				TEXT("INVALID_CURSOR: cursor decode/query mismatch; restart pagination without `cursor`."),
 				FMonolithJsonUtils::ErrInvalidParams
-			).WithErrorData(ErrData);
+			);
 		}
 		PageIndex = State.SourcePage;
 	}

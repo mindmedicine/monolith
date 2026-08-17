@@ -1556,6 +1556,13 @@ FMonolithActionResult FMonolithEditorActions::HandleGetLogStats(const TSharedPtr
 
 	if (CachedLogCapture)
 	{
+		// NOT the gap #111 warning channel. These six keys are a VERBOSITY HISTOGRAM whose key
+		// names are the verbosity vocabulary VerbosityToString/VerbosityFromString emit and parse
+		// (the same strings that appear as `verbosity` on a log line and are accepted as this
+		// namespace's verbosity filter param). `warning` here is a COUNT of captured Warning lines,
+		// not a caution about this call, so it neither migrates to `warnings[]` nor renames to
+		// `warning_count` without breaking that correspondence. Deliberately left as-is; the
+		// registry merge only ever touches the PLURAL `warnings` key, so nothing destroys it.
 		Root->SetNumberField(TEXT("total"), CachedLogCapture->GetTotalCount());
 		Root->SetNumberField(TEXT("fatal"), CachedLogCapture->GetCountByVerbosity(ELogVerbosity::Fatal));
 		Root->SetNumberField(TEXT("error"), CachedLogCapture->GetCountByVerbosity(ELogVerbosity::Error));
@@ -6159,7 +6166,7 @@ FMonolithActionResult FMonolithEditorActions::HandleStopPieSmoke(const TSharedPt
 		}
 		else
 		{
-			Result->SetStringField(TEXT("warning"),
+			FMonolithJsonUtils::AddWarning(Result,
 				FString::Printf(TEXT("Unknown session '%s' — nothing to stop."), *SessionId));
 		}
 	}

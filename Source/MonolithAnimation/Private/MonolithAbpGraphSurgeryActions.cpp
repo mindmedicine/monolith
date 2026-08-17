@@ -1,6 +1,7 @@
 #include "MonolithAbpGraphSurgeryActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #include "Animation/AnimBlueprint.h"
 #include "EdGraph/EdGraph.h"
@@ -704,7 +705,7 @@ FMonolithActionResult FMonolithAbpGraphSurgeryActions::HandleRemoveNodeSlice(con
 	Root->SetArrayField(TEXT("broken_exec_continuity"), BrokenExec);
 	if (BrokenExec.Num() > 0)
 	{
-		Root->SetStringField(TEXT("warning"), TEXT("Removing this slice severs required exec continuity at the listed pins. These are surfaced, not auto-rewired — wire them manually if the graph must remain executable."));
+		FMonolithJsonUtils::AddWarning(Root, TEXT("Removing this slice severs required exec continuity at the listed pins. These are surfaced, not auto-rewired — wire them manually if the graph must remain executable."));
 	}
 
 	if (bDryRun)

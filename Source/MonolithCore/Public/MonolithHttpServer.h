@@ -10,6 +10,7 @@
 class FJsonObject;
 class FJsonValue;
 class FMonolithToolRegistry;
+struct FMonolithActionResult;
 
 /**
  * Embedded MCP HTTP server.
@@ -40,6 +41,30 @@ public:
 
 	/** Get the port the server is listening on */
 	int32 GetPort() const { return BoundPort; }
+
+	/**
+	 * THE tools/call projection — the single point at which an FMonolithActionResult
+	 * becomes something an MCP client can see.
+	 *
+	 * Extracted from HandleToolsCall so it can be TESTED. Before extraction nothing in
+	 * the suite touched this layer: of 49 test files, zero referenced the HTTP server,
+	 * and every one of them asserted on the struct HandleToolsCall projects FROM. That
+	 * made any assertion about a failure-path field vacuous as a claim about callers —
+	 * `ErrorData` was asserted green in two test files while the projection deleted it
+	 * on all ~42 paths that set it, for as long as the field has existed.
+	 *
+	 * Pure: no socket, no server state, no side effects. HandleToolsCall calls this and
+	 * MonolithTransportProjectionTest calls this — deliberately the SAME function, since
+	 * a test that reimplements the projection proves only that two copies agree.
+	 *
+	 * Returns the MCP `tools/call` result object: `{ content: [{type:"text", text}], isError }`
+	 * and nothing else. The shape is fixed by the MCP spec; an error response has no
+	 * structured field, which is why ErrorData and warnings ride inside `text` (see
+	 * FMonolithActionResult::FormatErrorDataBlock / FormatWarningBlock).
+	 *
+	 * @param ActionResult  the result as returned by FMonolithToolRegistry::ExecuteAction.
+	 */
+	static TSharedPtr<FJsonObject> ProjectResultToToolCallPayload(const FMonolithActionResult& ActionResult);
 
 private:
 	// --- Route Handlers ---

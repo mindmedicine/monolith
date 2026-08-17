@@ -1,5 +1,6 @@
 #include "MonolithGASInputActions.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 #include "MonolithGASInternal.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -384,7 +385,7 @@ FMonolithActionResult FMonolithGASInputActions::HandleBindAbilityToInput(const T
 		if (!InputTag.IsValid())
 		{
 			// Tag doesn't exist yet — warn but still store
-			Result->SetStringField(TEXT("warning"),
+			FMonolithJsonUtils::AddWarning(Result,
 				FString::Printf(TEXT("Tag '%s' not registered. Consider adding it via add_gameplay_tags first."),
 					*InputAction));
 		}

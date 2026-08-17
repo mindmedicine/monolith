@@ -1,5 +1,6 @@
 #include "MonolithGASCueActions.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 #include "MonolithGASInternal.h"
 #include "MonolithAssetUtils.h"
 
@@ -327,7 +328,7 @@ FMonolithActionResult FMonolithGASCueActions::HandleCreateGameplayCueNotify(cons
 
 	if (!bTagSet)
 	{
-		Result->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Result,
 			FString::Printf(TEXT("Tag '%s' is not registered. Add it via add_gameplay_tags or scaffold_tag_hierarchy."), *CueTag));
 	}
 

@@ -1591,7 +1591,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
 	if (bGenericFallback)
 	{
-		Root->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Root,
 			TEXT("Created via generic K2Node fallback — node may require additional configuration via set_pin_default or dedicated handler"));
 	}
 	return FMonolithActionResult::Success(Root);
@@ -1752,7 +1752,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddPropertyAccess(con
 	}
 	if (!bPropertyFound)
 	{
-		Root->SetStringField(TEXT("warning"), FString::Printf(
+		FMonolithJsonUtils::AddWarning(Root, FString::Printf(
 			TEXT("Property '%s' was not found on class '%s' via reflection — node was authored with the external member reference, but verify the property name."),
 			*MemberName, *MemberClass->GetName()));
 	}
@@ -1921,7 +1921,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddPropertyAccessNode
 	{
 		// The path did not resolve to a leaf (e.g. wrong field name / GUID, or the access
 		// root member is not present on this Blueprint). Node is still authored; warn.
-		Root->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Root,
 			TEXT("Property Access authored but its 'Value' pin did not resolve — verify the path: element 0 must be a member/function "
 			     "on the access root (the AnimInstance's own variable or a thread-safe function), and struct field elements must use "
 			     "the exact internal field name (GUID-suffixed for UserDefinedStruct fields)."));
@@ -2070,7 +2070,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleConnectPins(const TSh
 	Root->SetBoolField(TEXT("success"), true);
 	if (bAutoConversion)
 	{
-		Root->SetStringField(TEXT("warning"), TEXT("Connection required an auto-conversion node (types were not directly compatible)"));
+		FMonolithJsonUtils::AddWarning(Root, TEXT("Connection required an auto-conversion node (types were not directly compatible)"));
 	}
 	return FMonolithActionResult::Success(Root);
 }

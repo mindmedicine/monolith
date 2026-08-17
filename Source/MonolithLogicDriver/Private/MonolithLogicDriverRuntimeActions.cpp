@@ -1,5 +1,6 @@
 #include "MonolithLogicDriverRuntimeActions.h"
 #include "MonolithParamSchema.h"
+#include "MonolithJsonUtils.h"
 
 #if WITH_LOGICDRIVER
 
@@ -352,7 +353,7 @@ FMonolithActionResult FMonolithLogicDriverRuntimeActions::HandleRuntimeSwitchSta
 	Result->SetBoolField(TEXT("switched"), bSwitched);
 	if (!bSwitched)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("SwitchActiveState function not found on SM instance"));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("SwitchActiveState function not found on SM instance"));
 	}
 
 	return FMonolithActionResult::Success(Result);
@@ -378,7 +379,7 @@ FMonolithActionResult FMonolithLogicDriverRuntimeActions::HandleRuntimeEvaluateT
 	Result->SetBoolField(TEXT("evaluated"), bCalled);
 	if (!bCalled)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("EvaluateTransitions function not found on SM instance"));
+		FMonolithJsonUtils::AddWarning(Result, TEXT("EvaluateTransitions function not found on SM instance"));
 	}
 
 	return FMonolithActionResult::Success(Result);

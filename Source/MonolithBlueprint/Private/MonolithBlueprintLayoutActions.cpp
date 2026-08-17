@@ -347,7 +347,7 @@ FMonolithActionResult FMonolithBlueprintLayoutActions::HandleAutoLayout(const TS
 				// Warn if BA-incompatible params were set
 				if (LayoutMode != TEXT("all") || SelectedNodeIds.Num() > 0)
 				{
-					Result->SetStringField(TEXT("warning"),
+					FMonolithJsonUtils::AddWarning(Result,
 						TEXT("layout_mode and node_ids are ignored by Blueprint Assist formatter"));
 				}
 

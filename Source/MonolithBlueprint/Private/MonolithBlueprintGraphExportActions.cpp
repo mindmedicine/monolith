@@ -320,7 +320,7 @@ FMonolithActionResult FMonolithBlueprintGraphExportActions::HandleCopyNodes(cons
 			NotFoundArr.Add(MakeShared<FJsonValueString>(Id));
 		}
 		Root->SetArrayField(TEXT("not_found"), NotFoundArr);
-		Root->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Root,
 			FString::Printf(TEXT("%d node(s) not found in source graph"), NotFound.Num()));
 	}
 
