@@ -93,6 +93,10 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 
+// Pure name-classification rules shared by the parameter readers (gaps #83, #99). Header-only
+// and dependency-free so the same rules are unit-testable without an editor or a graph.
+#include "MonolithNiagaraParameterNames.h"
+
 #if WITH_NIAGARA_WIZARD_PRIVATE
 // Engine-PRIVATE NiagaraEditor node headers — resolvable only when WITH_NIAGARA_WIZARD_PRIVATE=1
 // widens PrivateIncludePaths into NiagaraEditor/Private (see MonolithNiagara.Build.cs). The
@@ -4472,7 +4476,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 	// real cost was never the recreate: it was the I-19 churn on every PLACED instance, which is
 	// what produced incidents #13/C14 and #2/C6. All three refuse before opening a transaction
 	// (#36) and warn — never silently — when the script is placed somewhere (I-20 / #62).
-	Registry.RegisterAction(TEXT("niagara"), TEXT("rename_script_parameter"), TEXT("Rename a module script's parameter AND every pin that references it, in one operation (UNiagaraGraph::RenameParameter — the editor's own Parameters-panel rename). Refuses static switch parameters (the engine refuses them too), refuses a target name that is already taken unless allow_merge=true (a merge keeps the TARGET's metadata and discards this parameter's), and always refuses when the target name exists with a DIFFERENT type, because that would silently produce two parameters sharing one name. ALSO REPAIRS PLACED CALLERS by default (gap #93): every referencing system/emitter is traversed down to the placed module node and its stale override pin is RENAMED in place — the engine's own repair (NiagaraStackGraphUtilities.cpp:4236) — which preserves links, default values, dynamic-input chains and data interfaces because only the pin name changes. All-or-nothing: if any caller cannot be repaired, nothing is changed at all. It CANNOT verify its own work — per I-37 an in-session compile does not re-translate a dependent system, so reload each caller to confirm. Not exposed through batch_execute — batch does not abort or roll back, and a half-applied rename is worse than a failed one."),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("rename_script_parameter"), TEXT("Rename a module script's parameter AND every pin that references it, in one operation (UNiagaraGraph::RenameParameter — the editor's own Parameters-panel rename). Refuses static switch parameters (the engine refuses them too), refuses a target name that is already taken unless allow_merge=true (a merge keeps the TARGET's metadata and discards this parameter's), and always refuses when the target name exists with a DIFFERENT type, because that would silently produce two parameters sharing one name. ALSO REPAIRS PLACED CALLERS by default (gap #93): every referencing system/emitter is traversed down to the placed module node and its stale override pin is RENAMED in place — the engine's own repair (NiagaraStackGraphUtilities.cpp:4236) — which preserves links, default values, dynamic-input chains and data interfaces because only the pin name changes. All-or-nothing: if any caller cannot be repaired, nothing is changed at all. A COMPILE ALONE CANNOT CONFIRM THE REPAIR: an in-session request_compile does re-translate dependent systems, but this repair renames the override pin IN PLACE and so preserves semantics by design — a clean compile is expected whether or not every caller was reached. Read the overrides back on each caller to confirm. Not exposed through batch_execute — batch does not abort or roll back, and a half-applied rename is worse than a failed one."),
 		FMonolithActionHandler::CreateStatic(&HandleRenameScriptParameter),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
@@ -7823,6 +7827,228 @@ static void CollectStackParameterReaders(const TArray<FMonolithNamedGraph>& Grap
 	}
 }
 
+// ============================================================================
+// Release-safe access to the engine-PRIVATE ParameterMap node classes.
+//
+// UNiagaraNodeParameterMapGet and UNiagaraNodeParameterMapSet are plain UCLASS() (no
+// MinimalAPI, no NIAGARAEDITOR_API) declared in NiagaraEditor/PRIVATE. Their headers are only
+// on our include path when WITH_NIAGARA_WIZARD_PRIVATE=1, so `Cast<UNiagaraNodeParameterMapSet>`
+// does not even COMPILE in a release build, and their StaticClass() would not link if it did —
+// which is exactly why FindFunctionOverridePin deliberately types its override node as
+// UEdGraphNode instead.
+//
+// Resolving the UClass by its script path keeps these readers working in EVERY configuration.
+// It is also strictly better than the GetClass()->GetName().Contains(...) string test used
+// elsewhere in this file, because IsA() honours inheritance: UNiagaraNodeParameterMapFor derives
+// from UNiagaraNodeParameterMapSet (NiagaraNodeParameterMapFor.h:11), so a for-loop write is a
+// real ParameterMapSet write that a substring match silently misses.
+// ============================================================================
+static UClass* ResolveNiagaraNodeClassByPath(const TCHAR* ScriptPath)
+{
+	// Not cached on failure: a null here would mean NiagaraEditor was not loaded yet, and
+	// caching that would poison every later call.
+	return FindObject<UClass>(nullptr, ScriptPath);
+}
+
+static UClass* GetNiagaraParameterMapGetClass()
+{
+	static UClass* Cached = nullptr;
+	if (!Cached) Cached = ResolveNiagaraNodeClassByPath(TEXT("/Script/NiagaraEditor.NiagaraNodeParameterMapGet"));
+	return Cached;
+}
+
+static UClass* GetNiagaraParameterMapSetClass()
+{
+	static UClass* Cached = nullptr;
+	if (!Cached) Cached = ResolveNiagaraNodeClassByPath(TEXT("/Script/NiagaraEditor.NiagaraNodeParameterMapSet"));
+	return Cached;
+}
+
+static bool IsParameterMapGetNode(const UEdGraphNode* Node)
+{
+	UClass* C = GetNiagaraParameterMapGetClass();
+	return Node && C && Node->IsA(C);
+}
+
+static bool IsParameterMapSetNode(const UEdGraphNode* Node)
+{
+	UClass* C = GetNiagaraParameterMapSetClass();
+	return Node && C && Node->IsA(C);
+}
+
+// ============================================================================
+// GAP #83 — shared module/dynamic-input INPUT enumeration. ONE traversal, two callers.
+//
+// get_dynamic_input_inputs already had this right: gap #31-F replaced its UNiagaraNodeInput walk
+// with a union of the script-variable registry and the ParameterMapGet read pins. get_module_
+// script_inputs was left with the ORIGINAL defect and it is the same defect — it enumerated
+// UNiagaraNodeInput nodes with Usage==Parameter, which for a stock Epic module matches only the
+// graph's ParameterMap plumbing node. Stock GravityForce answered input_count 2 (InputMap +
+// the Coordinate Space switch), omitted Module.Gravity, and carried no warnings key.
+//
+// The two now share this function so they cannot drift again — the gap #77 lesson, applied to
+// the reader side. A module input is collected from the two places an unattached script carries
+// one, unioned and deduped:
+//   1. UNiagaraGraph::GetAllMetaData — the exported accessor for VariableToScriptVariable
+//      (NiagaraGraph.h:367-368), which is what the script editor's Parameters panel lists and
+//      what get_script_parameters (the known-good reader) reads; and
+//   2. the Module.* OUTPUT pins on the graph's ParameterMapGet nodes, where the value is
+//      physically read.
+// UNiagaraNodeInput is still consulted last, so older or hand-built scripts keep working.
+// ============================================================================
+struct FMonolithDiscoveredScriptInput
+{
+	FName FullName;
+	FNiagaraTypeDefinition Type;
+	FString Source;   // "script_variable" | "parameter_map_get" | "input_node"
+};
+
+// OutUnresolved receives any Module.* candidate whose TYPE could not be resolved. Such a
+// parameter is a real input we are unable to describe, and dropping it without a word is the
+// precise failure gap #83 is about — so callers MUST surface these as a warning rather than
+// letting the count quietly shrink.
+static void CollectModuleScriptInputs(
+	UNiagaraGraph* Graph,
+	const TArray<MonolithNiagaraHelpers::FStaticSwitchInput>& SwitchInputs,
+	TArray<FMonolithDiscoveredScriptInput>& Out,
+	TArray<FString>& OutUnresolved)
+{
+	Out.Reset();
+	OutUnresolved.Reset();
+	if (!Graph) return;
+
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+
+	// Switch selectors are enumerated separately by every caller and must not also appear as
+	// ordinary inputs — they are registered as script variables like everything else.
+	TSet<FName> SwitchNames;
+	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
+	{
+		SwitchNames.Add(SwitchInput.Variable.GetName());
+	}
+
+	TSet<FName> SeenNames;
+	auto AddInput = [&](const FName& FullName, const FNiagaraTypeDefinition& Type, const TCHAR* Source)
+	{
+		if (FullName.IsNone()) return;
+
+		// Engine./Particles./System./Transient. names are READS the module performs, not inputs
+		// the caller can set. "InputMap" — the map plumbing pin that used to be reported as an
+		// input — fails here too, because it carries no namespace at all.
+		if (!MonolithNiagaraParameterNames::IsModuleInputName(FullName.ToString())) return;
+		if (SwitchNames.Contains(FullName)) return;
+		if (SeenNames.Contains(FullName)) return;
+
+		// A ParameterMap-typed entry is plumbing, never an input, and is not a reporting failure.
+		if (Type.IsValid() && Type == MapDef) return;
+
+		if (!Type.IsValid())
+		{
+			OutUnresolved.AddUnique(FullName.ToString());
+			return;
+		}
+
+		SeenNames.Add(FullName);
+		Out.Add({ FullName, Type, FString(Source) });
+	};
+
+	for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& Pair : Graph->GetAllMetaData())
+	{
+		AddInput(Pair.Key.GetName(), Pair.Key.GetType(), TEXT("script_variable"));
+	}
+
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!IsParameterMapGetNode(Node)) continue;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output) continue;
+			if (Pin->PinName.IsNone() || Pin->PinName == TEXT("Add")) continue;
+			AddInput(Pin->PinName, UEdGraphSchema_Niagara::PinToTypeDefinition(Pin), TEXT("parameter_map_get"));
+		}
+	}
+
+	TArray<UNiagaraNodeInput*> InputNodes;
+	Graph->GetNodesOfClass<UNiagaraNodeInput>(InputNodes);
+	for (UNiagaraNodeInput* InputNode : InputNodes)
+	{
+		if (!InputNode) continue;
+		if (InputNode->Usage != ENiagaraInputNodeUsage::Parameter) continue;
+		AddInput(InputNode->Input.GetName(), InputNode->Input.GetType(), TEXT("input_node"));
+	}
+}
+
+// ============================================================================
+// GAP #99 — shared module OUTPUT (ParameterMapSet write) enumeration.
+//
+// A module's outputs are the write pins on the ParameterMapSet nodes inside its own script
+// graph. get_module_output_parameters read the Output NODE instead, whose only pin on a module
+// script is the parameter map itself — hence output_count 1 / OutputMap for every module,
+// including Epic's Collision, with no error and no warning.
+//
+// The name classification lives in MonolithNiagaraParameterNames so this reader and
+// BuildStackWriterIndex apply identical rules.
+// ============================================================================
+struct FMonolithDiscoveredScriptWrite
+{
+	FString PinName;                                  // the raw MapSet pin, e.g. "StackContext.Position"
+	FNiagaraTypeDefinition Type;
+	MonolithNiagaraParameterNames::EModuleWriteKind Kind = MonolithNiagaraParameterNames::EModuleWriteKind::NotAWrite;
+	TArray<FString> ResolvedNames;                    // caller-addressable name(s); empty for module_local
+};
+
+// OutUnresolved receives any write pin whose TYPE could not be resolved — same contract, and
+// same reason, as CollectModuleScriptInputs.
+static void CollectModuleScriptWrites(
+	UNiagaraGraph* FunctionGraph,
+	const FString& CallName,
+	MonolithNiagaraParameterNames::EStackContextKind Context,
+	TArray<FMonolithDiscoveredScriptWrite>& Out,
+	TArray<FString>& OutUnresolved)
+{
+	Out.Reset();
+	OutUnresolved.Reset();
+	if (!FunctionGraph) return;
+
+	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
+
+	TSet<FString> SeenPins;
+	for (UEdGraphNode* Node : FunctionGraph->Nodes)
+	{
+		if (!IsParameterMapSetNode(Node)) continue;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Input) continue;
+
+			const FString PinName = Pin->PinName.IsNone() ? FString() : Pin->PinName.ToString();
+			const FNiagaraTypeDefinition PinType = UEdGraphSchema_Niagara::PinToTypeDefinition(Pin);
+
+			// The map spine threading through the node is not a write.
+			if (PinType.IsValid() && PinType == MapDef) continue;
+
+			TArray<FString> ResolvedNames;
+			const MonolithNiagaraParameterNames::EModuleWriteKind Kind =
+				MonolithNiagaraParameterNames::ClassifyModuleWritePin(PinName, CallName, Context, ResolvedNames);
+			if (Kind == MonolithNiagaraParameterNames::EModuleWriteKind::NotAWrite) continue;
+
+			if (SeenPins.Contains(PinName)) continue;
+			SeenPins.Add(PinName);
+
+			if (!PinType.IsValid())
+			{
+				OutUnresolved.AddUnique(PinName);
+				continue;
+			}
+
+			FMonolithDiscoveredScriptWrite& Entry = Out.AddDefaulted_GetRef();
+			Entry.PinName = PinName;
+			Entry.Type = PinType;
+			Entry.Kind = Kind;
+			Entry.ResolvedNames = MoveTemp(ResolvedNames);
+		}
+	}
+}
+
 // Shared: index of every name-addressable parameter written anywhere in a system's
 // stacks, with writer attribution ("Owner/Usage/Module", "User", "engine_intrinsic").
 // Sources: module-script ParameterMapSet pins (alias-resolved per call), assignment
@@ -7954,31 +8180,29 @@ static void BuildStackWriterIndex(UNiagaraSystem* System, const FString& Emitter
 				UNiagaraScriptSource* FnSrc = Cast<UNiagaraScriptSource>(FnScript->GetLatestSource());
 				if (!FnSrc || !FnSrc->NodeGraph) continue;
 
+				// Same classification the module-output reader applies, via the shared pure rules
+				// (gap #99) so the writer index and get_module_output_parameters cannot disagree
+				// about what a MapSet pin name means.
+				const MonolithNiagaraParameterNames::EStackContextKind Ctx =
+					bSystemStage  ? MonolithNiagaraParameterNames::EStackContextKind::System :
+					bEmitterStage ? MonolithNiagaraParameterNames::EStackContextKind::Emitter
+					              : MonolithNiagaraParameterNames::EStackContextKind::Particles;
+
 				for (UEdGraphNode* SNode : FnSrc->NodeGraph->Nodes)
 				{
-					if (!SNode || !SNode->GetClass()->GetName().Contains(TEXT("NiagaraNodeParameterMapSet"))) continue;
+					if (!IsParameterMapSetNode(SNode)) continue;
 					for (UEdGraphPin* P : SNode->Pins)
 					{
 						if (P->Direction != EGPD_Input || IsSkippablePin(P)) continue;
-						FString N = P->PinName.ToString();
 
-						if (N.StartsWith(TEXT("Output.Module.")))
+						TArray<FString> ResolvedNames;
+						MonolithNiagaraParameterNames::ClassifyModuleWritePin(
+							P->PinName.ToString(), CallName, Ctx, ResolvedNames);
+						// ModuleLocal and NotAWrite yield no names — module-local writes are not
+						// addressable from outside, exactly as before.
+						for (const FString& ResolvedName : ResolvedNames)
 						{
-							AddModuleWriter(FString::Printf(TEXT("Output.%s.%s"), *CallName, *N.Mid(14)), Ref);
-						}
-						else if (N.StartsWith(TEXT("Module.")))
-						{
-							// module-local — not addressable from outside
-						}
-						else if (N.StartsWith(TEXT("StackContext.")))
-						{
-							AddModuleWriter(N, Ref);
-							const TCHAR* Ctx = bSystemStage ? TEXT("System") : (bEmitterStage ? TEXT("Emitter") : TEXT("Particles"));
-							AddModuleWriter(FString::Printf(TEXT("%s.%s"), Ctx, *N.Mid(13)), Ref);
-						}
-						else
-						{
-							AddModuleWriter(N, Ref);
+							AddModuleWriter(ResolvedName, Ref);
 						}
 					}
 				}
@@ -18121,69 +18345,26 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetDynamicInputInputs(const
 	//   2. the Module.* output pins on the graph's ParameterMap Get nodes, which is where the
 	//      values are physically read.
 	// ParameterMap-typed entries are excluded — the map is plumbing, never an input.
+	//
+	// GAP #83 — that enumeration now lives in CollectModuleScriptInputs and is SHARED with
+	// get_module_script_inputs, which had been left with the original input-node walk. Keeping
+	// one copy is the point: this is the same drift gap #77 caught on the write side.
 	// ------------------------------------------------------------------------
-	const FNiagaraTypeDefinition MapDef = FNiagaraTypeDefinition::GetParameterMapDef();
-
-	struct FDiscoveredInput
-	{
-		FName FullName;
-		FNiagaraTypeDefinition Type;
-		FString Source;
-	};
-	TArray<FDiscoveredInput> Discovered;
-	TSet<FName> SeenNames;
-
-	// Switch selectors are enumerated separately below and must not also show up as
-	// ordinary inputs — they are registered as script variables like everything else.
 	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
 	MonolithNiagaraHelpers::CollectStaticSwitchInputs(Graph, SwitchInputs);
-	TSet<FName> SwitchNames;
-	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
-	{
-		SwitchNames.Add(SwitchInput.Variable.GetName());
-	}
 
-	auto AddInput = [&](const FName& FullName, const FNiagaraTypeDefinition& Type, const TCHAR* Source)
-	{
-		if (FullName.IsNone() || !Type.IsValid()) return;
-		if (Type == MapDef) return;
-		const FString FullNameStr = FullName.ToString();
-		if (!FullNameStr.StartsWith(TEXT("Module."))) return;   // Engine./Particles./System. are reads, not inputs
-		if (SwitchNames.Contains(FullName)) return;
-		if (SeenNames.Contains(FullName)) return;
-		SeenNames.Add(FullName);
-		Discovered.Add({ FullName, Type, FString(Source) });
-	};
+	TArray<FMonolithDiscoveredScriptInput> Discovered;
+	TArray<FString> UnresolvedInputs;
+	CollectModuleScriptInputs(Graph, SwitchInputs, Discovered, UnresolvedInputs);
 
-	for (const TPair<FNiagaraVariable, TObjectPtr<UNiagaraScriptVariable>>& Pair : Graph->GetAllMetaData())
+	TSet<FName> SeenNames;
+	for (const FMonolithDiscoveredScriptInput& In : Discovered)
 	{
-		AddInput(Pair.Key.GetName(), Pair.Key.GetType(), TEXT("script_variable"));
-	}
-
-	for (UEdGraphNode* Node : Graph->Nodes)
-	{
-		UNiagaraNodeParameterMapGet* GetNode = Cast<UNiagaraNodeParameterMapGet>(Node);
-		if (!GetNode) continue;
-		for (UEdGraphPin* Pin : GetNode->Pins)
-		{
-			if (!Pin || Pin->Direction != EGPD_Output) continue;
-			if (Pin->PinName.IsNone() || Pin->PinName == TEXT("Add")) continue;
-			AddInput(Pin->PinName, UEdGraphSchema_Niagara::PinToTypeDefinition(Pin), TEXT("parameter_map_get"));
-		}
-	}
-
-	// Scripts that DO use input nodes (older or hand-built ones) still get read, minus the map.
-	TArray<UNiagaraNodeInput*> InputNodes;
-	Graph->GetNodesOfClass<UNiagaraNodeInput>(InputNodes);
-	for (UNiagaraNodeInput* InputNode : InputNodes)
-	{
-		if (!InputNode) continue;
-		if (InputNode->Usage != ENiagaraInputNodeUsage::Parameter) continue;
-		AddInput(InputNode->Input.GetName(), InputNode->Input.GetType(), TEXT("input_node"));
+		SeenNames.Add(In.FullName);
 	}
 
 	TArray<TSharedPtr<FJsonValue>> InputsArr;
-	for (const FDiscoveredInput& In : Discovered)
+	for (const FMonolithDiscoveredScriptInput& In : Discovered)
 	{
 		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
 		IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(In.FullName).ToString());
@@ -18238,6 +18419,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetDynamicInputInputs(const
 	{
 		R->SetStringField(TEXT("warning"),
 			TEXT("This script's usage is not DynamicInput — add_dynamic_input will refuse it. Use get_module_script_inputs for module scripts."));
+	}
+	// Same contract as get_module_script_inputs: an input we found but could not type is
+	// reported, never silently dropped (gap #83).
+	if (UnresolvedInputs.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		WarnArr.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT(
+			"INCOMPLETE: %d Module.* parameter(s) could not have their type resolved and are NOT in "
+			"'inputs': %s. Cross-check with get_script_parameters before concluding they do not exist."),
+			UnresolvedInputs.Num(), *FString::Join(UnresolvedInputs, TEXT(", ")))));
+		R->SetArrayField(TEXT("warnings"), WarnArr);
 	}
 	return NA_SuccessObj(R);
 }
@@ -20433,49 +20625,89 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleOutputParameters(c
 	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage);
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
 
-	// GetStackFunctionOutputVariables is NOT exported (no NIAGARAEDITOR_API).
-	// Alternative: inspect the module's script graph for output variables via the output node,
-	// and also check which Particles.* attributes appear in the module's ParameterMap output pins.
-	TArray<TSharedPtr<FJsonValue>> OutputsArr;
+	// GAP #99 — this action used to enumerate the module script's OUTPUT NODE pins. On a module
+	// script the Output node carries exactly one pin, the parameter map itself, so the answer was
+	// always output_count 1 / OutputMap — for our own modules and for Epic's Collision alike —
+	// with no error and no warning to say the list was meaningless. The branch that was meant to
+	// read the real writes existed only as three comment lines ending "But the formal output node
+	// approach above covers the standard case."
+	//
+	// A module's outputs are the WRITE pins on the ParameterMapSet nodes inside its own graph.
+	// That is what the enumeration below reads, using the same shared name rules as
+	// BuildStackWriterIndex (get_available_parameters / list_stack_writers / trace_parameter_binding).
+	const FString CallName = MN->GetFunctionName();
 
-	// Approach: load the module's script and inspect its output node
-	if (UNiagaraScript* FuncScript = MN->FunctionScript.Get())
+	// StackContext.* resolves against the stage the module is PLACED in, which FindModuleNode
+	// already told us.
+	const bool bSystemStage  = FoundUsage == ENiagaraScriptUsage::SystemSpawnScript  || FoundUsage == ENiagaraScriptUsage::SystemUpdateScript;
+	const bool bEmitterStage = FoundUsage == ENiagaraScriptUsage::EmitterSpawnScript || FoundUsage == ENiagaraScriptUsage::EmitterUpdateScript;
+	const MonolithNiagaraParameterNames::EStackContextKind Context =
+		bSystemStage  ? MonolithNiagaraParameterNames::EStackContextKind::System :
+		bEmitterStage ? MonolithNiagaraParameterNames::EStackContextKind::Emitter
+		              : MonolithNiagaraParameterNames::EStackContextKind::Particles;
+
+	UNiagaraScript* FuncScript = MN->FunctionScript.Get();
+	UNiagaraScriptSource* ScriptSrc = FuncScript ? Cast<UNiagaraScriptSource>(FuncScript->GetLatestSource()) : nullptr;
+	UNiagaraGraph* FuncGraph = ScriptSrc ? ScriptSrc->NodeGraph : nullptr;
+
+	TArray<FString> Warnings;
+
+	// A placed node whose script/graph cannot be reached can report NOTHING about outputs. Saying
+	// "output_count 0" for that case would repeat the original defect in a new costume.
+	if (!FuncGraph)
 	{
-		if (UNiagaraScriptSource* ScriptSrc = Cast<UNiagaraScriptSource>(FuncScript->GetLatestSource()))
-		{
-			if (UNiagaraGraph* FuncGraph = ScriptSrc->NodeGraph)
-			{
-				TArray<UNiagaraNodeOutput*> OutputNodes;
-				FuncGraph->GetNodesOfClass<UNiagaraNodeOutput>(OutputNodes);
-				for (UNiagaraNodeOutput* OutNode : OutputNodes)
-				{
-					for (const FNiagaraVariable& OutVar : OutNode->GetOutputs())
-					{
-						TSharedRef<FJsonObject> VO = MakeShared<FJsonObject>();
-						VO->SetStringField(TEXT("name"), OutVar.GetName().ToString());
-						VO->SetStringField(TEXT("type"), OutVar.GetType().GetName());
-						OutputsArr.Add(MakeShared<FJsonValueObject>(VO));
-					}
-				}
-			}
-		}
+		Warnings.Add(TEXT(
+			"CANNOT REPORT: this placed module's function script or its graph could not be loaded, so its "
+			"outputs are UNKNOWN — 'outputs' being empty does NOT mean the module writes nothing."));
 	}
 
-	// Also check the module's ParameterMap output for written attributes
-	// (attributes written via ParameterMapSet that aren't in the formal output list)
-	UEdGraphPin* MapOut = MonolithNiagaraHelpers::GetParameterMapPin(*MN, EGPD_Output);
-	if (MapOut)
+	TArray<FMonolithDiscoveredScriptWrite> Writes;
+	TArray<FString> UnresolvedWrites;
+	CollectModuleScriptWrites(FuncGraph, CallName, Context, Writes, UnresolvedWrites);
+
+	int32 AddressableCount = 0;
+	TArray<TSharedPtr<FJsonValue>> OutputsArr;
+	for (const FMonolithDiscoveredScriptWrite& W : Writes)
 	{
-		// The module's output ParameterMap contains all attributes it writes.
-		// We can inspect the pins on the override node downstream to see what was written.
-		// But the formal output node approach above covers the standard case.
+		TSharedRef<FJsonObject> VO = MakeShared<FJsonObject>();
+		// "name" is the caller-addressable name where one exists, so a reader can feed it straight
+		// back into a binding; the raw MapSet pin is always reported alongside it.
+		VO->SetStringField(TEXT("name"), W.ResolvedNames.Num() > 0 ? W.ResolvedNames[0] : W.PinName);
+		VO->SetStringField(TEXT("pin_name"), W.PinName);
+		VO->SetStringField(TEXT("type"), W.Type.GetName());
+		VO->SetStringField(TEXT("kind"), MonolithNiagaraParameterNames::LexToStringWriteKind(W.Kind));
+		VO->SetBoolField(TEXT("is_data_interface"), W.Type.IsDataInterface());
+
+		// A StackContext.* write is addressable under BOTH names; a module-local write under none.
+		TArray<TSharedPtr<FJsonValue>> Resolved;
+		for (const FString& N : W.ResolvedNames) Resolved.Add(MakeShared<FJsonValueString>(N));
+		VO->SetArrayField(TEXT("resolved_names"), Resolved);
+		VO->SetBoolField(TEXT("addressable_by_callers"), W.ResolvedNames.Num() > 0);
+
+		if (W.ResolvedNames.Num() > 0) ++AddressableCount;
+		OutputsArr.Add(MakeShared<FJsonValueObject>(VO));
+	}
+
+	if (UnresolvedWrites.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"INCOMPLETE: %d ParameterMapSet write pin(s) could not have their type resolved and are NOT in "
+			"'outputs': %s."),
+			UnresolvedWrites.Num(), *FString::Join(UnresolvedWrites, TEXT(", "))));
 	}
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
-	R->SetStringField(TEXT("module"), MN->GetFunctionName());
+	R->SetStringField(TEXT("module"), CallName);
 	R->SetStringField(TEXT("module_node"), MN->NodeGuid.ToString());
 	R->SetNumberField(TEXT("output_count"), OutputsArr.Num());
+	R->SetNumberField(TEXT("addressable_output_count"), AddressableCount);
 	R->SetArrayField(TEXT("outputs"), OutputsArr);
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		for (const FString& W : Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
+		R->SetArrayField(TEXT("warnings"), WarnArr);
+	}
 	return NA_SuccessObj(R);
 }
 
@@ -22033,50 +22265,41 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleScriptInputs(const
 
 	UNiagaraGraph* Graph = Source->NodeGraph;
 
-	// Manually iterate graph nodes to find input nodes — UNiagaraGraph::FindInputNodes
-	// is NOT exported (no NIAGARAEDITOR_API), so we replicate its logic inline.
-	// Only collect Parameter-usage input nodes, filtering duplicates by name.
-	TSet<FName> SeenNames;
-	TArray<TSharedPtr<FJsonValue>> InputArr;
-
-	for (UEdGraphNode* Node : Graph->Nodes)
-	{
-		UNiagaraNodeInput* InputNode = Cast<UNiagaraNodeInput>(Node);
-		if (!InputNode) continue;
-
-		// Only include parameters (not attributes, system constants, or translator constants)
-		if (InputNode->Usage != ENiagaraInputNodeUsage::Parameter) continue;
-
-		const FNiagaraVariable& InputVar = InputNode->Input;
-		FName FullName = InputVar.GetName();
-
-		// Filter duplicates
-		if (SeenNames.Contains(FullName)) continue;
-		SeenNames.Add(FullName);
-
-		FString InputName = FullName.ToString();
-
-		// Strip "Module." prefix for consistency with our other APIs
-		if (InputName.StartsWith(TEXT("Module.")))
-		{
-			InputName = InputName.Mid(7);
-		}
-
-		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
-		IO->SetStringField(TEXT("name"), InputName);
-		IO->SetStringField(TEXT("type"), InputVar.GetType().GetName());
-		IO->SetStringField(TEXT("usage"), TEXT("parameter"));
-		IO->SetBoolField(TEXT("is_parameter"), true);
-		IO->SetBoolField(TEXT("is_static_switch"), false);
-
-		InputArr.Add(MakeShared<FJsonValueObject>(IO));
-	}
-
 	// Gap #18: UNiagaraNodeInput enumeration alone never sees static switches, so a module's
 	// switches were invisible here while get_module_inputs (placed-node path) reported them.
 	// Same shared enumeration as set_static_switch_value, so the read and the write agree.
 	TArray<MonolithNiagaraHelpers::FStaticSwitchInput> SwitchInputs;
 	MonolithNiagaraHelpers::CollectStaticSwitchInputs(Graph, SwitchInputs);
+
+	// GAP #83. This used to walk UNiagaraNodeInput nodes only, which for a stock Epic module
+	// matches nothing but the graph's ParameterMap plumbing pin: GravityForce answered
+	// input_count 2 (InputMap + the Coordinate Space switch) and silently omitted Module.Gravity.
+	// A module input is a Module.* parameter read out of the parameter map, so the enumeration is
+	// now the SHARED one get_dynamic_input_inputs already used after gap #31-F.
+	TArray<FMonolithDiscoveredScriptInput> Discovered;
+	TArray<FString> UnresolvedInputs;
+	CollectModuleScriptInputs(Graph, SwitchInputs, Discovered, UnresolvedInputs);
+
+	TSet<FName> SeenNames;
+	TArray<TSharedPtr<FJsonValue>> InputArr;
+	for (const FMonolithDiscoveredScriptInput& In : Discovered)
+	{
+		SeenNames.Add(In.FullName);
+
+		TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+		// "name" stays the Module.-stripped short form every other action here uses.
+		IO->SetStringField(TEXT("name"), MonolithNiagaraHelpers::StripModulePrefix(In.FullName).ToString());
+		IO->SetStringField(TEXT("full_name"), In.FullName.ToString());
+		IO->SetStringField(TEXT("type"), In.Type.GetName());
+		IO->SetStringField(TEXT("usage"), TEXT("parameter"));
+		IO->SetBoolField(TEXT("is_parameter"), true);
+		IO->SetBoolField(TEXT("is_static_switch"), false);
+		IO->SetBoolField(TEXT("is_data_interface"), In.Type.IsDataInterface());
+		IO->SetStringField(TEXT("discovered_from"), In.Source);
+
+		InputArr.Add(MakeShared<FJsonValueObject>(IO));
+	}
+
 	int32 StaticSwitchCount = 0;
 	for (const MonolithNiagaraHelpers::FStaticSwitchInput& SwitchInput : SwitchInputs)
 	{
@@ -22113,6 +22336,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleScriptInputs(const
 	R->SetNumberField(TEXT("input_count"), InputArr.Num());
 	R->SetNumberField(TEXT("static_switch_count"), StaticSwitchCount);
 	R->SetArrayField(TEXT("inputs"), InputArr);
+
+	// A Module.* parameter we found but could not type is a real input this action cannot
+	// describe. Reporting a shorter list without saying so is the exact defect gap #83 was —
+	// so it is a warning, never a silent omission.
+	if (UnresolvedInputs.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		WarnArr.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT(
+			"INCOMPLETE: %d Module.* parameter(s) could not have their type resolved and are NOT in "
+			"'inputs': %s. Cross-check with get_script_parameters before concluding they do not exist."),
+			UnresolvedInputs.Num(), *FString::Join(UnresolvedInputs, TEXT(", ")))));
+		R->SetArrayField(TEXT("warnings"), WarnArr);
+	}
 
 	// Module usage bitmask and metadata from versioned data
 	const FVersionedNiagaraScriptData* ScriptData = Script->GetScriptData(Script->GetExposedVersion().VersionGuid);
@@ -28454,9 +28690,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 				"'<module>.%s' in place, which is what the engine's own repair does "
 				"(NiagaraStackGraphUtilities.cpp:4236) — links, default values, dynamic-input chains and data interfaces "
 				"are preserved because only the pin NAME changed. %d placed module(s) had never overridden this input and "
-				"needed nothing. THIS ACTION CANNOT VERIFY ITS OWN WORK: per I-37 an in-session compile does not "
-				"re-translate a dependent system, so a clean compile right now proves nothing either way. RELOAD each "
-				"listed asset and check its compile status before trusting this."),
+				"needed nothing. A COMPILE ALONE CANNOT CONFIRM THIS: an in-session request_compile DOES re-translate "
+				"dependent systems, but this repair preserves semantics by design, so a clean compile is expected "
+				"whether or not every caller was reached — and the traversal can only see what the asset registry "
+				"lists, so an unsaved system open in the editor would be missed. Read the overrides back on each "
+				"listed asset to confirm."),
 				CallersRepaired, CallersRepaired, *ParamName, *NewName, CallersWithNoOverride));
 		}
 		else if (PlacedCallers.Num() == 0)
