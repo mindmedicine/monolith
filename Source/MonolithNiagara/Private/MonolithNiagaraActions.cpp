@@ -97,6 +97,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 // and dependency-free so the same rules are unit-testable without an editor or a graph.
 #include "MonolithNiagaraParameterNames.h"
 #include "MonolithNiagaraEnumValue.h"
+#include "MonolithNiagaraDefaultLiteral.h"
 #include "NiagaraEmitterBase.h"
 
 #if WITH_NIAGARA_WIZARD_PRIVATE
@@ -2954,6 +2955,47 @@ namespace MonolithNiagaraHelpers
 		}
 	}
 
+	/**
+	 * Write an ALREADY-VALIDATED pin-default literal into Variable's bytes, through the type's
+	 * own registered editor utilities — the same parser the compiler resolves through.
+	 *
+	 * Gap #106. Pairing this with ValidateStackInputLiteral is what lets a value-writing action
+	 * cover every composite type without a per-type chain. The per-type chain is what drifted:
+	 * add_user_parameter grew its own JSON decoder, that decoder silently zeroed every vector
+	 * spelling, and the action reported "with default" anyway.
+	 *
+	 * Variable is ALLOCATED first, for the reason set out at length in the #32 block comment —
+	 * unallocated, SetValueFromPinDefaultString CANNOT fail, because every composite
+	 * implementation has the shape `if (Parse(..) || !Variable.IsDataAllocated())`.
+	 *
+	 * Returns false for a type with no registered pin-default handling (NiagaraMatrix4, data
+	 * interfaces, user structs). ValidateStackInputLiteral already refuses those up front
+	 * (gap #41), so a false here means the two have disagreed — the caller must SAY SO rather
+	 * than treat the value as written.
+	 */
+	bool ApplyPinDefaultLiteral(const FNiagaraTypeDefinition& TypeDef, const FString& Literal,
+		FNiagaraVariable& Variable)
+	{
+		if (!TypeDef.IsValid() || TypeDef.GetSize() <= 0 || TypeDef.GetClass() != nullptr)
+		{
+			return false;
+		}
+
+		FNiagaraEditorModule& NiagaraEditorModule = FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
+		TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(TypeDef);
+		if (!TypeUtilities.IsValid() || !TypeUtilities->CanHandlePinDefaults())
+		{
+			return false;
+		}
+
+		Variable.AllocateData();
+		if (!Variable.IsDataAllocated())
+		{
+			return false;
+		}
+		return TypeUtilities->SetValueFromPinDefaultString(Literal, Variable);
+	}
+
 	// ========================================================================
 	// Gap #31-C / #31-G — pre-flight checks for a script about to be attached as a
 	// dynamic input. Both refuse BEFORE any mutation (the #26b abort-before-transaction
@@ -5125,7 +5167,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter name (to include particle/emitter-scoped attributes, and to restrict writer scanning to that emitter plus the system graph)"))
-			.Optional(TEXT("usage"), TEXT("string"), TEXT("Filter by context: user, engine, particle, emitter, system, or all (default: all). Writer-derived names outside those namespaces (Output.*, StackContext.*, Transient.*, Local.*) have scope 'other' and appear only under 'all'."))
+			.Optional(TEXT("usage"), TEXT("string"), TEXT("Filter by parameter NAMESPACE: user, engine, particle, emitter, system, other, or all (default: all). An unrecognised value is REFUSED with the valid set, not answered with count 0 (gap #109). These are namespaces, NOT stack stages — 'particle_update' is not a value here. Writer-derived names outside the engine namespaces (Output.*, StackContext.*, Transient.*, Local.*) have scope 'other'; they appear under 'all' and under 'other'. The applied filter is echoed back as 'usage'."))
 			.Build());
 
 	// --- Phase 6B: Preview (1 new, QoL params added Phase 9) ---
@@ -10153,76 +10195,61 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	// Setting after AddParameter fails because FNiagaraUserRedirectionParameterStore
 	// has a redirection layer — the name lookup in SetParameterValue may not match.
 	// By setting data on the variable first, AddParameter copies it into the store directly.
+	// ------------------------------------------------------------------------
+	// GAP #106 — a `default` that cannot be applied is REFUSED, not written as zero.
+	//
+	// This block used to be a per-type chain of AsObjectOrParseString + GetNumberField("x").
+	// For a STRING default that helper returns a valid-but-EMPTY object (AsObject() on an
+	// FJsonValueString does that, and its own Deserialize fallback ignores its return value),
+	// so `if (O.IsValid())` passed, every GetNumberField missed and answered 0, and
+	// bDefaultSet was set TRUE. Measured 2026-08-17: type "vector" with default "1,2,3" AND
+	// with "(X=1.0,Y=2.0,Z=3.0)" both stored (0,0,0) under the message "…with default", no
+	// warning. The "failed to set default value" branch further down existed the whole time
+	// and could never fire. Full mechanism: MonolithNiagaraDefaultLiteral.h.
+	//
+	// It is now the same two-step every other value-writing path uses:
+	//   1. MonolithNiagaraDefaultLiteral::JsonValueToPinDefaultLiteral — what string did the
+	//      caller mean (number, bool, literal, {x,y,z} object, [1,2,3] array)?
+	//   2. ValidateStackInputLiteral (gap #32) — does the TYPE'S OWN registered parser accept
+	//      it, probed on an allocated variable so it is able to say no?
+	// then ApplyPinDefaultLiteral writes the bytes with that same parser. No type is named
+	// here, so vec2/vec3/vec4/quat/color/position are covered by construction rather than by
+	// six branches that can drift apart again.
+	//
+	// A refusal happens BEFORE the transaction below, so nothing is created — reported as
+	// such, because "the parameter exists but its value is not what you asked for" is the
+	// state this whole class of bug leaves behind.
+	// ------------------------------------------------------------------------
 	bool bDefaultSet = false;
 	if (DefaultJV.IsValid())
 	{
-		NV.AllocateData();
-		if (TD == FNiagaraTypeDefinition::GetColorDef())
+		FString DefaultLiteral;
+		FString LiteralError;
+		if (!MonolithNiagaraDefaultLiteral::JsonValueToPinDefaultLiteral(DefaultJV, TD, DefaultLiteral, LiteralError))
 		{
-			TSharedPtr<FJsonObject> O = AsObjectOrParseString(DefaultJV);
-			if (O.IsValid())
-			{
-				FLinearColor V(
-					static_cast<float>(O->GetNumberField(TEXT("r"))),
-					static_cast<float>(O->GetNumberField(TEXT("g"))),
-					static_cast<float>(O->GetNumberField(TEXT("b"))),
-					O->HasField(TEXT("a")) ? static_cast<float>(O->GetNumberField(TEXT("a"))) : 1.0f);
-				NV.SetValue<FLinearColor>(V);
-				bDefaultSet = true;
-			}
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("add_user_parameter: 'default' for '%s' %s NOTHING WAS CREATED."),
+				*ParamName, *LiteralError));
 		}
-		else if (TD == FNiagaraTypeDefinition::GetFloatDef())
+
+		FString NormalizedLiteral;
+		FString ValueError;
+		if (!MonolithNiagaraHelpers::ValidateStackInputLiteral(TD, DefaultLiteral, NormalizedLiteral, ValueError))
 		{
-			NV.SetValue<float>(static_cast<float>(DefaultJV->AsNumber()));
-			bDefaultSet = true;
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("add_user_parameter: 'default' for parameter '%s' %s NOTHING WAS CREATED."),
+				*ParamName, *ValueError));
 		}
-		else if (TD == FNiagaraTypeDefinition::GetIntDef())
+
+		if (!MonolithNiagaraHelpers::ApplyPinDefaultLiteral(TD, NormalizedLiteral, NV))
 		{
-			NV.SetValue<int32>(static_cast<int32>(DefaultJV->AsNumber()));
-			bDefaultSet = true;
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("add_user_parameter: parameter '%s' is %s, whose default value cannot be written — the "
+					 "type has no registered pin-default handling, so there is no parser to encode '%s' with. "
+					 "Create the parameter without a 'default'. NOTHING WAS CREATED."),
+				*ParamName, *TD.GetName(), *NormalizedLiteral));
 		}
-		else if (TD == FNiagaraTypeDefinition::GetBoolDef())
-		{
-			FNiagaraBool BV; BV.SetValue(DefaultJV->AsBool());
-			NV.SetValue<FNiagaraBool>(BV);
-			bDefaultSet = true;
-		}
-		else if (TD == FNiagaraTypeDefinition::GetVec3Def() || TD == FNiagaraTypeDefinition::GetPositionDef())
-		{
-			TSharedPtr<FJsonObject> O = AsObjectOrParseString(DefaultJV);
-			if (O.IsValid())
-			{
-				FVector3f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
-					static_cast<float>(O->GetNumberField(TEXT("y"))),
-					static_cast<float>(O->GetNumberField(TEXT("z"))));
-				NV.SetValue<FVector3f>(V);
-				bDefaultSet = true;
-			}
-		}
-		else if (TD == FNiagaraTypeDefinition::GetVec2Def())
-		{
-			TSharedPtr<FJsonObject> O = AsObjectOrParseString(DefaultJV);
-			if (O.IsValid())
-			{
-				FVector2f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
-					static_cast<float>(O->GetNumberField(TEXT("y"))));
-				NV.SetValue<FVector2f>(V);
-				bDefaultSet = true;
-			}
-		}
-		else if (TD == FNiagaraTypeDefinition::GetVec4Def() || TD == FNiagaraTypeDefinition::GetQuatDef())
-		{
-			TSharedPtr<FJsonObject> O = AsObjectOrParseString(DefaultJV);
-			if (O.IsValid())
-			{
-				FVector4f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
-					static_cast<float>(O->GetNumberField(TEXT("y"))),
-					static_cast<float>(O->GetNumberField(TEXT("z"))),
-					static_cast<float>(O->GetNumberField(TEXT("w"))));
-				NV.SetValue<FVector4f>(V);
-				bDefaultSet = true;
-			}
-		}
+		bDefaultSet = true;
 	}
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddUP", "Add User Parameter"));
@@ -10273,6 +10300,9 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	// Write our actual value to BOTH storage layers:
 	// Layer 1: Runtime store (ExposedParameters) — for immediate use
 	// Layer 2: Editor data (UNiagaraScriptVariable::DefaultValueVariant) — survives recompile/re-sync
+	// Gap #106 — tracks whether the value actually reached the runtime store, so the response
+	// can only claim "with default" for a value that was genuinely written.
+	bool bStoreValueWritten = false;
 	if (bDefaultSet)
 	{
 		// Layer 1: runtime store — use SetParameterValue<T> which handles the User
@@ -10299,6 +10329,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 			}
 			if (bFoundInStore)
 			{
+				bStoreValueWritten = true;
 				if (TD == FNiagaraTypeDefinition::GetColorDef())
 				{
 					US.SetParameterValue<FLinearColor>(NV.GetValue<FLinearColor>(), StoreVar, true);
@@ -10319,13 +10350,50 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 				{
 					US.SetParameterValue<FVector2f>(NV.GetValue<FVector2f>(), StoreVar, true);
 				}
-				else if (TD == FNiagaraTypeDefinition::GetVec3Def() || TD == FNiagaraTypeDefinition::GetPositionDef())
+				else if (TD == FNiagaraTypeDefinition::GetVec3Def())
 				{
 					US.SetParameterValue<FVector3f>(NV.GetValue<FVector3f>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetPositionDef())
+				{
+					// ------------------------------------------------------------------
+					// Position must NOT go through SetParameterValue<FVector3f>, which is what
+					// this branch used to share with Vec3. That template asserts
+					//     check(HasPositionData(Param.GetName()))
+					// for a Position-typed variable under WITH_EDITOR
+					// (NiagaraParameterStore.h:567-570) — an assert, not a failed write.
+					//
+					// It fires here because the two halves disagree about the NAME.
+					// FNiagaraParameterStore::AddParameter registers the position data under
+					// whatever name it was handed (NiagaraParameterStore.cpp:904-908), and
+					// FNiagaraUserRedirectionParameterStore::AddParameter hands it the
+					// REDIRECTED "User.X" form (NiagaraUserRedirectionParameterStore.cpp:88-106).
+					// GetUserParameters, above, hands back the redirect KEYS — the BARE "X"
+					// (NiagaraUserRedirectionParameterStore.h:32). HasPositionData is not
+					// overridden by the redirection store, so it looks up "X", finds nothing,
+					// and the check fails.
+					//
+					// SetPositionParameterValue is the redirection-aware entry point: the
+					// override resolves the bare name through UserParameterRedirects
+					// (NiagaraUserRedirectionParameterStore.cpp:152-157) and the base calls
+					// SetPositionData FIRST, then SetParameterValue, so the assert is satisfied
+					// by construction (NiagaraParameterStore.cpp:1358-1366). It also keeps
+					// OriginalPositionData — the LWC source-of-truth — in step with the bytes,
+					// which the raw memcpy path never did.
+					// ------------------------------------------------------------------
+					const FVector3f PositionValue = NV.GetValue<FVector3f>();
+					US.SetPositionParameterValue(FVector(PositionValue), StoreVar.GetName(), true);
 				}
 				else if (TD == FNiagaraTypeDefinition::GetVec4Def() || TD == FNiagaraTypeDefinition::GetQuatDef())
 				{
 					US.SetParameterValue<FVector4f>(NV.GetValue<FVector4f>(), StoreVar, true);
+				}
+				else
+				{
+					// No branch claimed this type, so nothing reached the runtime store. Say so
+					// rather than let the response's "with default" stand — an unwritten value
+					// reported as written is the entire gap #106 defect class.
+					bStoreValueWritten = false;
 				}
 
 				// Value readback for historically problematic types (Bool, Vec3f)
@@ -10340,7 +10408,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 							ReadBack.GetValue() ? TEXT("true") : TEXT("false"));
 					}
 				}
-				else if (TD == FNiagaraTypeDefinition::GetVec3Def() || TD == FNiagaraTypeDefinition::GetPositionDef())
+				else if (TD == FNiagaraTypeDefinition::GetVec3Def())
 				{
 					FVector3f ReadBack = US.GetParameterValue<FVector3f>(StoreVar);
 					FVector3f Expected = NV.GetValue<FVector3f>();
@@ -10348,6 +10416,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 					{
 						UE_LOG(LogMonolithNiagara, Warning, TEXT("add_user_parameter: Vec3f value readback mismatch for '%s' — wrote (%f,%f,%f), read (%f,%f,%f) (editor cascade may overwrite)"),
 							*ParamName, Expected.X, Expected.Y, Expected.Z, ReadBack.X, ReadBack.Y, ReadBack.Z);
+					}
+				}
+				else if (TD == FNiagaraTypeDefinition::GetPositionDef())
+				{
+					// Read back through the POSITION accessor, matching the write above:
+					// OriginalPositionData is the LWC source of truth for a Position parameter,
+					// so comparing the raw float3 bytes would verify the wrong half.
+					const FVector3f Expected = NV.GetValue<FVector3f>();
+					const FVector* ReadBack = US.GetPositionParameterValue(StoreVar.GetName());
+					if (!ReadBack || !FVector3f(*ReadBack).Equals(Expected, KINDA_SMALL_NUMBER))
+					{
+						UE_LOG(LogMonolithNiagara, Warning, TEXT("add_user_parameter: Position value readback mismatch for '%s' — wrote (%f,%f,%f), read %s (editor cascade may overwrite)"),
+							*ParamName, Expected.X, Expected.Y, Expected.Z,
+							ReadBack ? *ReadBack->ToString() : TEXT("<no position data>"));
 					}
 				}
 			}
@@ -10376,12 +10458,21 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 		ResultObj->SetStringField(TEXT("warning"), FString::Printf(TEXT("Unknown type '%s' — defaulted to float. Valid types: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix"), *TypeName));
 	}
 
-	if (DefaultJV.IsValid() && !bDefaultSet)
+	// Gap #106 — "with default" is claimed ONLY for a value that reached the runtime store.
+	// An unparseable default is already a refusal above, so the one way to land here with
+	// bDefaultSet and no store write is a type the Layer-1 chain does not handle. That used to
+	// read as success; it now reports the exact shortfall, because the value IS in the editor
+	// data and IS NOT in the store, and a caller reading it back will see the difference.
+	if (bDefaultSet && !bStoreValueWritten)
 	{
-		ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Added user parameter '%s' but failed to set default value — check value format matches type '%s'"), *ParamName, *TypeName));
-		return NA_SuccessObj(ResultObj);
+		ResultObj->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("Default for '%s' (%s) parsed and was stored as the editor-data default, but no runtime "
+				 "store write path covers this type — get_parameter_value may report the type default "
+				 "until the system is recompiled. Verify before relying on it."),
+			*ParamName, *ResolvedTypeName));
 	}
-	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Added user parameter '%s'%s"), *ParamName, bDefaultSet ? TEXT(" with default") : TEXT("")));
+	ResultObj->SetStringField(TEXT("message"), FString::Printf(TEXT("Added user parameter '%s'%s"),
+		*ParamName, (bDefaultSet && bStoreValueWritten) ? TEXT(" with default") : TEXT("")));
 	return NA_SuccessObj(ResultObj);
 }
 
@@ -19724,6 +19815,44 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetAvailableParameters(cons
 
 	if (SystemPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required field: asset_path"));
 
+	// ------------------------------------------------------------------------
+	// GAP #109 — refuse an unknown 'usage' instead of answering {"count":0}.
+	//
+	// Every namespace block below is guarded by a literal comparison chain
+	// (`UsageFilter == TEXT("all") || UsageFilter == TEXT("user")`, and so on). An
+	// unrecognised value matched no block, every block was skipped, and an empty array
+	// fell out of the bottom as a success-shaped {"count":0,"parameters":[]}. Measured
+	// 2026-08-17: usage="particle_update" — a STAGE name where a NAMESPACE is wanted —
+	// returned exactly that, with no error, no warning and no echo of the applied filter.
+	//
+	// On a DISCOVERY reader that is a false claim of absence: "no parameters exist here"
+	// and "your filter was nonsense" become the same answer, and the caller then binds to
+	// a name it invented. Same fix, same shape, as list_module_scripts (gap #31), which
+	// refuses its own unknown 'usage' with the valid set and the same stage-vs-usage hint.
+	//
+	// 'other' IS accepted, even though the schema prose used to imply it was not: the
+	// writer-derived merge below compares UsageFilter against a scope that can be "other"
+	// (Output.*, StackContext.*, Transient.*, Local.*), so the filter genuinely works and
+	// refusing it would be a false refusal. The schema now says so too.
+	// ------------------------------------------------------------------------
+	if (UsageFilter != TEXT("all")
+		&& UsageFilter != TEXT("user")
+		&& UsageFilter != TEXT("engine")
+		&& UsageFilter != TEXT("system")
+		&& UsageFilter != TEXT("emitter")
+		&& UsageFilter != TEXT("particle")
+		&& UsageFilter != TEXT("other"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown usage '%s'. Valid: user | engine | system | emitter | particle | other | all "
+				 "(omit for all). These are parameter NAMESPACES, not stack stages — if you meant a stage "
+				 "such as 'particle_update', this action does not filter by stage; every namespace is "
+				 "listed for the whole system, and writer-derived entries carry written_by_stage so you "
+				 "can filter by stage yourself. Refused rather than returning count 0, which would be "
+				 "indistinguishable from a system that genuinely has no parameters."),
+			*Params->GetStringField(TEXT("usage"))));
+	}
+
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
@@ -20017,6 +20146,10 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetAvailableParameters(cons
 	}
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	// Gap #109 — echo the filter that was actually applied. With the refusal above this can no
+	// longer be a surprise, but it makes a zero count self-diagnosing: the caller can see
+	// whether the empty answer came from the filter it thinks it passed.
+	R->SetStringField(TEXT("usage"), UsageFilter);
 	R->SetNumberField(TEXT("count"), All.Num());
 	R->SetNumberField(TEXT("writer_derived_count"), MergedCount);
 	R->SetArrayField(TEXT("parameters"), All);

@@ -1,6 +1,8 @@
 #include "Actions/ProjectExportAssetTextAction.h"
 #include "MonolithAssetUtils.h"
+#include "MonolithGrepWithContext.h"
 #include "MonolithParamSchema.h"
+#include "Dom/JsonValue.h"
 #include "Exporters/Exporter.h"
 #include "UnrealExporter.h"
 #include "Misc/StringOutputDevice.h"
@@ -19,60 +21,8 @@ namespace
 	// hard error -- the action is an inspection escape hatch, not a bulk dumper.
 	constexpr int32 MaxBytesCeiling = 4 * 1024 * 1024;
 
-	// Lines of context emitted on each side of a grep match.
-	constexpr int32 GrepContextLines = 3;
-
-	/**
-	 * Filter T3D text to only the lines matching Pattern (case-insensitive
-	 * substring), each surrounded by GrepContextLines of context. Disjoint
-	 * windows are separated by a "..." marker line. Returns the number of
-	 * matching lines via OutMatchCount.
-	 */
-	FString GrepWithContext(const FString& Text, const FString& Pattern, int32& OutMatchCount)
-	{
-		TArray<FString> Lines;
-		Text.ParseIntoArrayLines(Lines, /*InCullEmpty=*/false);
-
-		const FString PatternLower = Pattern.ToLower();
-		TArray<bool> Keep;
-		Keep.Init(false, Lines.Num());
-		OutMatchCount = 0;
-
-		for (int32 i = 0; i < Lines.Num(); ++i)
-		{
-			if (Lines[i].ToLower().Contains(PatternLower))
-			{
-				++OutMatchCount;
-				const int32 Start = FMath::Max(0, i - GrepContextLines);
-				const int32 End = FMath::Min(Lines.Num() - 1, i + GrepContextLines);
-				for (int32 k = Start; k <= End; ++k)
-				{
-					Keep[k] = true;
-				}
-			}
-		}
-
-		FString Out;
-		bool bPrevKept = false;
-		for (int32 i = 0; i < Lines.Num(); ++i)
-		{
-			if (Keep[i])
-			{
-				if (!bPrevKept && !Out.IsEmpty())
-				{
-					Out += TEXT("...\n");
-				}
-				Out += Lines[i];
-				Out += TEXT("\n");
-				bPrevKept = true;
-			}
-			else
-			{
-				bPrevKept = false;
-			}
-		}
-		return Out;
-	}
+	// The grep itself now lives in MonolithGrepWithContext.h so it can be unit-tested without
+	// an asset or an exporter — see that header for what gap #101 was and was not.
 
 	/** Locate a sub-object of Asset whose object name OR class name contains Filter (case-insensitive). */
 	UObject* FindSubObjectByFilter(UObject* Asset, const FString& Filter, TArray<FString>& OutCandidates)
@@ -180,11 +130,12 @@ FMonolithActionResult FProjectExportAssetTextAction::Execute(const TSharedPtr<FJ
 	// Optional grep narrowing.
 	const FString GrepPattern = Params->GetStringField(TEXT("grep_pattern"));
 	FString PayloadText = FullText;
-	int32 MatchCount = 0;
+	MonolithGrepWithContext::FGrepResult Grep;
 	const bool bGrepped = !GrepPattern.IsEmpty();
 	if (bGrepped)
 	{
-		PayloadText = GrepWithContext(FullText, GrepPattern, MatchCount);
+		Grep = MonolithGrepWithContext::GrepWithContext(FullText, GrepPattern);
+		PayloadText = Grep.Text;
 	}
 
 	const int32 PayloadBytes = PayloadText.Len();
@@ -218,7 +169,39 @@ FMonolithActionResult FProjectExportAssetTextAction::Execute(const TSharedPtr<FJ
 	if (bGrepped)
 	{
 		Result->SetStringField(TEXT("grep_pattern"), GrepPattern);
-		Result->SetNumberField(TEXT("match_count"), MatchCount);
+		// `match_count` is LINES, and keeps that meaning on purpose (gap #101) — numbers
+		// already quoted in the evidence notes were counted this way. `occurrence_count` is
+		// the total the name `match_count` sounds like it means.
+		Result->SetNumberField(TEXT("match_count"), Grep.MatchingLines);
+		Result->SetNumberField(TEXT("matching_lines"), Grep.MatchingLines);
+		Result->SetNumberField(TEXT("occurrence_count"), Grep.Occurrences);
+
+		// ------------------------------------------------------------------
+		// GAP #101 — a zero match must SAY SO.
+		//
+		// It used to return success with an empty `text` and nothing else, so "the pattern is
+		// absent from the dump" and "the thing is absent from the asset" were the same answer.
+		// On this action that is expensive: it is the only instrument that can see a Niagara
+		// ExposureOptions flag, and it is where I-38's cause was found. A caller that treats a
+		// silent zero as proof of absence draws exactly the wrong conclusion.
+		//
+		// The advice is the procedure the validator actually used to trust its own zero match:
+		// re-dump without a pattern and read the property ORDERING, because an absent property
+		// is one that equals the CDO and is simply not written.
+		// ------------------------------------------------------------------
+		if (Grep.MatchingLines == 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> Warnings;
+			Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(
+				TEXT("grep_pattern '%s' matched NO line of the %d-byte dump, so this response proves nothing "
+					 "about the asset. The pattern is a plain case-insensitive LITERAL substring — not a regex, "
+					 "and nothing is escaped or stripped — so check spelling, spacing and the exact punctuation "
+					 "the T3D uses. DO NOT read this as 'the property is absent': re-run without grep_pattern "
+					 "(add object_filter to keep it small) and read the property ORDERING instead, since a "
+					 "property equal to the class default is never written at all."),
+				*GrepPattern, FullBytes)));
+			Result->SetArrayField(TEXT("warnings"), Warnings);
+		}
 	}
 	Result->SetStringField(TEXT("text"), PayloadText);
 	return FMonolithActionResult::Success(Result);
@@ -231,7 +214,7 @@ TSharedPtr<FJsonObject> FProjectExportAssetTextAction::GetSchema()
 		.Optional(TEXT("object_filter"), TEXT("string"),
 			TEXT("Optional name/class substring (case-insensitive) scoping the export to a single matching sub-object instead of the whole asset"))
 		.Optional(TEXT("grep_pattern"), TEXT("string"),
-			TEXT("Optional case-insensitive substring; returns only matching lines plus a few lines of surrounding context"))
+			TEXT("Optional case-insensitive LITERAL substring -- not a regex, nothing is escaped or stripped, so '(' and '\"' match themselves. Returns only matching lines plus 3 lines of context each side. 'match_count' counts matching LINES (so does 'matching_lines'); 'occurrence_count' counts total hits. A zero match returns a warnings[] entry: it is NOT evidence the property is absent -- re-dump without a pattern and read the property ordering instead."))
 		.Optional(TEXT("max_bytes"), TEXT("number"),
 			TEXT("Optional byte budget for the returned text (default 262144). Hard error if the payload exceeds it -- narrow with grep_pattern/object_filter rather than expecting silent truncation"))
 		.Build();
