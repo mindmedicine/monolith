@@ -96,6 +96,8 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 // Pure name-classification rules shared by the parameter readers (gaps #83, #99). Header-only
 // and dependency-free so the same rules are unit-testable without an editor or a graph.
 #include "MonolithNiagaraParameterNames.h"
+#include "MonolithNiagaraEnumValue.h"
+#include "NiagaraEmitterBase.h"
 
 #if WITH_NIAGARA_WIZARD_PRIVATE
 // Engine-PRIVATE NiagaraEditor node headers — resolvable only when WITH_NIAGARA_WIZARD_PRIVATE=1
@@ -10810,6 +10812,64 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererMaterial(const T
 	return bOk ? NA_SuccessStr(bClear ? TEXT("Material cleared") : TEXT("Material set")) : FMonolithActionResult::Error(TEXT("Unsupported renderer type"));
 }
 
+// ----------------------------------------------------------------------------
+// Gap #47 — is a RendererVisibility value going to do anything?
+//
+// RendererVisibility is compared against whatever the renderer's
+// RendererVisibilityTagBinding resolves to (Particles.VisibilityTag by default). If no module
+// on the emitter WRITES that attribute, the comparison never has data and every particle draws.
+// Nothing in the engine complains: measured 2026-08-17, RendererVisibility=7 on an emitter with
+// no VisibilityTag writer gave error_count 0, warning_count 0 and unchanged rendered pixels.
+//
+// The existence question is asked of the engine, not reimplemented: UNiagaraEmitterBase's
+// CanObtain*Attribute pair is exactly what FNiagaraVariableAttributeBinding::CacheValues uses to
+// compute bBindingExistsOnSource (NiagaraCommon.cpp, CacheValues, ~:901-908). The particle vs
+// emitter branch is chosen with the binding's own IsParticleBinding(), mirroring that code.
+//
+// Returns an empty string when the attribute IS present (nothing to say). Deliberately advisory:
+// a false positive costs a warning, never a refusal, because the writer may be added afterwards.
+// ----------------------------------------------------------------------------
+static FString NA_DescribeInertRendererVisibility(UNiagaraRendererProperties* Rend)
+{
+	if (!Rend) return FString();
+
+	FStructProperty* TagProp = CastField<FStructProperty>(
+		Rend->GetClass()->FindPropertyByName(TEXT("RendererVisibilityTagBinding")));
+	if (!TagProp || TagProp->Struct != FNiagaraVariableAttributeBinding::StaticStruct())
+	{
+		return FString::Printf(
+			TEXT("RendererVisibility was stored, but %s has no RendererVisibilityTagBinding, ")
+			TEXT("so nothing reads it and the value has no effect."),
+			*Rend->GetClass()->GetName());
+	}
+
+	const FNiagaraVariableAttributeBinding* Tag =
+		TagProp->ContainerPtrToValuePtr<FNiagaraVariableAttributeBinding>(Rend);
+
+	const FVersionedNiagaraEmitterBase VersionedEmitter = Rend->GetOuterEmitterBase();
+	if (!VersionedEmitter.Emitter)
+	{
+		return TEXT("RendererVisibility was stored, but the renderer's owning emitter could not be "
+		            "resolved, so whether the VisibilityTag attribute exists was NOT checked.");
+	}
+
+	const FString AttributeName = Tag->GetParamMapBindableVariable().GetName().ToString();
+	FNiagaraTypeDefinition BoundType = Tag->GetType();
+
+	const bool bExists = Tag->IsParticleBinding()
+		? VersionedEmitter.Emitter->CanObtainParticleAttribute(Tag->GetDataSetBindableVariable(), VersionedEmitter.Version, BoundType)
+		: VersionedEmitter.Emitter->CanObtainEmitterAttribute(Tag->GetParamMapBindableVariable(), BoundType);
+
+	if (bExists) return FString();
+
+	return FString::Printf(
+		TEXT("RendererVisibility was stored but has NO EFFECT: no module on this emitter writes '%s', ")
+		TEXT("which RendererVisibilityTagBinding reads, so every particle still renders. ")
+		TEXT("Add a module that writes that attribute, or point RendererVisibilityTagBinding at one that exists ")
+		TEXT("(set_renderer_binding binding_name=RendererVisibilityTagBinding)."),
+		*AttributeName);
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererProperty(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SystemPath = NA_GetAssetPath(Params);
@@ -10830,6 +10890,37 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererProperty(const T
 	FProperty* Prop = Rend->GetClass()->FindPropertyByName(FName(*PropertyName));
 	if (!Prop) return FMonolithActionResult::Error(FString::Printf(TEXT("Property '%s' not found"), *PropertyName));
 
+	// Gap #46 — resolve enum VALUES before anything is touched, and REFUSE an unrecognised one.
+	//
+	// The old code fell back to `JV->AsNumber()`, which answers 0 for any non-numeric string, so a
+	// typo was stored as enum entry 0 and still reported "Property set". Entry 0 is usually the CDO
+	// default, so the write also stopped being delta-serialised: measured 2026-08-17, a garbage
+	// `shape` one call after `preset=tube` left Shape back at Plane while TubeSubdivisions=8
+	// survived. Half-applied presets are not recoverable by re-applying the preset.
+	//
+	// This runs BEFORE BeginTransaction on purpose: a refusal must leave the renderer byte-identical,
+	// not open and roll back a transaction. The property NAME was already validated two lines up —
+	// this is the same rule applied to the value.
+	int64 ResolvedEnumValue = 0;
+	{
+		const UEnum* ValueEnum = nullptr;
+		if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))      ValueEnum = EnumProp->GetEnum();
+		else if (const FByteProperty* ByteProp = CastField<FByteProperty>(Prop)) ValueEnum = ByteProp->Enum;
+
+		if (ValueEnum)
+		{
+			FString EnumError;
+			const bool bResolved = (JV->Type == EJson::Number)
+				? MonolithNiagaraEnumValue::ResolveEnumValueStrictNumeric(ValueEnum, JV->AsNumber(), ResolvedEnumValue, EnumError)
+				: MonolithNiagaraEnumValue::ResolveEnumValueStrict(ValueEnum, JV->AsString(), ResolvedEnumValue, EnumError);
+			if (!bResolved)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Cannot set '%s': %s"), *PropertyName, *EnumError));
+			}
+		}
+	}
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetRendProp", "Set Renderer Property"));
 	System->Modify();
 	Rend->Modify();
@@ -10844,23 +10935,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererProperty(const T
 	else if (FStrProperty* SP = CastField<FStrProperty>(Prop)) { SP->SetPropertyValue(Addr, JV->AsString()); bOk = true; }
 	else if (FEnumProperty* EP = CastField<FEnumProperty>(Prop))
 	{
-		UEnum* E = EP->GetEnum();
-		if (E)
-		{
-			int64 EV = E->GetValueByNameString(JV->AsString());
-			if (EV == INDEX_NONE) EV = static_cast<int64>(JV->AsNumber());
-			FNumericProperty* UP2 = EP->GetUnderlyingProperty();
-			if (UP2) { UP2->SetIntPropertyValue(Addr, EV); bOk = true; }
-		}
+		// ResolvedEnumValue was validated above; EP->GetEnum() was non-null or we already refused.
+		FNumericProperty* UP2 = EP->GetUnderlyingProperty();
+		if (UP2) { UP2->SetIntPropertyValue(Addr, ResolvedEnumValue); bOk = true; }
 	}
 	else if (FByteProperty* ByP = CastField<FByteProperty>(Prop))
 	{
-		if (ByP->Enum)
-		{
-			int64 EV = ByP->Enum->GetValueByNameString(JV->AsString());
-			if (EV == INDEX_NONE) EV = static_cast<int64>(JV->AsNumber());
-			ByP->SetPropertyValue(Addr, static_cast<uint8>(EV));
-		}
+		if (ByP->Enum) ByP->SetPropertyValue(Addr, static_cast<uint8>(ResolvedEnumValue));
 		else ByP->SetPropertyValue(Addr, static_cast<uint8>(JV->AsNumber()));
 		bOk = true;
 	}
@@ -10875,8 +10956,26 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererProperty(const T
 	}
 
 	GEditor->EndTransaction();
-	if (bOk) System->RequestCompile(false);
-	return bOk ? NA_SuccessStr(TEXT("Property set")) : FMonolithActionResult::Error(TEXT("Failed to set property"));
+	if (!bOk) return FMonolithActionResult::Error(TEXT("Failed to set property"));
+
+	System->RequestCompile(false);
+
+	// Gap #47 — RendererVisibility stores and reads back but does nothing unless the emitter
+	// actually writes the attribute RendererVisibilityTagBinding reads. Measured 2026-08-17:
+	// RendererVisibility=7 with no Particles.VisibilityTag writer culled nothing and produced
+	// error_count 0 / warning_count 0. The write is NOT blocked — the attribute may be added
+	// afterwards — but it no longer passes silently.
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("result"), TEXT("Property set"));
+	if (PropertyName == TEXT("RendererVisibility"))
+	{
+		const FString VisibilityWarning = NA_DescribeInertRendererVisibility(Rend);
+		if (!VisibilityWarning.IsEmpty())
+		{
+			Out->SetStringField(TEXT("warning"), VisibilityWarning);
+		}
+	}
+	return NA_SuccessObj(Out);
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleGetRendererBindings(const TSharedPtr<FJsonObject>& Params)
@@ -10928,29 +11027,92 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetRendererBinding(const TS
 	UNiagaraRendererProperties* Rend = GetRenderer(System, EmitterHandleId, RendererIndex);
 	if (!Rend) return FMonolithActionResult::Error(TEXT("Renderer not found"));
 
-	FStructProperty* BP = nullptr;
+	if (AttributePath.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("Missing required field: attribute"));
+
+	FProperty* Found = nullptr;
 	for (TFieldIterator<FProperty> It(Rend->GetClass()); It; ++It)
 	{
-		if ((*It)->GetName() == BindingName) { BP = CastField<FStructProperty>(*It); break; }
+		if ((*It)->GetName() == BindingName) { Found = *It; break; }
 	}
-	if (!BP) return FMonolithActionResult::Error(TEXT("Binding property not found"));
+	if (!Found)
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Binding property '%s' not found"), *BindingName));
+
+	FStructProperty* BP = CastField<FStructProperty>(Found);
+	if (!BP || BP->Struct != FNiagaraVariableAttributeBinding::StaticStruct())
+	{
+		// Previously this fell out of a CastField and reported "Binding property not found",
+		// which is a different and misleading claim: the property exists, it is just not a binding.
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Property '%s' exists but is not an attribute binding (it is a %s). ")
+			TEXT("Use set_renderer_property for non-binding properties."),
+			*BindingName, *Found->GetCPPType()));
+	}
+
+	// Gap #45 — write the binding through the ENGINE's own setup path, not by hand.
+	//
+	// The old code ImportText'd `(BoundVariable=(Name="X"))` into the struct. That is a PARTIAL
+	// WRITE: BoundVariable is an editor-only legacy field that only PostLoad consults. The fields
+	// the renderer actually sources from — RootName, ParamMapVariable, DataSetName,
+	// CachedDisplayName, bBindingExistsOnSource — were never touched, which is why
+	// get_renderer_bindings kept reporting the OLD value (it reads ParamMapVariable) and why the
+	// rendered pixels never changed. Measured three ways 2026-08-17, including a magenta/green
+	// pixel test that stayed green after the binding was pointed at a magenta attribute.
+	//
+	// FNiagaraVariableAttributeBinding::SetValue is that path. It is NIAGARA_API, public, and is
+	// exactly what the details panel calls (FNiagaraVariableAttributeBindingCustomization::
+	// ChangeSource, NiagaraTypeCustomizations.cpp ~:793-816). It resolves the namespace against the
+	// emitter, then calls CacheValues, which populates ALL of the fields above — so nothing here
+	// reproduces those assignments by hand, which is how this bug class recurs.
+	//
+	// PostEditChangeProperty is the customization's follow-up (its NotifyPostChange). It rebuilds
+	// the emitter's cached renderer bindings and, on renderers that override it, re-derives source
+	// mode data (UNiagaraSpriteRendererProperties::PostEditChangeProperty ~:527-532).
+	const FVersionedNiagaraEmitterBase VersionedEmitter = Rend->GetOuterEmitterBase();
+	if (!VersionedEmitter.Emitter)
+	{
+		// SetValue with a null emitter cannot resolve namespaces or bBindingExistsOnSource, and
+		// would leave exactly the half-written state this fix exists to remove. Refuse instead.
+		return FMonolithActionResult::Error(
+			TEXT("Renderer has no owning emitter, so a binding cannot be resolved against it. "
+			     "Nothing was written."));
+	}
+
+	FNiagaraVariableAttributeBinding* Binding = BP->ContainerPtrToValuePtr<FNiagaraVariableAttributeBinding>(Rend);
+	const FString PreviousAttribute = Binding->GetParamMapBindableVariable().GetName().ToString();
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetRendBind", "Set Renderer Binding"));
 	System->Modify();
 	Rend->Modify();
 
-	void* Addr = BP->ContainerPtrToValuePtr<void>(Rend);
-	FString ImportText = FString::Printf(TEXT("(BoundVariable=(Name=\"%s\"))"), *AttributePath);
-	bool bOk = BP->ImportText_Direct(*ImportText, Addr, Rend, PPF_None) != nullptr;
-	if (!bOk)
-	{
-		FString Fallback = FString::Printf(TEXT("(BoundVariable=(Name=\"%s\",TypeDefHandle=(RegisteredTypeIndex=-1)))"), *AttributePath);
-		bOk = BP->ImportText_Direct(*Fallback, Addr, Rend, PPF_None) != nullptr;
-	}
+	Binding->SetValue(FName(*AttributePath), VersionedEmitter, Rend->GetCurrentSourceMode());
+
+	FPropertyChangedEvent ChangedEvent(BP, EPropertyChangeType::ValueSet);
+	Rend->PostEditChangeProperty(ChangedEvent);
 
 	GEditor->EndTransaction();
-	if (bOk) System->RequestCompile(false);
-	return bOk ? NA_SuccessStr(TEXT("Binding set")) : FMonolithActionResult::Error(TEXT("Failed to set binding"));
+	System->RequestCompile(false);
+
+	const FString ResolvedAttribute = Binding->GetParamMapBindableVariable().GetName().ToString();
+	const bool bExistsOnSource = Binding->DoesBindingExistOnSource();
+
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("result"), TEXT("Binding set"));
+	Out->SetStringField(TEXT("binding_name"), BindingName);
+	Out->SetStringField(TEXT("previous_attribute"), PreviousAttribute);
+	Out->SetStringField(TEXT("bound_to"), ResolvedAttribute);
+	Out->SetBoolField(TEXT("binding_exists_on_source"), bExistsOnSource);
+	if (!bExistsOnSource)
+	{
+		// The engine's own verdict, surfaced rather than swallowed. This is the case that used to
+		// silently destroy a working default binding when configure_ribbon pointed *_binding at
+		// attributes the emitter never writes.
+		Out->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("Binding now resolves to '%s', but no module on this emitter writes that attribute, ")
+			TEXT("so the renderer will fall back to its default value. Previous binding was '%s'."),
+			*ResolvedAttribute, *PreviousAttribute));
+	}
+	return NA_SuccessObj(Out);
 }
 
 // ============================================================================
