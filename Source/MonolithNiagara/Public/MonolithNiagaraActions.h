@@ -51,6 +51,8 @@ public:
 	static FMonolithActionResult HandleSetModuleInputValue(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleInputBinding(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetModuleInputDI(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateModule(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleCreateModuleFromTemplate(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateModuleFromHLSL(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateFunctionFromHLSL(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCreateDynamicInputFromHLSL(const TSharedPtr<FJsonObject>& Params);

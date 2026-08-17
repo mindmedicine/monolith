@@ -4122,7 +4122,45 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("di_class"), TEXT("string"), TEXT("Data interface class name"))
 			.Optional(TEXT("config"), TEXT("object"), TEXT("Data interface configuration"))
 			.Build());
-	Registry.RegisterAction(TEXT("niagara"), TEXT("create_module_from_hlsl"), TEXT("Create a Niagara module script from custom HLSL"),
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_module"),
+		TEXT("Create a Niagara MODULE script as a plain node graph — the shape the editor authors for a new module: "
+			 "InputMap -> ParameterMapGet, InputMap -> ParameterMapSet -> Output, with each declared input's read pin "
+			 "wired straight to a declared output's write pin. NO CustomHlsl node is created unless you pass 'hlsl'. "
+			 "PREFER THIS over create_module_from_hlsl for routing, renaming and pass-through modules; reach for 'hlsl' "
+			 "when there is actual arithmetic to do. (The project rule 'prefer custom HLSL' is about SCRATCH PADS, not "
+			 "about node graphs — Epic's own stock modules are node graphs that use HLSL sparingly.)"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateModule),
+		FParamSchemaBuilder()
+			.Required(TEXT("name"), TEXT("string"), TEXT("Display name for the module"))
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path to save (e.g. /Game/VFX/Modules/MyModule). FULL asset path, never a folder."))
+			.Optional(TEXT("inputs"), TEXT("array"), TEXT("Array of {name, type} objects. Each becomes a 'Module.<name>' read pin on the ParameterMapGet, i.e. a settable input on the placed module."))
+			.Optional(TEXT("outputs"), TEXT("array"), TEXT("Array of {name, type} objects written through the ParameterMapSet. Bare name -> module-local 'Output.<name>'. Namespaced name (System.X, Emitter.X, Particles.X, StackContext.X, Transient.X) -> writes that context directly."))
+			.Optional(TEXT("route"), TEXT("array"), TEXT("Array of {input, output} objects saying which input feeds which output. DEFAULT when omitted: pair by position (inputs[0]->outputs[0], inputs[1]->outputs[1], ...). Types must match exactly — with no HLSL node there is nothing to convert between them, and the action refuses a mismatch before creating anything. An output with nothing routed into it keeps its pin default, i.e. the module writes a constant."))
+			.Optional(TEXT("hlsl"), TEXT("string"), TEXT("OPTIONAL. When supplied, a CustomHlsl node is inserted and the parameter map is threaded through it, exactly as create_module_from_hlsl does. Same body rules: bare I/O identifiers (no dots), no '%', functions wrapped in structs, outputs defaulted before any '#if GPU_SIMULATION'."))
+			.Optional(TEXT("stages"), TEXT("array"), TEXT("Stack stages this module may live in (sets ModuleUsageBitmask): particle_spawn, particle_update, particle_event, particle_simulation_stage, emitter_spawn, emitter_update, system_spawn, system_update. Omitted: the engine's own default for a new script (particle spawn/update/event/sim-stage), FVersionedNiagaraScriptData ctor, NiagaraScript.cpp:416-417."))
+			.Optional(TEXT("default_mode"), TEXT("string"), TEXT("Default mode for the parameters this module declares: value (DEFAULT — module works standalone) | binding | custom | fail_if_previously_not_set."))
+			.Optional(TEXT("description"), TEXT("string"), TEXT("Optional description, applied to the script asset. Unlike the HLSL path this does NOT add node comment bubbles — a plain module is kept byte-comparable with a hand-authored one."))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_module_from_template"),
+		TEXT("Create a Niagara MODULE by DUPLICATING a known-good empty module asset and adding pins to the copy, "
+			 "instead of constructing the graph in C++. EXPERIMENTAL, and it exists for a specific reason: I-38 is "
+			 "localised to the module CREATION step, so starting from an asset already proven to survive renames "
+			 "(e.g. /Game/FX/_Probes/2026-08-16/NM_Empty) sidesteps whatever construction gets wrong — WITHOUT "
+			 "anyone knowing what that is. It may hide the bug rather than fix it. Its premise (that DuplicateAsset "
+			 "carries over the invisible creation-time state) is UNPROVEN: T3D-diff the copy against the template "
+			 "before trusting it. Does not accept 'hlsl'."),
+		FMonolithActionHandler::CreateStatic(&HandleCreateModuleFromTemplate),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("save_path"), TEXT("Asset path to save (e.g. /Game/VFX/Modules/MyModule). FULL asset path, never a folder."))
+			.RequiredAssetPath(TEXT("template_module"), TEXT("Module script to duplicate. MUST be a pristine empty module graph: exactly 4 nodes — 1 Output, 1 Input (ParameterMap), 1 ParameterMapGet, 1 ParameterMapSet. Anything else is refused, because a template's contents become part of every module built from it."))
+			.Optional(TEXT("inputs"), TEXT("array"), TEXT("Array of {name, type} objects. Each becomes a 'Module.<name>' read pin on the copy's ParameterMapGet."))
+			.Optional(TEXT("outputs"), TEXT("array"), TEXT("Array of {name, type} objects written through the copy's ParameterMapSet. Bare name -> 'Output.<name>'; namespaced (System.X, Emitter.X, Particles.X, StackContext.X, Transient.X) writes that context directly."))
+			.Optional(TEXT("route"), TEXT("array"), TEXT("Array of {input, output} objects. DEFAULT when omitted: pair by position. Types must match exactly."))
+			.Optional(TEXT("stages"), TEXT("array"), TEXT("Stack stages this module may live in (sets ModuleUsageBitmask). Omitted: whatever the TEMPLATE carries — which is the point of a template."))
+			.Optional(TEXT("default_mode"), TEXT("string"), TEXT("Default mode for the parameters this call declares: value (DEFAULT) | binding | custom | fail_if_previously_not_set."))
+			.Optional(TEXT("description"), TEXT("string"), TEXT("Optional description, applied to the script asset."))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_module_from_hlsl"), TEXT("Create a Niagara module script from custom HLSL. Same builder as create_module with 'hlsl' mandatory — prefer create_module when the module has no arithmetic to do."),
 		FMonolithActionHandler::CreateStatic(&HandleCreateModuleFromHLSL),
 		FParamSchemaBuilder()
 			.Required(TEXT("name"), TEXT("string"), TEXT("Display name for the module"))
@@ -7921,12 +7959,25 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	// === Parse and validate params ===
 	FString Name = Params->GetStringField(TEXT("name"));
 	FString SavePath = Params->GetStringField(TEXT("save_path"));
-	FString HlslBody = Params->GetStringField(TEXT("hlsl"));
+	// 'hlsl' is OPTIONAL for MODULE usage (create_module). A module with no body is a plain node
+	// graph — InputMap → MapGet, InputMap → MapSet → Output — which is what the editor's own
+	// "new module" asset is and what most of Epic's stock modules are; a CustomHlsl node is a
+	// tool you reach for, not the shape of a module. Function and DynamicInput scripts have no
+	// such shape (their whole content IS the body), so they still require it, and
+	// create_module_from_hlsl re-imposes the requirement in its own handler so that action's
+	// contract and error text are unchanged.
+	FString HlslBody;
+	Params->TryGetStringField(TEXT("hlsl"), HlslBody);
 	FString Description = Params->HasField(TEXT("description")) ? Params->GetStringField(TEXT("description")) : FString();
 
 	if (Name.IsEmpty()) return FMonolithActionResult::Error(TEXT("'name' is required"));
 	if (SavePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("'save_path' is required"));
-	if (HlslBody.IsEmpty()) return FMonolithActionResult::Error(TEXT("'hlsl' is required"));
+	if (HlslBody.IsEmpty() && Usage != ENiagaraScriptUsage::Module)
+	{
+		return FMonolithActionResult::Error(TEXT("'hlsl' is required"));
+	}
+	// Every downstream branch keys off this rather than re-testing the string.
+	const bool bHasHlsl = !HlslBody.IsEmpty();
 
 	// Validate the destination up front — a malformed path asserts inside CreatePackage below.
 	if (const FString PathError = MonolithCore::ValidatePackagePath(SavePath); !PathError.IsEmpty())
@@ -8068,6 +8119,109 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 			}
 			SeenBareNames.Add(Pin.Name);
 		}
+	}
+
+	// ------------------------------------------------------------------------
+	// PLAIN NODE-GRAPH MODULE (create_module) — routing plan, resolved and validated BEFORE
+	// anything is created (#26b abort-before-mutation).
+	//
+	// With no HLSL body there is nothing between the MapGet and the MapSet, so each declared
+	// output has to be fed by a declared input or it is left on its pin default. The default
+	// plan pairs them BY POSITION (input[i] → output[i]); 'route' overrides that explicitly.
+	// Types must match exactly — the schema refuses a connection between differing Niagara
+	// types, so an unchecked mismatch would silently produce a MapSet pin with no link and a
+	// module that writes a constant while looking wired.
+	// ------------------------------------------------------------------------
+	TArray<TPair<int32, int32>> RoutePairs; // (index into ParsedInputs, index into ParsedOutputs)
+	if (!bHasHlsl)
+	{
+#if !WITH_NIAGARA_WIZARD_PRIVATE
+		return FMonolithActionResult::Error(
+			TEXT("This build cannot author a plain node-graph module: its 'Module.<name>' read pins and "
+				 "'Output.<name>' write pins require the engine-private ParameterMapGet/Set pin helpers "
+				 "(UE::Niagara::Wizard::Utilities::Add*ParameterPin), which are compiled out when "
+				 "MONOLITH_RELEASE_BUILD=1. Rebuild with WITH_NIAGARA_WIZARD_PRIVATE=1, or pass 'hlsl' to "
+				 "get the CustomHlsl shape instead. NOTHING WAS CREATED."));
+#else
+		TSet<int32> RoutedOutputs;
+		auto AddRoute = [&](int32 InIdx, int32 OutIdx, FString& OutError) -> bool
+		{
+			if (!ParsedInputs[InIdx].Type.IsValid() || ParsedInputs[InIdx].Type != ParsedOutputs[OutIdx].Type)
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot route input '%s' (%s) into output '%s' (%s): a module with no 'hlsl' body has "
+						 "nothing to convert between them, and UEdGraphSchema_Niagara refuses a connection "
+						 "between differing types. Give them the same type, drop one of them, or pass 'hlsl' "
+						 "with a body that does the conversion. NOTHING WAS CREATED."),
+					*ParsedInputs[InIdx].Name, *ParsedInputs[InIdx].Type.GetName(),
+					*ParsedOutputs[OutIdx].Name, *ParsedOutputs[OutIdx].Type.GetName());
+				return false;
+			}
+			if (RoutedOutputs.Contains(OutIdx))
+			{
+				OutError = FString::Printf(
+					TEXT("Output '%s' is routed more than once. A ParameterMapSet write pin takes exactly one "
+						 "link. NOTHING WAS CREATED."), *ParsedOutputs[OutIdx].Name);
+				return false;
+			}
+			RoutedOutputs.Add(OutIdx);
+			RoutePairs.Add(TPair<int32, int32>(InIdx, OutIdx));
+			return true;
+		};
+
+		const TArray<TSharedPtr<FJsonValue>> RouteArr = GetJsonArray(Params, TEXT("route"));
+		if (RouteArr.Num() > 0)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : RouteArr)
+			{
+				TSharedPtr<FJsonObject> Obj = AsObjectOrParseString(Val);
+				if (!Obj.IsValid() || Obj->Values.Num() == 0) continue;
+				const FString FromName = Obj->GetStringField(TEXT("input"));
+				const FString ToName = Obj->GetStringField(TEXT("output"));
+				if (FromName.IsEmpty() || ToName.IsEmpty())
+				{
+					return FMonolithActionResult::Error(
+						TEXT("Each 'route' entry needs both 'input' and 'output'. NOTHING WAS CREATED."));
+				}
+
+				const int32 InIdx = ParsedInputs.IndexOfByPredicate(
+					[&FromName](const FPinDef& P) { return P.Name == FromName; });
+				if (InIdx == INDEX_NONE)
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("route: no declared input named '%s'. NOTHING WAS CREATED."), *FromName));
+				}
+				// Accept either the bare HLSL-style identifier or the full namespaced write name,
+				// because the caller wrote one of those two in 'outputs'.
+				const int32 OutIdx = ParsedOutputs.IndexOfByPredicate(
+					[&ToName](const FPinDef& P) { return P.Name == ToName || P.WritePinName == ToName; });
+				if (OutIdx == INDEX_NONE)
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("route: no declared output named '%s'. NOTHING WAS CREATED."), *ToName));
+				}
+
+				FString RouteError;
+				if (!AddRoute(InIdx, OutIdx, RouteError))
+				{
+					return FMonolithActionResult::Error(RouteError);
+				}
+			}
+		}
+		else
+		{
+			const int32 PairCount = FMath::Min(ParsedInputs.Num(), ParsedOutputs.Num());
+			for (int32 i = 0; i < PairCount; ++i)
+			{
+				FString RouteError;
+				if (!AddRoute(i, i, RouteError))
+				{
+					return FMonolithActionResult::Error(RouteError + TEXT(
+						" (This is the DEFAULT by-position pairing; pass 'route' to pair them differently.)"));
+				}
+			}
+		}
+#endif // WITH_NIAGARA_WIZARD_PRIVATE
 	}
 
 	// ------------------------------------------------------------------------
@@ -8352,11 +8506,16 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		}
 	}
 
-	// --- CustomHlsl Node ---
+	// --- CustomHlsl Node (ONLY when a body was supplied) ---
+	// Without 'hlsl' this node does not exist at all and the graph is the four-node routing shape
+	// the editor authors for a new module. Everything below is unchanged from the HLSL path.
+	UNiagaraNodeCustomHlsl* HlslNode = nullptr;
+	if (bHasHlsl)
+	{
 	// Set up the Signature BEFORE Finalize so AllocateDefaultPins creates the correct pins.
 	// For Module usage, bRequiresExecPin=true creates ParameterMap flow pins automatically.
 	FGraphNodeCreator<UNiagaraNodeCustomHlsl> HlslCreator(*Graph);
-	UNiagaraNodeCustomHlsl* HlslNode = HlslCreator.CreateNode(/*bSelectNewNode=*/ false);
+	HlslNode = HlslCreator.CreateNode(/*bSelectNewNode=*/ false);
 
 	// Set ScriptUsage (public UPROPERTY)
 	HlslNode->ScriptUsage = Usage;
@@ -8452,6 +8611,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 
 	// Finalize calls AllocateDefaultPins which reads Signature to create pins
 	HlslCreator.Finalize();
+	} // if (bHasHlsl)
 
 #if WITH_NIAGARA_WIZARD_PRIVATE
 	// Module ParameterMap bridge requires the engine-private Wizard::Utilities::Add*ParameterPin
@@ -8486,16 +8646,29 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		UEdGraphPin* MapGetMapIn = MapGetNode->GetInputPin(0);
 		UEdGraphPin* MapSetMapIn = MapSetNode->GetInputPin(0);
 		UEdGraphPin* MapSetMapOut = MapSetNode->GetOutputPin(0);
-		UEdGraphPin* HlslMapIn = MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Input);
-		UEdGraphPin* HlslMapOut = MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Output);
+		UEdGraphPin* HlslMapIn = HlslNode ? MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Input) : nullptr;
+		UEdGraphPin* HlslMapOut = HlslNode ? MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Output) : nullptr;
 		UEdGraphPin* OutputMapIn = OutputNode->GetInputPin(0);
 
 		if (InputMapOut && MapGetMapIn)
 			Schema->TryCreateConnection(InputMapOut, MapGetMapIn);
-		if (InputMapOut && HlslMapIn)
-			Schema->TryCreateConnection(InputMapOut, HlslMapIn);
-		if (HlslMapOut && MapSetMapIn)
-			Schema->TryCreateConnection(HlslMapOut, MapSetMapIn);
+		if (HlslNode)
+		{
+			// HLSL path: the map spine threads THROUGH the CustomHlsl node, so it participates in
+			// BuildParameterMapHistory (NiagaraNodeCustomHlsl.cpp:478, the I-21 assert site).
+			if (InputMapOut && HlslMapIn)
+				Schema->TryCreateConnection(InputMapOut, HlslMapIn);
+			if (HlslMapOut && MapSetMapIn)
+				Schema->TryCreateConnection(HlslMapOut, MapSetMapIn);
+		}
+		else
+		{
+			// Plain node graph: the InputMap fans out to BOTH map nodes and the MapSet feeds the
+			// Output directly. This is the shape of a hand-authored empty module
+			// (/Game/FX/_Probes/2026-08-16/NM_Empty) — 4 nodes, 3 map edges plus one edge per route.
+			if (InputMapOut && MapSetMapIn)
+				Schema->TryCreateConnection(InputMapOut, MapSetMapIn);
+		}
 		if (MapSetMapOut && OutputMapIn)
 			Schema->TryCreateConnection(MapSetMapOut, OutputMapIn);
 
@@ -8525,26 +8698,44 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 			}
 		}
 
-		for (UEdGraphPin* HlslPin : HlslNode->Pins)
+		if (HlslNode)
 		{
-			if (HlslPin->PinName.IsNone() || HlslPin->PinName == TEXT("Add")) continue;
-			if (Schema->PinToTypeDefinition(HlslPin) == FNiagaraTypeDefinition::GetParameterMapDef()) continue;
-
-			if (HlslPin->Direction == EGPD_Input)
+			for (UEdGraphPin* HlslPin : HlslNode->Pins)
 			{
-				if (UEdGraphPin* const* GetPin = MapGetPinsByShortName.Find(HlslPin->PinName))
+				if (HlslPin->PinName.IsNone() || HlslPin->PinName == TEXT("Add")) continue;
+				if (Schema->PinToTypeDefinition(HlslPin) == FNiagaraTypeDefinition::GetParameterMapDef()) continue;
+
+				if (HlslPin->Direction == EGPD_Input)
 				{
-					Schema->TryCreateConnection(*GetPin, HlslPin);
+					if (UEdGraphPin* const* GetPin = MapGetPinsByShortName.Find(HlslPin->PinName))
+					{
+						Schema->TryCreateConnection(*GetPin, HlslPin);
+					}
+				}
+				else if (HlslPin->Direction == EGPD_Output)
+				{
+					// The MapSet write is the module's ONLY output path. There is deliberately no
+					// second wire to the OutputNode: it has just the ParameterMap pin (see its
+					// construction above), which the MapSet already feeds.
+					if (UEdGraphPin* const* SetPin = MapSetPinsByShortName.Find(HlslPin->PinName))
+					{
+						Schema->TryCreateConnection(HlslPin, *SetPin);
+					}
 				}
 			}
-			else if (HlslPin->Direction == EGPD_Output)
+		}
+		else
+		{
+			// No HLSL node: read pins go straight to write pins, per the routing plan validated
+			// before anything was created. Types were checked there, so a refusal here would mean
+			// the pin helpers produced a type we did not ask for — recorded, not swallowed.
+			for (const TPair<int32, int32>& Route : RoutePairs)
 			{
-				// The MapSet write is the module's ONLY output path. There is deliberately no
-				// second wire to the OutputNode: it has just the ParameterMap pin (see its
-				// construction above), which the MapSet already feeds.
-				if (UEdGraphPin* const* SetPin = MapSetPinsByShortName.Find(HlslPin->PinName))
+				UEdGraphPin* const* GetPin = MapGetPinsByShortName.Find(FName(*ParsedInputs[Route.Key].Name));
+				UEdGraphPin* const* SetPin = MapSetPinsByShortName.Find(FName(*ParsedOutputs[Route.Value].Name));
+				if (GetPin && SetPin)
 				{
-					Schema->TryCreateConnection(HlslPin, *SetPin);
+					Schema->TryCreateConnection(*GetPin, *SetPin);
 				}
 			}
 		}
@@ -8597,7 +8788,10 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	if (bIsModule)
 	{
 		// Module wiring: InputNode(MapOut) → HlslNode(MapIn) → OutputNode(MapIn)
-		// The ParameterMap pins are unnamed (empty FName) — find them by type
+		// The ParameterMap pins are unnamed (empty FName) — find them by type.
+		// HlslNode is always valid here: a body-less module needs the MapGet/MapSet parameter-pin
+		// helpers this build does not have, and was refused before anything was created.
+		check(HlslNode);
 		UEdGraphPin* InputMapOut = InputNode->GetOutputPin(0);
 		UEdGraphPin* HlslMapIn = MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Input);
 		UEdGraphPin* HlslMapOut = MonolithNiagaraHelpers::GetParameterMapPin(*HlslNode, EGPD_Output);
@@ -8688,25 +8882,35 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	// driven by the longest source line and dwarfs the fixed-width Map nodes. Estimate that
 	// width from the body text (~9uu per char at default zoom) so downstream nodes clear it
 	// instead of abutting it.
-	int32 MaxLineLen = 0;
-	{
-		TArray<FString> BodyLines;
-		HlslBody.ParseIntoArrayLines(BodyLines, /*bCullEmpty=*/false);
-		for (const FString& Line : BodyLines)
-		{
-			MaxLineLen = FMath::Max(MaxLineLen, Line.Len());
-		}
-	}
-	const int32 HlslWidth = FMath::Clamp(320 + MaxLineLen * 9, 520, 1500);
 	const int32 HlslX = -600;
+	int32 MapSetX = HlslX;
+	if (HlslNode)
+	{
+		int32 MaxLineLen = 0;
+		{
+			TArray<FString> BodyLines;
+			HlslBody.ParseIntoArrayLines(BodyLines, /*bCullEmpty=*/false);
+			for (const FString& Line : BodyLines)
+			{
+				MaxLineLen = FMath::Max(MaxLineLen, Line.Len());
+			}
+		}
+		const int32 HlslWidth = FMath::Clamp(320 + MaxLineLen * 9, 520, 1500);
+		HlslNode->NodePosX = HlslX;                  HlslNode->NodePosY = 0;
+		MapSetX = HlslX + HlslWidth + 160;
+	}
 
 	InputNode->NodePosX = HlslX - 800;               InputNode->NodePosY = 0;
-	HlslNode->NodePosX = HlslX;                      HlslNode->NodePosY = 0;
-	const int32 MapSetX = HlslX + HlslWidth + 160;
 	OutputNode->NodePosX = MapSetX + 480;            OutputNode->NodePosY = 0;
 
-	// Comment bubbles so generated graphs are self-describing
-	if (!Description.IsEmpty())
+	// Comment bubbles so generated graphs are self-describing.
+	//
+	// Deliberately HLSL-PATH ONLY. A plain node-graph module is meant to be byte-comparable with a
+	// hand-authored one (Tim's NM_Empty carries no node comments at all — see D-6 in
+	// Docs/staging/2026-08-16-validator-timdup-diff.md), and the T3D diff that validates this
+	// action is much easier to read when the only differences are names, paths and GUIDs.
+	// The 'description' still lands on the script asset via ScriptData->Description either way.
+	if (HlslNode && !Description.IsEmpty())
 	{
 		HlslNode->NodeComment = Description;
 		HlslNode->bCommentBubbleVisible = true;
@@ -8717,7 +8921,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	// per-input wires clear of the straight ParameterMap spine.
 	if (MapGetNode) { MapGetNode->NodePosX = HlslX - 420; MapGetNode->NodePosY = 190; }
 	if (MapSetNode) { MapSetNode->NodePosX = MapSetX;     MapSetNode->NodePosY = 0; }
-	if (MapGetNode && ParsedInputs.Num() > 0)
+	if (HlslNode && MapGetNode && ParsedInputs.Num() > 0)
 	{
 		TArray<FString> InputNames;
 		for (const FPinDef& I : ParsedInputs) InputNames.Add(I.Name);
@@ -8725,7 +8929,7 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		MapGetNode->bCommentBubbleVisible = true;
 		MapGetNode->bCommentBubblePinned = true;
 	}
-	if (MapSetNode && ParsedOutputs.Num() > 0)
+	if (HlslNode && MapSetNode && ParsedOutputs.Num() > 0)
 	{
 		TArray<FString> WriteNames;
 		for (const FPinDef& O : ParsedOutputs)
@@ -8792,8 +8996,16 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		}
 	}
 
-	// Mark graph as needing recompile
-	HlslNode->MarkNodeRequiresSynchronization(TEXT("MonolithHLSL"), true);
+	// Mark graph as needing recompile. The call bumps the owning graph's change id, so any
+	// UNiagaraNode in the graph serves — a body-less module marks through its Output node.
+	if (HlslNode)
+	{
+		HlslNode->MarkNodeRequiresSynchronization(TEXT("MonolithHLSL"), true);
+	}
+	else
+	{
+		OutputNode->MarkNodeRequiresSynchronization(TEXT("MonolithModule"), true);
+	}
 
 	// Set source on script — compilation happens when the module is added to a system
 	Script->SetLatestSource(Source);
@@ -8827,6 +9039,33 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	// usage implicitly; create_dynamic_input_from_hlsl's callers need it stated, because the
 	// whole point of the action is producing a script that passes add_dynamic_input's usage guard.
 	Result->SetStringField(TEXT("script_usage"), MonolithNiagaraHelpers::DescribeScriptUsage(Usage));
+
+	// Only emitted on the body-less path, so create_module_from_hlsl's response shape is byte-for-byte
+	// what it was before this action existed.
+	if (!bHasHlsl)
+	{
+		Result->SetStringField(TEXT("graph_shape"), TEXT("node_graph"));
+		Result->SetBoolField(TEXT("has_custom_hlsl"), false);
+		TArray<TSharedPtr<FJsonValue>> RoutedPairs;
+		for (const TPair<int32, int32>& Route : RoutePairs)
+		{
+			TSharedRef<FJsonObject> RouteObj = MakeShared<FJsonObject>();
+			RouteObj->SetStringField(TEXT("from"),
+				FString::Printf(TEXT("Module.%s"), *ParsedInputs[Route.Key].Name));
+			RouteObj->SetStringField(TEXT("to"), ParsedOutputs[Route.Value].WritePinName.IsEmpty()
+				? FString::Printf(TEXT("Output.%s"), *ParsedOutputs[Route.Value].Name)
+				: ParsedOutputs[Route.Value].WritePinName);
+			RoutedPairs.Add(MakeShared<FJsonValueObject>(RouteObj));
+		}
+		Result->SetArrayField(TEXT("routed"), RoutedPairs);
+		if (RoutePairs.Num() < ParsedOutputs.Num())
+		{
+			Result->SetStringField(TEXT("unrouted_outputs_note"),
+				TEXT("Some declared outputs have no input feeding them. Their ParameterMapSet pin is left at its "
+					 "literal default, so the module writes a CONSTANT for those — which compiles clean and is easy "
+					 "to mistake for a live value. Pass 'route', add matching inputs, or supply 'hlsl'."));
+		}
+	}
 	if (bIsDynamicInput)
 	{
 		Result->SetStringField(TEXT("output_type"), ParsedOutputs[0].Type.GetName());
@@ -8861,9 +9100,451 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 	return NA_SuccessObj(Result);
 }
 
-FMonolithActionResult FMonolithNiagaraActions::HandleCreateModuleFromHLSL(const TSharedPtr<FJsonObject>& Params)
+// The general module-creation entry point. 'hlsl' is optional here: without it the builder authors
+// the plain four-node routing graph the editor produces for a new module asset, with no CustomHlsl
+// node anywhere in it.
+//
+// WHY THIS EXISTS: create_module_from_hlsl was the only module-creation path Monolith had, so every
+// module we ever authored came out HLSL-shaped — including modules whose entire content is one
+// assignment. Epic's stock modules are node graphs that reach for HLSL sparingly; the project rule
+// this was derived from ("prefer custom HLSL over SCRATCH PADS") was never about node graphs.
+FMonolithActionResult FMonolithNiagaraActions::HandleCreateModule(const TSharedPtr<FJsonObject>& Params)
 {
 	return CreateScriptFromHLSL(Params, ENiagaraScriptUsage::Module);
+}
+
+// Thin wrapper, kept because 69 documents, the niagara-authoring skill and a pile of staging notes
+// name this action. Identical behaviour to before: 'hlsl' is mandatory, with the same error text,
+// and the response carries no new fields (the body-less extras are gated on !bHasHlsl).
+FMonolithActionResult FMonolithNiagaraActions::HandleCreateModuleFromHLSL(const TSharedPtr<FJsonObject>& Params)
+{
+	FString HlslBody;
+	Params->TryGetStringField(TEXT("hlsl"), HlslBody);
+	if (HlslBody.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'hlsl' is required"));
+	}
+	return HandleCreateModule(Params);
+}
+
+// ============================================================================
+// create_module_from_template — the DUPLICATION route to a module (Tim's proposal, 2026-08-17).
+//
+// WHY A SECOND PATH EXISTS. I-38 is localised to create_module_from_hlsl's CREATION step and
+// nothing else: /Game/FX/_Probes/2026-08-16/NM_Empty was hand-created in the editor, then had its
+// parameters added with add_map_parameter_pin, its wiring made with connect_graph_pins, its
+// placement made with add_module, and TWO renames with rename_script_parameter — 0 errors,
+// reload-verified after both. Every MCP step downstream of creation is therefore already
+// exonerated; only creation is implicated, and nobody knows WHAT in it is wrong.
+//
+// Constructing a module in C++ (HandleCreateModule, above) means reproducing whatever the editor
+// does correctly, from scratch, while guessing at completeness. Duplication inverts that: start
+// from an asset PROVEN to survive and only add to it. Precedent in this file: duplicate_system
+// uses IAssetTools::DuplicateAsset the same way.
+//
+// 🛑 THIS MAY HIDE THE BUG RATHER THAN FIX IT. If duplication survives renames and construction
+// does not, I-38 stops biting for callers of this action while the defect in the construction path
+// stays live for everyone else. That is a reason to run BOTH and diff them, not a reason to prefer
+// this one blindly.
+//
+// 🛑 AND ITS PREMISE IS UNPROVEN. The whole idea rests on DuplicateAsset carrying over the
+// invisible creation-time state we have been hunting. A duplicate SHOULD be a deep copy, but
+// "should" is doing the work — the response therefore tells the caller to T3D-diff the copy
+// against the template before trusting it. See
+// Docs/staging/2026-08-17-toolsmith-create-module.md for the validation procedure.
+// ============================================================================
+FMonolithActionResult FMonolithNiagaraActions::HandleCreateModuleFromTemplate(const TSharedPtr<FJsonObject>& Params)
+{
+#if !WITH_NIAGARA_WIZARD_PRIVATE
+	return FMonolithActionResult::Error(
+		TEXT("This build cannot add 'Module.<name>' / 'Output.<name>' pins to a duplicated module: the "
+			 "ParameterMapGet/Set pin helpers (UE::Niagara::Wizard::Utilities::Add*ParameterPin) are compiled "
+			 "out when MONOLITH_RELEASE_BUILD=1. NOTHING WAS CREATED."));
+#else
+	FString SavePath = Params->GetStringField(TEXT("save_path"));
+	FString TemplatePath = Params->GetStringField(TEXT("template_module"));
+	FString Description = Params->HasField(TEXT("description")) ? Params->GetStringField(TEXT("description")) : FString();
+
+	if (SavePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("'save_path' is required"));
+	if (TemplatePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("'template_module' is required"));
+	if (Params->HasField(TEXT("hlsl")))
+	{
+		// Deliberately not supported in v1. Inserting a CustomHlsl node means BREAKING the template's
+		// InputMap->MapSet map edge and rerouting the spine through the new node — which is exactly
+		// D-1, the one structural difference between our modules and Tim's that is still live as an
+		// I-38 candidate (Docs/staging/2026-08-16-validator-timdup-diff.md). Doing it here would
+		// contaminate the very comparison this action exists to make.
+		return FMonolithActionResult::Error(
+			TEXT("create_module_from_template does not take 'hlsl'. Create the plain module first, then add the "
+				 "node with add_graph_node {node_type:'custom_hlsl'} and wire it with connect_graph_pins — that is "
+				 "the MCP route already exonerated by NM_Empty. Or use create_module with 'hlsl' for the "
+				 "single-call constructed shape. NOTHING WAS CREATED."));
+	}
+
+	if (const FString PathError = MonolithCore::ValidatePackagePath(SavePath); !PathError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(PathError);
+	}
+
+	// --- Parse I/O, identically to the construction path -------------------------------------
+	struct FPinDef { FString Name; FNiagaraTypeDefinition Type; FString WritePinName; };
+	TArray<FPinDef> ParsedInputs;
+	TArray<FPinDef> ParsedOutputs;
+
+	auto GetJsonArray = [](const TSharedPtr<FJsonObject>& P, const FString& FieldName) -> TArray<TSharedPtr<FJsonValue>>
+	{
+		if (!P->HasField(FieldName)) return {};
+		const TArray<TSharedPtr<FJsonValue>>* ArrPtr;
+		if (P->TryGetArrayField(FieldName, ArrPtr)) return *ArrPtr;
+		FString Str = P->GetStringField(FieldName);
+		if (!Str.IsEmpty())
+		{
+			TArray<TSharedPtr<FJsonValue>> Parsed;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Str);
+			FJsonSerializer::Deserialize(Reader, Parsed);
+			return Parsed;
+		}
+		return {};
+	};
+
+	auto ParsePinArray = [&](const TCHAR* Field, TArray<FPinDef>& Out, FString& OutError) -> bool
+	{
+		for (const TSharedPtr<FJsonValue>& Val : GetJsonArray(Params, Field))
+		{
+			TSharedPtr<FJsonObject> Obj = AsObjectOrParseString(Val);
+			if (!Obj.IsValid() || Obj->Values.Num() == 0) continue;
+			const FString PinName = Obj->GetStringField(TEXT("name"));
+			const FString TypeStr = Obj->GetStringField(TEXT("type"));
+			if (PinName.IsEmpty() || TypeStr.IsEmpty()) continue;
+			bool bTypeFellBack = false;
+			const FNiagaraTypeDefinition ResolvedType = ResolveNiagaraType(TypeStr, &bTypeFellBack);
+			if (bTypeFellBack)
+			{
+				OutError = FString::Printf(
+					TEXT("Unknown Niagara type '%s' for pin '%s'. Use a real Niagara type name (e.g. float, vec3, "
+						 "position). NOTHING WAS CREATED."), *TypeStr, *PinName);
+				return false;
+			}
+			Out.Add({ PinName, ResolvedType, FString() });
+		}
+		return true;
+	};
+
+	{
+		FString ParseError;
+		if (!ParsePinArray(TEXT("inputs"), ParsedInputs, ParseError)) return FMonolithActionResult::Error(ParseError);
+		if (!ParsePinArray(TEXT("outputs"), ParsedOutputs, ParseError)) return FMonolithActionResult::Error(ParseError);
+	}
+
+	for (const FPinDef& Pin : ParsedInputs)
+	{
+		if (Pin.Name.Contains(TEXT(".")))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input name '%s' must be a bare identifier — it becomes 'Module.%s'. NOTHING WAS CREATED."),
+				*Pin.Name, *Pin.Name));
+		}
+	}
+	{
+		static const TCHAR* AllowedWriteNamespaces[] = {
+			TEXT("System"), TEXT("Emitter"), TEXT("Particles"), TEXT("StackContext"), TEXT("Transient"), TEXT("Output")
+		};
+		TSet<FString> SeenBareNames;
+		for (FPinDef& Pin : ParsedOutputs)
+		{
+			if (Pin.Name.Contains(TEXT(".")))
+			{
+				FString Namespace, Bare;
+				Pin.Name.Split(TEXT("."), &Namespace, &Bare, ESearchCase::CaseSensitive, ESearchDir::FromStart);
+				if (Namespace.IsEmpty() || Bare.IsEmpty() || Bare.Contains(TEXT(".")))
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("Output name '%s' must be 'Namespace.Identifier' with exactly one dot. NOTHING WAS CREATED."),
+						*Pin.Name));
+				}
+				bool bAllowed = false;
+				for (const TCHAR* NS : AllowedWriteNamespaces) { if (Namespace == NS) { bAllowed = true; break; } }
+				if (!bAllowed)
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("Output namespace '%s' is not writable from a module. Use System, Emitter, Particles, "
+							 "StackContext, Transient — or a bare identifier. NOTHING WAS CREATED."), *Namespace));
+				}
+				Pin.WritePinName = Pin.Name;
+				Pin.Name = Bare;
+			}
+			if (SeenBareNames.Contains(Pin.Name))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Duplicate output identifier '%s'. NOTHING WAS CREATED."), *Pin.Name));
+			}
+			SeenBareNames.Add(Pin.Name);
+		}
+	}
+
+	// --- Routing plan, validated before any mutation (#26b) -----------------------------------
+	TArray<TPair<int32, int32>> RoutePairs;
+	{
+		TSet<int32> RoutedOutputs;
+		auto AddRoute = [&](int32 InIdx, int32 OutIdx, FString& OutError) -> bool
+		{
+			if (!ParsedInputs[InIdx].Type.IsValid() || ParsedInputs[InIdx].Type != ParsedOutputs[OutIdx].Type)
+			{
+				OutError = FString::Printf(
+					TEXT("Cannot route input '%s' (%s) into output '%s' (%s): there is no node between them to "
+						 "convert, and the Niagara schema refuses a connection between differing types. "
+						 "NOTHING WAS CREATED."),
+					*ParsedInputs[InIdx].Name, *ParsedInputs[InIdx].Type.GetName(),
+					*ParsedOutputs[OutIdx].Name, *ParsedOutputs[OutIdx].Type.GetName());
+				return false;
+			}
+			if (RoutedOutputs.Contains(OutIdx))
+			{
+				OutError = FString::Printf(
+					TEXT("Output '%s' is routed more than once; a MapSet write pin takes exactly one link. "
+						 "NOTHING WAS CREATED."), *ParsedOutputs[OutIdx].Name);
+				return false;
+			}
+			RoutedOutputs.Add(OutIdx);
+			RoutePairs.Add(TPair<int32, int32>(InIdx, OutIdx));
+			return true;
+		};
+
+		const TArray<TSharedPtr<FJsonValue>> RouteArr = GetJsonArray(Params, TEXT("route"));
+		if (RouteArr.Num() > 0)
+		{
+			for (const TSharedPtr<FJsonValue>& Val : RouteArr)
+			{
+				TSharedPtr<FJsonObject> Obj = AsObjectOrParseString(Val);
+				if (!Obj.IsValid() || Obj->Values.Num() == 0) continue;
+				const FString FromName = Obj->GetStringField(TEXT("input"));
+				const FString ToName = Obj->GetStringField(TEXT("output"));
+				const int32 InIdx = ParsedInputs.IndexOfByPredicate([&](const FPinDef& P) { return P.Name == FromName; });
+				const int32 OutIdx = ParsedOutputs.IndexOfByPredicate([&](const FPinDef& P) { return P.Name == ToName || P.WritePinName == ToName; });
+				if (InIdx == INDEX_NONE || OutIdx == INDEX_NONE)
+				{
+					return FMonolithActionResult::Error(FString::Printf(
+						TEXT("route: no declared %s named '%s'. NOTHING WAS CREATED."),
+						InIdx == INDEX_NONE ? TEXT("input") : TEXT("output"),
+						InIdx == INDEX_NONE ? *FromName : *ToName));
+				}
+				FString RouteError;
+				if (!AddRoute(InIdx, OutIdx, RouteError)) return FMonolithActionResult::Error(RouteError);
+			}
+		}
+		else
+		{
+			const int32 PairCount = FMath::Min(ParsedInputs.Num(), ParsedOutputs.Num());
+			for (int32 i = 0; i < PairCount; ++i)
+			{
+				FString RouteError;
+				if (!AddRoute(i, i, RouteError)) return FMonolithActionResult::Error(RouteError);
+			}
+		}
+	}
+
+	TOptional<int32> StagesBitmask;
+	{
+		const TArray<TSharedPtr<FJsonValue>> StagesArr = GetJsonArray(Params, TEXT("stages"));
+		if (StagesArr.Num() > 0)
+		{
+			int32 Bitmask = 0;
+			FString StageError;
+			if (!ParseStagesToUsageBitmask(StagesArr, Bitmask, StageError)) return FMonolithActionResult::Error(StageError);
+			StagesBitmask = Bitmask;
+		}
+	}
+
+	// --- Resolve and SHAPE-CHECK the template, still before any mutation -----------------------
+	UNiagaraScript* Template = LoadObject<UNiagaraScript>(nullptr, *TemplatePath);
+	if (!Template)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load template_module '%s'. NOTHING WAS CREATED."), *TemplatePath));
+	}
+	if (Template->Usage != ENiagaraScriptUsage::Module)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("template_module '%s' is not a Module script (usage: %s). NOTHING WAS CREATED."),
+			*TemplatePath, *MonolithNiagaraHelpers::DescribeScriptUsage(Template->Usage)));
+	}
+	{
+		UNiagaraScriptSource* TemplateSource = Cast<UNiagaraScriptSource>(Template->GetLatestSource());
+		if (!TemplateSource || !TemplateSource->NodeGraph)
+		{
+			return FMonolithActionResult::Error(TEXT("template_module has no graph. NOTHING WAS CREATED."));
+		}
+		UNiagaraGraph* TG = TemplateSource->NodeGraph;
+		TArray<UNiagaraNodeOutput*> TOutNodes;          TG->GetNodesOfClass<UNiagaraNodeOutput>(TOutNodes);
+		TArray<UNiagaraNodeInput*> TInNodes;            TG->GetNodesOfClass<UNiagaraNodeInput>(TInNodes);
+		TArray<UNiagaraNodeParameterMapGet*> TGetNodes; TG->GetNodesOfClass<UNiagaraNodeParameterMapGet>(TGetNodes);
+		TArray<UNiagaraNodeParameterMapSet*> TSetNodes; TG->GetNodesOfClass<UNiagaraNodeParameterMapSet>(TSetNodes);
+		if (TOutNodes.Num() != 1 || TInNodes.Num() != 1 || TGetNodes.Num() != 1 || TSetNodes.Num() != 1 || TG->Nodes.Num() != 4)
+		{
+			// Refused loudly rather than "handled": a template with extra content silently becomes
+			// part of every module built from it, and the whole value of this path is that the
+			// starting point is known-good and known-empty.
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("template_module must be an EMPTY module graph: exactly 4 nodes — 1 Output, 1 Input "
+					 "(ParameterMap), 1 ParameterMapGet, 1 ParameterMapSet. Found %d nodes (%d Output, %d Input, "
+					 "%d MapGet, %d MapSet). Use a pristine hand-authored module such as "
+					 "/Game/FX/_Probes/2026-08-16/NM_Empty. NOTHING WAS CREATED."),
+				TG->Nodes.Num(), TOutNodes.Num(), TInNodes.Num(), TGetNodes.Num(), TSetNodes.Num()));
+		}
+	}
+
+	// --- Duplicate ----------------------------------------------------------------------------
+	const FString DestPath = FPackageName::GetLongPackagePath(SavePath);
+	const FString NewName = FPackageName::GetLongPackageAssetName(SavePath);
+
+	IAssetTools& AT = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+	UNiagaraScript* Script = Cast<UNiagaraScript>(AT.DuplicateAsset(NewName, DestPath, Template));
+	if (!Script) return FMonolithActionResult::Error(TEXT("DuplicateAsset failed"));
+
+	UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Script->GetLatestSource());
+	UNiagaraGraph* Graph = (Source != nullptr) ? Source->NodeGraph : nullptr;
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"The duplicated script has no graph. The asset EXISTS on disk and is broken — delete it before retrying."));
+	}
+
+	const UEdGraphSchema_Niagara* Schema = Cast<UEdGraphSchema_Niagara>(Graph->GetSchema());
+	if (!Schema) Schema = GetDefault<UEdGraphSchema_Niagara>();
+
+	TArray<UNiagaraNodeParameterMapGet*> GetNodes; Graph->GetNodesOfClass<UNiagaraNodeParameterMapGet>(GetNodes);
+	TArray<UNiagaraNodeParameterMapSet*> SetNodes; Graph->GetNodesOfClass<UNiagaraNodeParameterMapSet>(SetNodes);
+	UNiagaraNodeParameterMapGet* MapGetNode = GetNodes.Num() == 1 ? GetNodes[0] : nullptr;
+	UNiagaraNodeParameterMapSet* MapSetNode = SetNodes.Num() == 1 ? SetNodes[0] : nullptr;
+	if (!MapGetNode || !MapSetNode)
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"The duplicate lost its ParameterMapGet/Set nodes — DuplicateAsset did not deep-copy the graph. "
+			"The asset EXISTS on disk; delete it and report this, it invalidates the premise of this action."));
+	}
+
+	// Record what came along from the template, so nobody mistakes inherited parameters for ours.
+	TArray<TSharedPtr<FJsonValue>> InheritedPins;
+	for (const UEdGraphPin* Pin : MapGetNode->Pins)
+	{
+		if (Pin->Direction == EGPD_Output && !Pin->PinName.IsNone() && Pin->PinName != TEXT("Add"))
+			InheritedPins.Add(MakeShared<FJsonValueString>(Pin->PinName.ToString()));
+	}
+	for (const UEdGraphPin* Pin : MapSetNode->Pins)
+	{
+		if (Pin->Direction == EGPD_Input && !Pin->PinName.IsNone() && Pin->PinName != TEXT("Add")
+			&& Schema->PinToTypeDefinition(Pin) != FNiagaraTypeDefinition::GetParameterMapDef())
+			InheritedPins.Add(MakeShared<FJsonValueString>(Pin->PinName.ToString()));
+	}
+
+	// --- Metadata -----------------------------------------------------------------------------
+	Script->CheckVersionDataAvailable();
+	if (FVersionedNiagaraScriptData* ScriptData = Script->GetLatestScriptData())
+	{
+		if (!Description.IsEmpty()) ScriptData->Description = FText::FromString(Description);
+		if (StagesBitmask.IsSet()) ScriptData->ModuleUsageBitmask = StagesBitmask.GetValue();
+	}
+
+	// --- Add pins and route -------------------------------------------------------------------
+	TMap<FName, UEdGraphPin*> MapGetPinsByShortName;
+	for (const FPinDef& Input : ParsedInputs)
+	{
+		const FName ModuleInputName(*FString::Printf(TEXT("Module.%s"), *Input.Name));
+		if (UEdGraphPin* GetPin = UE::Niagara::Wizard::Utilities::AddReadParameterPin(Input.Type, ModuleInputName, MapGetNode))
+		{
+			MapGetPinsByShortName.Add(FName(*Input.Name), GetPin);
+		}
+	}
+	TMap<FName, UEdGraphPin*> MapSetPinsByShortName;
+	for (const FPinDef& Output : ParsedOutputs)
+	{
+		const FName OutputName = Output.WritePinName.IsEmpty()
+			? FName(*FString::Printf(TEXT("Output.%s"), *Output.Name))
+			: FName(*Output.WritePinName);
+		if (UEdGraphPin* SetPin = UE::Niagara::Wizard::Utilities::AddWriteParameterPin(Output.Type, OutputName, MapSetNode))
+		{
+			MapSetPinsByShortName.Add(FName(*Output.Name), SetPin);
+		}
+	}
+	for (const TPair<int32, int32>& Route : RoutePairs)
+	{
+		UEdGraphPin* const* GetPin = MapGetPinsByShortName.Find(FName(*ParsedInputs[Route.Key].Name));
+		UEdGraphPin* const* SetPin = MapSetPinsByShortName.Find(FName(*ParsedOutputs[Route.Value].Name));
+		if (GetPin && SetPin) Schema->TryCreateConnection(*GetPin, *SetPin);
+	}
+
+	// --- Default mode (I-12: never leave an exposed parameter in fail mode) ---------------------
+	{
+		ENiagaraDefaultMode DesiredMode = ENiagaraDefaultMode::Value;
+		if (Params->HasField(TEXT("default_mode")))
+		{
+			const FString ModeStr = Params->GetStringField(TEXT("default_mode")).ToLower().Replace(TEXT("_"), TEXT(""));
+			if (ModeStr == TEXT("binding")) DesiredMode = ENiagaraDefaultMode::Binding;
+			else if (ModeStr == TEXT("custom")) DesiredMode = ENiagaraDefaultMode::Custom;
+			else if (ModeStr == TEXT("failifpreviouslynotset") || ModeStr == TEXT("fail")) DesiredMode = ENiagaraDefaultMode::FailIfPreviouslyNotSet;
+			else if (ModeStr != TEXT("value"))
+			{
+				// The asset already exists at this point, so this is reported, not rolled back
+				// (CancelTransaction does not roll back — see the skill's settled note).
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Unknown default_mode '%s' (value | binding | custom | fail_if_previously_not_set). "
+						 "THE ASSET WAS ALREADY CREATED at %s with engine-default modes — fix it with "
+						 "set_script_parameter_meta or delete it."),
+					*Params->GetStringField(TEXT("default_mode")), *Script->GetPathName()));
+			}
+		}
+		TArray<FName> DeclaredNames;
+		for (const FPinDef& In : ParsedInputs) DeclaredNames.Add(FName(*FString::Printf(TEXT("Module.%s"), *In.Name)));
+		for (const FPinDef& Out : ParsedOutputs)
+		{
+			DeclaredNames.Add(Out.WritePinName.IsEmpty()
+				? FName(*FString::Printf(TEXT("Output.%s"), *Out.Name))
+				: FName(*Out.WritePinName));
+		}
+		for (const FName& VarName : DeclaredNames)
+		{
+			if (UNiagaraScriptVariable* SV = Graph->GetScriptVariable(VarName)) SV->DefaultMode = DesiredMode;
+		}
+	}
+
+	MapSetNode->MarkNodeRequiresSynchronization(TEXT("MonolithModuleFromTemplate"), true);
+
+	const FMonolithSaveOutcome SaveOutcome = NA_SaveObjectPackage(Script);
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("asset_path"), Script->GetPathName());
+	Result->SetStringField(TEXT("template_module"), Template->GetPathName());
+	Result->SetStringField(TEXT("graph_shape"), TEXT("node_graph"));
+	Result->SetBoolField(TEXT("has_custom_hlsl"), false);
+	Result->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
+	Result->SetStringField(TEXT("script_usage"), MonolithNiagaraHelpers::DescribeScriptUsage(ENiagaraScriptUsage::Module));
+
+	TArray<TSharedPtr<FJsonValue>> InputPinNames, OutputPinNames;
+	for (const FPinDef& P : ParsedInputs) InputPinNames.Add(MakeShared<FJsonValueString>(P.Name));
+	for (const FPinDef& P : ParsedOutputs)
+		OutputPinNames.Add(MakeShared<FJsonValueString>(P.WritePinName.IsEmpty()
+			? FString::Printf(TEXT("Output.%s"), *P.Name) : P.WritePinName));
+	Result->SetArrayField(TEXT("input_pins"), InputPinNames);
+	Result->SetArrayField(TEXT("output_pins"), OutputPinNames);
+	if (InheritedPins.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("inherited_from_template"), InheritedPins);
+		Result->SetStringField(TEXT("inherited_note"),
+			TEXT("These parameter pins came from the TEMPLATE, not from this call. A template should be pristine; "
+				 "if you did not intend these, pick a cleaner template_module."));
+	}
+	if (StagesBitmask.IsSet()) Result->SetNumberField(TEXT("module_usage_bitmask"), StagesBitmask.GetValue());
+	Result->SetStringField(TEXT("premise_warning"),
+		TEXT("UNPROVEN PREMISE: this action assumes IAssetTools::DuplicateAsset carries over the creation-time "
+			 "state that distinguishes a hand-authored module from a constructed one. Before trusting it, "
+			 "project:export_asset_text this asset and the template and confirm they differ only in name, path "
+			 "and GUIDs. Read-back through typed readers proves nothing here — it already reported the two "
+			 "modules in the I-38 diff as near-identical."));
+
+	NA_ReportSave(Result, SaveOutcome, Script->GetPathName());
+	return NA_SuccessObj(Result);
+#endif // WITH_NIAGARA_WIZARD_PRIVATE
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleCreateFunctionFromHLSL(const TSharedPtr<FJsonObject>& Params)
