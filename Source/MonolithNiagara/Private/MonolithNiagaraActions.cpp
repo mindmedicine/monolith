@@ -3999,7 +3999,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleAddEmitter),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
-			.Required(TEXT("emitter_asset"), TEXT("string"), TEXT("Emitter asset path to add"))
+			.Required(TEXT("emitter_asset"), TEXT("string"), TEXT("Emitter asset path to add"), { TEXT("emitter_path"), TEXT("template"), TEXT("template_path") })
 			.Optional(TEXT("name"), TEXT("string"), TEXT("Custom name for the emitter"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_emitter"), TEXT("Remove an emitter from a Niagara system"),
@@ -4012,7 +4012,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleDuplicateEmitter),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
-			.Required(TEXT("source_emitter"), TEXT("string"), TEXT("Name of emitter to duplicate"))
+			.Required(TEXT("source_emitter"), TEXT("string"), TEXT("Name of emitter to duplicate"), { TEXT("emitter") })
 			.Optional(TEXT("new_name"), TEXT("string"), TEXT("Name for the duplicated emitter"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_emitter_enabled"), TEXT("Enable or disable an emitter"),
@@ -4033,7 +4033,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("property"), TEXT("string"), TEXT("Property name"))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property name"), { TEXT("property_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Property value"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("request_compile"), TEXT("Request compilation of a Niagara system"),
@@ -4070,7 +4070,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name"), TEXT("module") })
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_module_graph"), TEXT("Get the node graph of a module script. Function-call nodes also report 'function_specifiers' (e.g. a data-interface call's Identifier) when they carry any — that map is what the compiler reads, and it is not a pin, so nothing else exposes it."),
 		FMonolithActionHandler::CreateStatic(&HandleGetModuleGraph),
@@ -4132,8 +4132,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
-			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name"), TEXT("module") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"), { TEXT("input_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Value to set. Validated against the input's ACTUAL type; a value the type's own parser rejects is refused, never written. Composites take either spelling — \"1,2,3\" or \"(X=1,Y=2,Z=3)\" / \"(R=1,G=0.5,B=0,A=1)\" — and are re-spelled to whichever one that type parses, so read-back may differ from what you sent. Component count must match exactly."))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_input_binding"), TEXT("Bind a module input to a parameter"),
@@ -4141,8 +4141,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
-			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name"), TEXT("module") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"), { TEXT("input_name") })
 			.Required(TEXT("binding"), TEXT("string"), TEXT("Parameter binding path"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_input_di"), TEXT("Set a data interface on a module input"),
@@ -4150,8 +4150,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
-			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name"), TEXT("module") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"), { TEXT("input_name") })
 			.Required(TEXT("di_class"), TEXT("string"), TEXT("Data interface class name"))
 			.Optional(TEXT("config"), TEXT("object"), TEXT("Data interface configuration"))
 			.Build());
@@ -4581,8 +4581,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
-			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module"), TEXT("module_name") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Input parameter name"), { TEXT("input_name") })
 			.Required(TEXT("keys"), TEXT("array"), TEXT("Array of curve key objects"))
 			.Build());
 
@@ -4592,7 +4592,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("class"), TEXT("string"), TEXT("Renderer class (e.g. Sprite, Mesh, Ribbon)"))
+			.Required(TEXT("class"), TEXT("string"), TEXT("Renderer class (e.g. Sprite, Mesh, Ribbon)"), { TEXT("renderer_class"), TEXT("renderer_type") })
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_renderer"), TEXT("Remove a renderer from an emitter"),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveRenderer),
@@ -4615,7 +4615,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
 			.Required(TEXT("renderer_index"), TEXT("integer"), TEXT("Renderer index"))
-			.Required(TEXT("property"), TEXT("string"), TEXT("Property name"))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property name"), { TEXT("property_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Property value"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("get_renderer_bindings"), TEXT("Get renderer attribute bindings"),
@@ -4708,13 +4708,13 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&HandleGetSystemProperty),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
-			.Required(TEXT("property"), TEXT("string"), TEXT("Property name or snake_case alias: warmup_time, determinism, random_seed, max_pool_size, etc."))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property name or snake_case alias: warmup_time, determinism, random_seed, max_pool_size, etc."), { TEXT("property_name") })
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_system_property"), TEXT("Set a system-level property (WarmupTime, bDeterminism, etc.)"),
 		FMonolithActionHandler::CreateStatic(&HandleSetSystemProperty),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
-			.Required(TEXT("property"), TEXT("string"), TEXT("Property: WarmupTime, WarmupTickCount, WarmupTickDelta, bFixedTickDelta, FixedTickDeltaTime, bDeterminism, RandomSeed, bSupportLargeWorldCoordinates, bNeedsSortedSignificanceHandling, SignificanceHandlerLink, MaxPoolSize"))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property: WarmupTime, WarmupTickCount, WarmupTickDelta, bFixedTickDelta, FixedTickDeltaTime, bDeterminism, RandomSeed, bSupportLargeWorldCoordinates, bNeedsSortedSignificanceHandling, SignificanceHandlerLink, MaxPoolSize"), { TEXT("property_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Property value"))
 			.Build());
 
@@ -4724,8 +4724,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"))
-			.Required(TEXT("input"), TEXT("string"), TEXT("Static switch input name"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node name"), { TEXT("module_name") })
+			.Required(TEXT("input"), TEXT("string"), TEXT("Static switch input name"), { TEXT("input_name") })
 			.Required(TEXT("value"), TEXT("string"), TEXT("Value to set (true/false for bool, enum value name for enums, integer for int switches)"))
 			.Build());
 
@@ -4948,7 +4948,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
-			.Required(TEXT("property"), TEXT("string"), TEXT("Property name or snake_case alias (sim_target, local_space, determinism, bounds_mode, random_seed, allocation_mode, pre_allocation_count, requires_persistent_ids, max_gpu_particles_spawn_per_frame)"))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property name or snake_case alias (sim_target, local_space, determinism, bounds_mode, random_seed, allocation_mode, pre_allocation_count, requires_persistent_ids, max_gpu_particles_spawn_per_frame)"), { TEXT("property_name") })
 			.Build());
 
 	// --- Phase 5: Renderer & DI Improvements (4 new) ---
@@ -4962,7 +4962,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name"))
 			.Required(TEXT("renderer_index"), TEXT("integer"), TEXT("Renderer index"))
-			.Required(TEXT("mesh"), TEXT("string"), TEXT("StaticMesh asset path"))
+			.Required(TEXT("mesh"), TEXT("string"), TEXT("StaticMesh asset path"), { TEXT("mesh_path") })
 			.Optional(TEXT("mesh_index"), TEXT("integer"), TEXT("Mesh slot index (default: 0)"))
 			.Optional(TEXT("scale"), TEXT("object"), TEXT("Scale {x,y,z} (default: 1,1,1)"))
 			.Optional(TEXT("rotation"), TEXT("object"), TEXT("Rotation {pitch,yaw,roll} in degrees"))
@@ -5172,7 +5172,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
 			.Required(TEXT("emitter"), TEXT("string"), TEXT("Emitter name or handle ID"))
-			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID"))
+			.Required(TEXT("module_node"), TEXT("string"), TEXT("Module node GUID"), { TEXT("module_name") })
 			.Optional(TEXT("input"), TEXT("string"), TEXT("Static switch name — omit to list all"))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("import_system_spec"),
@@ -10953,6 +10953,34 @@ static const TMap<FString, FMonolithNiagaraBatchOp>& NA_GetBatchOpTable()
 	return Table;
 }
 
+// ----------------------------------------------------------------------------
+// GAP #72 — which registered action's schema validates a given batch op.
+//
+// For 128 of the table's 132 op names the answer is "the action of the same name", because
+// the op name IS the registered action name. FOUR are not: they are batch-only spellings
+// that never existed as actions, only as extra keys pointing at a shared arm of the old
+// else-if chain (see the `// alias` comments in the table above). Validating those against
+// a schema looked up by their own name would find nothing.
+//
+// This map is the ONLY place the two naming worlds meet, and it is deliberately adjacent to
+// the table so the pairing can be audited by eye. If you add an alias key to the table, add
+// it here too — an omission is not silent-wrong, it just leaves that spelling unvalidated
+// (ValidateActionParams fails open on an unknown action), which is today's behaviour.
+// ----------------------------------------------------------------------------
+static const TMap<FString, FString>& NA_GetBatchOpSchemaNames()
+{
+	static const TMap<FString, FString> Names = []
+	{
+		TMap<FString, FString> M;
+		M.Add(TEXT("set_module_input"), TEXT("set_module_input_value"));
+		M.Add(TEXT("set_module_binding"), TEXT("set_module_input_binding"));
+		M.Add(TEXT("add_user_param"), TEXT("add_user_parameter"));
+		M.Add(TEXT("remove_user_param"), TEXT("remove_user_parameter"));
+		return M;
+	}();
+	return Names;
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedPtr<FJsonObject>& Params)
 {
 	// ------------------------------------------------------------------------------
@@ -11130,7 +11158,50 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		const TMap<FString, FMonolithNiagaraBatchOp>& OpTable = NA_GetBatchOpTable();
 		if (const FMonolithNiagaraBatchOp* OpHandler = OpTable.Find(OpName))
 		{
-			SubResult = (*OpHandler)(SubParams);
+			// ----------------------------------------------------------------------------
+			// GAP #72 — validate the sub-op against its action's schema before dispatching.
+			//
+			// Because this table calls handlers directly, nothing about a sub-op ever reached
+			// FMonolithToolRegistry::ExecuteAction, so neither required-param validation nor
+			// declared-alias rewriting ran for it. The measured consequence: `list_renderers`
+			// with `emitter_name` instead of `emitter` answered "Emitter not found" — blaming
+			// the ASSET for the CALLER's typo — where the identical call made directly answered
+			// "Missing required param(s): [emitter]".
+			//
+			// VALIDATION is borrowed from the registry; DISPATCH IS NOT, and that separation is
+			// the whole design. Routing sub-ops through ExecuteAction was measured and rejected:
+			// it appends its own `warnings` array to every successful result, and SubParams
+			// always carries the `op` key, which no schema declares — so EVERY sub-op of EVERY
+			// batch would have gained an unknown-param warning, flipping `warned_steps` from 0
+			// to N and adding `warned_op_indices` + `warnings_note` to the envelope of batches
+			// that are correct today. It would also have broken the four batch-only op
+			// spellings, which are not registered actions at all.
+			//
+			// SubParams is normalised IN PLACE, so `system_path` (including the batch's own
+			// injection above) arrives at the handler rewritten to `asset_path`, exactly as a
+			// top-level call would deliver it.
+			//
+			// A rejection is reported as this op's own failure and the loop continues, which is
+			// the batch's existing not-atomic contract — a bad op has never aborted the batch
+			// and still does not.
+			// ----------------------------------------------------------------------------
+			FString SchemaAction = OpName;
+			if (const FString* Canonical = NA_GetBatchOpSchemaNames().Find(OpName))
+			{
+				SchemaAction = *Canonical;
+			}
+
+			const FMonolithActionResult ParamCheck =
+				FMonolithToolRegistry::Get().ValidateActionParams(TEXT("niagara"), SchemaAction, SubParams);
+
+			if (!ParamCheck.bSuccess)
+			{
+				SubResult = ParamCheck;
+			}
+			else
+			{
+				SubResult = (*OpHandler)(SubParams);
+			}
 		}
 		else
 		{

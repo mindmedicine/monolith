@@ -144,6 +144,92 @@ bool FMonolithParamSchema::IsStrictParamsEnabled()
 	return Val == TEXT("1");
 }
 
+// -----------------------------------------------------------------------------
+// Required-param check, factored out of ExecuteAction so ExecuteAction and
+// ValidateActionParams share ONE implementation of the rule and ONE wording of the
+// error. Both callers used to be impossible: the check lived inline in ExecuteAction,
+// so a dispatcher that called handlers directly (batch_execute's op table) could not
+// reuse it and simply went unvalidated — gap #72.
+//
+// Returns true when nothing required is missing. On false, OutError carries the
+// message ExecuteAction has always emitted, byte-for-byte: the caller supplies the
+// error CODE so the existing contract (default -32603) is not disturbed.
+//
+// Assumes alias rewriting has already run (FMonolithParamSchema::ApplyAliases), which
+// is what lets a legacy spelling satisfy a required canonical param.
+// -----------------------------------------------------------------------------
+static bool MonolithCheckRequiredParams(
+	const TSharedPtr<FJsonObject>& Schema,
+	const TSharedPtr<FJsonObject>& Params,
+	FString& OutError)
+{
+	if (!Schema.IsValid() || !Params.IsValid())
+	{
+		return true;
+	}
+
+	TArray<FString> Missing;
+	// Alias hints are read out of the SCHEMA, so the error names only the spellings this
+	// particular action actually accepts. A hardcoded `system_path` hint here would
+	// advertise it in all 25 namespaces, where it is meaningful in one.
+	TArray<FString> AliasHints;
+	for (const auto& Pair : Schema->Values)
+	{
+		const FString PairKeyStr = MonolithKeyToString(Pair.Key);
+
+		const TSharedPtr<FJsonObject>* ParamDef = nullptr;
+		if (Pair.Value->TryGetObject(ParamDef) && ParamDef)
+		{
+			bool bRequired = false;
+			(*ParamDef)->TryGetBoolField(TEXT("required"), bRequired);
+			if (bRequired && !Params->HasField(PairKeyStr))
+			{
+				// Legacy wbp_path / asset_path aliasing: accept asset_path as substitute for wbp_path
+				// (only fires for schemas not migrated to K2 aliases).
+				if (PairKeyStr == TEXT("wbp_path") && Params->HasField(TEXT("asset_path")))
+					continue;
+				Missing.Add(PairKeyStr);
+
+				const TArray<TSharedPtr<FJsonValue>>* AliasArr = nullptr;
+				if ((*ParamDef)->TryGetArrayField(TEXT("aliases"), AliasArr) && AliasArr)
+				{
+					TArray<FString> Spellings;
+					for (const TSharedPtr<FJsonValue>& AV : *AliasArr)
+					{
+						FString A;
+						if (AV.IsValid() && AV->TryGetString(A))
+						{
+							Spellings.Add(FString::Printf(TEXT("'%s'"), *A));
+						}
+					}
+					if (Spellings.Num() > 0)
+					{
+						AliasHints.Add(FString::Printf(
+							TEXT(" '%s' may also be spelled %s (alias); supply exactly one of them."),
+							*PairKeyStr, *FString::Join(Spellings, TEXT(" or "))));
+					}
+				}
+			}
+		}
+	}
+
+	if (Missing.Num() == 0)
+	{
+		return true;
+	}
+
+	TArray<FString> Provided;
+	for (const auto& P : Params->Values) Provided.Add(MonolithKeyToString(P.Key));
+	// The "NOTHING WAS READ OR CHANGED" clause is unconditional: it is true of every
+	// missing-param rejection, because this check runs before the handler is invoked.
+	OutError = FString::Printf(
+		TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields.%s NOTHING WAS READ OR CHANGED — this call did not reach the action."),
+		*FString::Join(Missing, TEXT(", ")),
+		*FString::Join(Provided, TEXT(", ")),
+		*FString::Join(AliasHints, TEXT("")));
+	return false;
+}
+
 // =============================================================================
 //  FMonolithToolRegistry
 // =============================================================================
@@ -387,61 +473,15 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	// this loop, so enforcing `asset_path` here does not break the Niagara callers that use it.
 	if (ActionInfo.ParamSchema.IsValid())
 	{
-		TArray<FString> Missing;
-		// Alias hints are read out of the SCHEMA, so the error names only the spellings this
-		// particular action actually accepts. A hardcoded `system_path` hint here would
-		// advertise it in all 25 namespaces, where it is meaningful in one.
-		TArray<FString> AliasHints;
-		for (const auto& Pair : ActionInfo.ParamSchema->Values)
+		// Body lives in MonolithCheckRequiredParams (top of this file) so that
+		// batch_execute's direct-dispatch table can apply the identical rule and emit the
+		// identical message via ValidateActionParams — gap #72. The error code stays the
+		// default (-32603): changing it would alter the client-visible contract for every
+		// missing-param error in every namespace.
+		FString MissingParamError;
+		if (!MonolithCheckRequiredParams(ActionInfo.ParamSchema, EffectiveParams, MissingParamError))
 		{
-			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
-
-			const TSharedPtr<FJsonObject>* ParamDef = nullptr;
-			if (Pair.Value->TryGetObject(ParamDef) && ParamDef)
-			{
-				bool bRequired = false;
-				(*ParamDef)->TryGetBoolField(TEXT("required"), bRequired);
-				if (bRequired && !EffectiveParams->HasField(PairKeyStr))
-				{
-					// Legacy wbp_path / asset_path aliasing: accept asset_path as substitute for wbp_path
-					// (only fires for schemas not migrated to K2 aliases).
-					if (PairKeyStr == TEXT("wbp_path") && EffectiveParams->HasField(TEXT("asset_path")))
-						continue;
-					Missing.Add(PairKeyStr);
-
-					const TArray<TSharedPtr<FJsonValue>>* AliasArr = nullptr;
-					if ((*ParamDef)->TryGetArrayField(TEXT("aliases"), AliasArr) && AliasArr)
-					{
-						TArray<FString> Spellings;
-						for (const TSharedPtr<FJsonValue>& AV : *AliasArr)
-						{
-							FString A;
-							if (AV.IsValid() && AV->TryGetString(A))
-							{
-								Spellings.Add(FString::Printf(TEXT("'%s'"), *A));
-							}
-						}
-						if (Spellings.Num() > 0)
-						{
-							AliasHints.Add(FString::Printf(
-								TEXT(" '%s' may also be spelled %s (alias); supply exactly one of them."),
-								*PairKeyStr, *FString::Join(Spellings, TEXT(" or "))));
-						}
-					}
-				}
-			}
-		}
-		if (Missing.Num() > 0)
-		{
-			TArray<FString> Provided;
-			for (const auto& P : EffectiveParams->Values) Provided.Add(MonolithKeyToString(P.Key));
-			// The "NOTHING WAS READ OR CHANGED" clause is unconditional: it is true of every
-			// missing-param rejection, because this check runs before the handler is invoked.
-			return FMonolithActionResult::Error(
-				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields.%s NOTHING WAS READ OR CHANGED — this call did not reach the action."),
-					*FString::Join(Missing, TEXT(", ")),
-					*FString::Join(Provided, TEXT(", ")),
-					*FString::Join(AliasHints, TEXT(""))));
+			return FMonolithActionResult::Error(MissingParamError);
 		}
 	}
 
@@ -580,6 +620,49 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	}
 
 	return ActionResult;
+}
+
+FMonolithActionResult FMonolithToolRegistry::ValidateActionParams(
+	const FString& Namespace,
+	const FString& Action,
+	const TSharedPtr<FJsonObject>& Params) const
+{
+	// Copy the schema out under the lock and release it before touching Params. The schema is
+	// immutable once registered, and holding the registry lock across caller-supplied JSON is
+	// exactly the kind of scope creep ExecuteAction already avoids (it unlocks before the
+	// handler runs).
+	TSharedPtr<FJsonObject> Schema;
+	{
+		FScopeLock Lock(&RegistryLock);
+		const FRegisteredAction* RegAction = Actions.Find(MakeKey(Namespace, Action));
+		if (!RegAction)
+		{
+			// Unknown action — fail open. See the header comment: the caller owns that error.
+			return FMonolithActionResult::Success(nullptr);
+		}
+		Schema = RegAction->Info.ParamSchema;
+	}
+
+	if (!Schema.IsValid() || !Params.IsValid())
+	{
+		return FMonolithActionResult::Success(nullptr);
+	}
+
+	// Same order as ExecuteAction: alias rewrite first, so a legacy spelling can satisfy a
+	// required canonical param rather than being reported missing while sitting right there.
+	FString Collision;
+	if (!FMonolithParamSchema::ApplyAliases(Schema, Params, Collision))
+	{
+		return FMonolithActionResult::Error(Collision, FMonolithJsonUtils::ErrInvalidParams);
+	}
+
+	FString MissingParamError;
+	if (!MonolithCheckRequiredParams(Schema, Params, MissingParamError))
+	{
+		return FMonolithActionResult::Error(MissingParamError);
+	}
+
+	return FMonolithActionResult::Success(nullptr);
 }
 
 TArray<FString> FMonolithToolRegistry::GetNamespaces() const

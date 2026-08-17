@@ -123,6 +123,31 @@ public:
 	/** Execute an action by namespace + action name */
 	FMonolithActionResult ExecuteAction(const FString& Namespace, const FString& Action, const TSharedPtr<FJsonObject>& Params);
 
+	/**
+	 * Validate and normalise a param object against a registered action's schema WITHOUT
+	 * dispatching it: the same declared-alias rewrite and required-param check ExecuteAction
+	 * performs, and the same error text, exposed for dispatchers that invoke handlers directly.
+	 *
+	 * Exists for gap #72. batch_execute dispatches its sub-ops through a function-pointer
+	 * table, so nothing about them ever reached ExecuteAction and neither validation nor alias
+	 * rewriting ran: a sub-op naming a param wrongly reached the handler with the param simply
+	 * absent, and came back with the handler's guess at what was wrong ("Emitter not found")
+	 * instead of the dispatch layer's fact ("Missing required param(s): [emitter]").
+	 *
+	 * `Params` is normalised IN PLACE — declared aliases are rewritten to their canonical
+	 * spelling, so the handler receives exactly what a top-level call would hand it.
+	 *
+	 * Deliberately does NOT run the K3 unknown-key check, the K4 string-decode, or any
+	 * response shaping. Those mutate the result envelope, and a batch's envelope is its
+	 * caller-visible contract; this call is validation only.
+	 *
+	 * Returns SUCCESS when the params are acceptable AND when the action is not registered at
+	 * all. Failing open on an unknown action is deliberate: a dispatcher may know op spellings
+	 * the registry does not, and it should answer for those with its own unknown-op error
+	 * rather than have this one contradict it. Call HasAction() first if that matters.
+	 */
+	FMonolithActionResult ValidateActionParams(const FString& Namespace, const FString& Action, const TSharedPtr<FJsonObject>& Params) const;
+
 	/** Get all registered namespaces */
 	TArray<FString> GetNamespaces() const;
 

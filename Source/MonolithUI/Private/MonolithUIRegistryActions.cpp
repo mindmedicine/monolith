@@ -412,7 +412,7 @@ void FMonolithUIRegistryActions::RegisterActions(FMonolithToolRegistry& Registry
              "the editor's 'add variable' affordance."),
         FMonolithActionHandler::CreateStatic(&MonolithUIRegistryPhase2::HandleAddWidgetVariable),
         FParamSchemaBuilder()
-            .RequiredAssetPath(TEXT("wbp_path"), TEXT("Widget Blueprint path (alias: asset_path)"))
+            .RequiredAssetPath(TEXT("wbp_path"), TEXT("Widget Blueprint path (alias: asset_path)"), { TEXT("asset_path") })
             .Required(TEXT("var_name"), TEXT("string"), TEXT("New variable FName (uniqueness enforced by AddMemberVariable)"))
             .Required(TEXT("var_type"), TEXT("string"), TEXT("Type token. See action description for grammar."))
             .Optional(TEXT("default_value"), TEXT("string"), TEXT("Default value as UE text format (engine ImportText grammar)"))
