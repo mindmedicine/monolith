@@ -1584,7 +1584,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleBakeBlendSpace(const TSha
 	Root->SetBoolField(TEXT("saved"), false);
 	// 2D triangulation needs >= 3 samples; fewer than that is degenerate (resample is a no-op for 0).
 	if (SampleCount > 0 && SampleCount < 3 && !BS->IsA<UBlendSpace1D>())
-		Root->SetStringField(TEXT("warning"),
+		FMonolithJsonUtils::AddWarning(Root,
 			TEXT("Blend space has fewer than 3 samples — 2D triangulation is degenerate until more are added."));
 	return FMonolithActionResult::Success(Root);
 }
