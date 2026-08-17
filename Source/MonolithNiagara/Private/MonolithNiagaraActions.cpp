@@ -8463,19 +8463,35 @@ FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TShare
 		// factory's DynamicInput case never touches them, NiagaraScriptFactory.cpp:120-143). So the
 		// correct shape is to leave them alone, which is what the dynamic input path now does.
 		//
-		// The MODULE path is DELIBERATELY LEFT UNCHANGED. By the reading above it carries the same
-		// defect, but create_module_from_hlsl is a validated path with placed-and-compiled modules
-		// behind it, and changing it here would be an unmeasured behaviour change in the same batch
-		// as this fix. Flagged for a separate, validated dispatch — see the staging note; the cheap
-		// check is one module with one input, added to a stack, compiled.
+		// THE MODULE PATH CARRIED THE SAME DEFECT AND IS NOW FIXED TOO (2026-08-17, Tim approved).
+		// The deferral above was discharged by the dispatch it asked for. What it predicted was
+		// half right, and the correction matters:
+		//
+		//   NOT "the placed caller has no ParameterMap pin". It HAS one at placement, and the
+		//   system compiles clean at 0 errors / op_count 33-36. The pin is created outside the
+		//   IsExposed()-gated AllocateDefaultPins loop.
+		//
+		//   What actually happens is that the pin is ORPHANED, NOT ABSENT, and only once something
+		//   moves the graph's ChangeId and forces the caller to reallocate — a renamed script
+		//   parameter being the trigger we hit. Measured on NM_Ctor_D: bOrphanedPin False -> True
+		//   across the rename while CachedChangeId moved, then 2x "Error compiling Pin - Node:
+		//   Output Particle Update Pin: Out - " with op_count 0. A duplicated control whose input
+		//   node sits at the CDO (bExposed=1) took the identical rename and stayed at 0 errors with
+		//   bOrphanedPin False. Only the INPUT pin orphans; OutputMap survives, matching the
+		//   exposure gate being input-side only.
+		//
+		// That is invariant I-38, and this block was its cause: all three constructed creation
+		// routes (create_module, create_module + hlsl, create_module_from_hlsl) share this function,
+		// which is why all three failed identically while the duplication route did not.
+		//
+		// The fix is to do nothing at all here — the engine's own factory leaves ExposureOptions at
+		// their struct defaults (bExposed=1, bRequired=1, bCanAutoBind=0, bHidden=0), so matching it
+		// means not writing them. Evidence:
+		// Docs/staging/2026-08-17-validator-exposure-discriminator.md.
+		//
+		// ⚠️ This does NOT retroactively repair modules already created with bExposed=false; those
+		// carry it on disk and still orphan on a rename.
 		// ------------------------------------------------------------------------
-		if (!bIsDynamicInput)
-		{
-			InputNode->ExposureOptions.bExposed = false;
-			InputNode->ExposureOptions.bRequired = false;
-			InputNode->ExposureOptions.bHidden = true;
-			InputNode->ExposureOptions.bCanAutoBind = true;
-		}
 	}
 	else if (ParsedInputs.Num() > 0)
 	{
