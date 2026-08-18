@@ -256,4 +256,124 @@ namespace MonolithNiagaraStackDependency
 		default:                                   return TEXT("unknown");
 		}
 	}
+
+	/**
+	 * How much a non-satisfied verdict is worth ASSERTING.
+	 *
+	 * 🛑 WHY THIS EXISTS. A stack issue is about INTENT; a compile error is about VALIDITY (Tim,
+	 * 2026-08-18). The engine reports both classes through one channel, and the first version of this
+	 * checker inherited that conflation — it called every unmet dependency `is_problem: true`, which
+	 * makes it CONFIDENTLY WRONG on a real authoring pattern:
+	 *
+	 *   Every force module reads what it needs and WRITES TRANSIENTS (Output.Module.* /
+	 *   Transient.PhysicsForce / Transient.PhysicsDrag). Solve Forces and Velocity is what READS those
+	 *   transients and integrates them into position and velocity. Remove or disable the solver and
+	 *   the forces still compute their transients — they are simply never integrated. Tim's words:
+	 *   "sometimes I only need those transient values to write to NDC without actually influencing the
+	 *   particle's position or velocity. I sometimes use this in niagara fluids context where I want
+	 *   to have additional curl noise forces but let the fluid solver do the actual solving."
+	 *
+	 * So an absent or switched-off provider is a LEGITIMATE STACK, and a validator that flags it gets
+	 * ignored — which costs us every finding it would otherwise have got right.
+	 *
+	 * THE SPLIT IS PRINCIPLED, NOT A SPECIAL CASE. Nothing here knows the name
+	 * `SolveForcesAndVelocity`, or any module name at all. The question asked of each verdict is:
+	 * COULD AN AUTHOR HAVE PRODUCED THIS STATE ON PURPOSE, AS AN EXPRESSION OF INTENT?
+	 *
+	 *   - `Missing` — YES. Not adding a provider is exactly how you say "something else integrates
+	 *     this" or "I want the transients only".
+	 *   - `DisabledProvider` — YES, and more strongly: disabling a module is an explicit authoring
+	 *     ACT, not an omission. This is Tim's case verbatim.
+	 *   - `WrongOrder` — NO. The provider is present, so the intent to use it is unambiguous; only the
+	 *     ordering is wrong. There is no effect an author achieves by putting it on the wrong side.
+	 *   - `WrongVersion` — NO, for the same reason: a correctly-placed, enabled provider of a
+	 *     disallowed version is an accident of versioning, never a statement.
+	 *
+	 * 🛑 CALIBRATION — AN AuthorDecision VERDICT IS "PROBABLY WRONG, CONFIRM", NOT "PROBABLY FINE".
+	 * Tim, 2026-08-18: "98% of the cases we'll want the solver to be present and active. IF IT'S
+	 * INACTIVE, JUST ASK." The fluids/NDC pattern is the RARE case. So the split exists to stop us
+	 * ASSERTING what we cannot know — it does NOT downgrade the finding's visibility, and
+	 * `is_problem: false` must never be read as "no action needed". These findings sit in `findings[]`
+	 * alongside the definite ones, carry their own prominent count, and their remedy ASKS while
+	 * saying plainly that the usual answer is to add or enable the provider.
+	 *
+	 * ⚠️ And the stakes are asymmetric: the failure mode of a genuinely unmet dependency is that the
+	 * forces compute and are never integrated, so the system COMPILES CLEAN, LOOKS CORRECT AND DOES
+	 * NOTHING. No instrument we have can see it. A silent 2% false-ask is cheap; a silent 98% miss is
+	 * not.
+	 */
+	enum class EVerdictSeverity : uint8
+	{
+		/** The dependency is met. */
+		Satisfied,
+		/** Definitely wrong: the author's intent is unambiguous and the stack does not express it. */
+		DefiniteProblem,
+		/**
+		 * Unmet and PROBABLY wrong, but it could be deliberate — so we ask instead of asserting.
+		 * ⚠️ Not a lesser finding: usually it still wants fixing (see the calibration above).
+		 */
+		AuthorDecision
+	};
+
+	inline EVerdictSeverity ClassifyVerdict(EDependencyVerdict Verdict)
+	{
+		switch (Verdict)
+		{
+		case EDependencyVerdict::Satisfied:
+			return EVerdictSeverity::Satisfied;
+
+		// Provider present and unambiguously intended — only its placement/version is wrong.
+		case EDependencyVerdict::WrongOrder:
+		case EDependencyVerdict::WrongVersion:
+			return EVerdictSeverity::DefiniteProblem;
+
+		// The absence, or the deliberate switching-off, MAY ITSELF BE THE INTENT.
+		case EDependencyVerdict::Missing:
+		case EDependencyVerdict::DisabledProvider:
+		default:
+			return EVerdictSeverity::AuthorDecision;
+		}
+	}
+
+	/**
+	 * Stable, machine-matchable severity names for the JSON payload.
+	 *
+	 * ⚠️ The advisory value is "probable_problem", NOT "question" or "info". A caller sorting or
+	 * filtering on this string must not be able to read the advisory class as benign — that is the
+	 * whole calibration above, expressed in the one field a skimming reader actually sees.
+	 */
+	inline const TCHAR* SeverityToString(EVerdictSeverity Severity)
+	{
+		switch (Severity)
+		{
+		case EVerdictSeverity::Satisfied:       return TEXT("satisfied");
+		case EVerdictSeverity::DefiniteProblem: return TEXT("problem");
+		case EVerdictSeverity::AuthorDecision:  return TEXT("probable_problem");
+		default:                                return TEXT("unknown");
+		}
+	}
+
+	/**
+	 * The one-line weight statement that ships INSIDE each finding, so a caller reading only the
+	 * findings array (never how_to_read) still gets the calibration.
+	 */
+	inline const TCHAR* SeverityMeaning(EVerdictSeverity Severity)
+	{
+		switch (Severity)
+		{
+		case EVerdictSeverity::Satisfied:
+			return TEXT("MET — a provider is present, enabled, correctly ordered and of an allowed version.");
+		case EVerdictSeverity::DefiniteProblem:
+			return TEXT("DEFINITELY WRONG — a provider IS present, so the intent to use it is unambiguous and only "
+						"its placement or version is off. Fix it.");
+		case EVerdictSeverity::AuthorDecision:
+			return TEXT("PROBABLY WRONG — CONFIRM, DO NOT IGNORE. In the large majority of stacks this provider "
+						"should be present and active, and an unmet dependency of this kind compiles clean, looks "
+						"correct and silently does nothing. It is only NOT a defect if something else performs the "
+						"integration or the transient values are consumed directly. is_problem is false because we "
+						"cannot tell from metadata — NOT because no action is needed.");
+		default:
+			return TEXT("unknown");
+		}
+	}
 }

@@ -4555,7 +4555,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("version"), TEXT("string"), TEXT("Version GUID to read, or 'exposed' (default). Omit to read the exposed version; call once and read available_versions to discover GUIDs. A module PLACED in a stack pins its own version via SelectedScriptVersion and may differ from the exposed one."), { TEXT("version_guid") })
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("validate_stack_dependencies"),
-		TEXT("READ-ONLY: check a Niagara SYSTEM for unmet or mis-ordered module dependencies, WITHOUT requiring a compile. Walks each scope's placed modules in execution order (system spawn/update, then per emitter: emitter spawn/update, particle spawn/update, enabled simulation stages) and evaluates every module's declared RequiredDependencies against the modules that advertise them via ProvidedDependencies. Honours Pre/Post ordering, the SameScript constraint (a provider in another stage does NOT satisfy it), disabled providers, RequiredVersion, and the OnlyEvaluateInScriptUsage gate. Per finding: the dependent module and the stage it was judged in, the required id, Pre/Post, whether it is missing / mis-ordered / disabled / wrong-version, the stack indices involved, the dependency's own description text, every candidate provider with the reason it was rejected, and stage-filtered suggested providers (which is why Particle Update suggests Solve Forces and Velocity while Particle Spawn suggests Apply Initial Forces). NEVER modifies anything. Event-handler stages and disabled simulation stages are reported in skipped[] — the ENGINE's own check does not cover them either."),
+		TEXT("READ-ONLY: check a Niagara SYSTEM for unmet or mis-ordered module dependencies, WITHOUT requiring a compile. Walks each scope's placed modules in execution order (system spawn/update, then per emitter: emitter spawn/update, particle spawn/update, enabled simulation stages) and evaluates every module's declared RequiredDependencies against the modules that advertise them via ProvidedDependencies. Honours Pre/Post ordering, the SameScript constraint (a provider in another stage does NOT satisfy it), disabled providers, RequiredVersion, and the OnlyEvaluateInScriptUsage gate. Per finding: the dependent module and the stage it was judged in, the required id, Pre/Post, whether it is missing / mis-ordered / disabled / wrong-version, the stack indices involved, the dependency's own description text, every candidate provider with the reason it was rejected, and stage-filtered suggested providers (which is why Particle Update suggests Solve Forces and Velocity while Particle Spawn suggests Apply Initial Forces). A STACK ISSUE IS ABOUT INTENT, A COMPILE ERROR ABOUT VALIDITY, so findings split into two classes: is_problem (mis-ordered or wrong-version provider — it IS present, so the intent is unambiguous) versus needs_author_decision (missing or disabled provider — which is how an author says 'something else integrates this', e.g. a fluids solver, or 'I want the transients only', e.g. written to an NDC). The second class is UNMET AND PROBABLY WRONG, not informational — in most stacks the provider should be present and active, and such a stack compiles clean while silently doing nothing — so both classes appear in findings[], each carrying severity + severity_meaning. problem_count counts ONLY the first class (CHANGED 2026-08-18 — see problem_count_meaning in the payload); unconfirmed_problem_count the second; unmet_count is both, is the headline, and is what the editor's issue total compares against. NEVER modifies anything. Event-handler stages and disabled simulation stages are reported in skipped[] — the ENGINE's own check does not cover them either."),
 		FMonolithActionHandler::CreateStatic(&HandleValidateStackDependencies),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
@@ -25383,6 +25383,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptDetails(const TSha
 // AND fixes; only the issue half is ported. The value of a no-compile checker is that it is safe to
 // run on anything, and that evaporates the moment it can mutate.
 //
+// 🛑 IT ALSO NEVER ASSERTS MORE THAN IT KNOWS (2026-08-18). A STACK ISSUE IS ABOUT INTENT; A COMPILE
+// ERROR IS ABOUT VALIDITY. An unmet dependency can be a legitimate authoring pattern — force modules
+// write TRANSIENTS and the solver merely integrates them, so a stack with no solver still produces
+// those transients on purpose (a fluids solver doing the integration, or the values written straight
+// to an NDC). So findings carry a SEVERITY: `is_problem` for the unambiguous cases only, and
+// `needs_author_decision` for the ones only the author can settle. See ClassifyVerdict in
+// MonolithNiagaraStackDependency.h for the principle — no module name appears in that decision.
+//
+// ⚠️ BUT THE ADVISORY IS NOT A FOOTNOTE (Tim, 2026-08-18: "98% of the cases we'll want the solver to
+// be present and active. if it's inactive, just ask."). It lives in findings[] beside the definite
+// problems, carries its own `unconfirmed_problem_count`, ships a per-finding `severity_meaning`, and
+// its remedy says plainly that the usual answer is to add or enable the provider BEFORE asking
+// whether this stack is the exception. `is_problem: false` must never read as "no action needed".
+//
 // FIDELITY. The rules are a line-by-line port of NiagaraStackModuleItem.cpp:800-911 — see
 // MonolithNiagaraStackDependency.h for the decision core and its citations. The port was forced,
 // not chosen: FNiagaraStackGraphUtilities::DependencyUtilities carries NO export macro
@@ -25693,7 +25707,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 	int32 DependenciesEvaluated = 0;
 	int32 DependenciesNotEnforcedHere = 0;
 	int32 SatisfiedCount = 0;
+	// UnmetCount is problems + questions — i.e. what `problem_count` USED to be, kept because it is
+	// the number the editor's own issue list matches. See the response block for the split.
 	int32 UnmetCount = 0;
+	int32 DefiniteProblemCount = 0;
+	int32 AuthorDecisionCount = 0;
 
 	for (const FVSDScope& Scope : Scopes)
 	{
@@ -25771,6 +25789,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 
 				FVerdictDetail Detail;
 				const EDependencyVerdict Verdict = EvaluateDependency(Dep.Type, ModuleIndex, Candidates, Detail);
+				// INTENT vs VALIDITY — see MonolithNiagaraStackDependency.h::ClassifyVerdict. A
+				// missing or disabled provider can be exactly what the author meant (transients
+				// consumed elsewhere), so it is a QUESTION; a mis-ordered or wrong-version provider
+				// is present and therefore unambiguously intended, so it is a PROBLEM.
+				const EVerdictSeverity Severity = ClassifyVerdict(Verdict);
 
 				if (Verdict == EDependencyVerdict::Satisfied)
 				{
@@ -25780,12 +25803,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 				else
 				{
 					++UnmetCount;
+					if (Severity == EVerdictSeverity::DefiniteProblem) { ++DefiniteProblemCount; }
+					else                                              { ++AuthorDecisionCount; }
 				}
 
 				// --- the finding ----------------------------------------------------------------
 				TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
 				F->SetStringField(TEXT("status"), VerdictToString(Verdict));
-				F->SetBoolField(TEXT("is_problem"), Verdict != EDependencyVerdict::Satisfied);
+				F->SetStringField(TEXT("severity"), SeverityToString(Severity));
+				// The weight statement travels INSIDE the finding: a caller that reads findings[] and
+				// nothing else must still see that an advisory usually wants fixing.
+				F->SetStringField(TEXT("severity_meaning"), SeverityMeaning(Severity));
+				// 🛑 is_problem now means "this is DEFINITELY wrong", not "this is not satisfied".
+				// The two flags are mutually exclusive and both are false for a satisfied finding.
+				// ⚠️ is_problem=false is NOT "no action needed" — see needs_author_decision.
+				F->SetBoolField(TEXT("is_problem"), Severity == EVerdictSeverity::DefiniteProblem);
+				F->SetBoolField(TEXT("needs_author_decision"), Severity == EVerdictSeverity::AuthorDecision);
 
 				{
 					TSharedRef<FJsonObject> Mod = MakeShared<FJsonObject>();
@@ -25888,6 +25921,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 					const TCHAR* Side = Dep.Type == ENiagaraModuleDependencyType::PreDependency
 						? TEXT("ABOVE") : TEXT("BELOW");
 
+					// The two DefiniteProblem verdicts INSTRUCT; the two AuthorDecision verdicts ASK,
+					// and name the legitimate alternative so the reader can judge rather than obey.
 					switch (Verdict)
 					{
 					case EDependencyVerdict::WrongOrder:
@@ -25896,23 +25931,36 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 								 "(or move '%s' to the other side of it) in %s."),
 							*Dep.Id.ToString(), Side, *ModuleLabel, *ModuleLabel, *Module.StageKey);
 						break;
-					case EDependencyVerdict::DisabledProvider:
-						Remedy = FString::Printf(
-							TEXT("A module providing '%s' is correctly placed but DISABLED. Enable it — see "
-								 "candidate_providers."), *Dep.Id.ToString());
-						break;
 					case EDependencyVerdict::WrongVersion:
 						Remedy = FString::Printf(
 							TEXT("A module providing '%s' is correctly placed and enabled but its version does not "
 								 "satisfy required_version '%s'. Change its version — see candidate_providers."),
 							*Dep.Id.ToString(), *Dep.RequiredVersion);
 						break;
+					case EDependencyVerdict::DisabledProvider:
+						Remedy = FString::Printf(
+							TEXT("CONFIRM THIS IS DELIBERATE. A module providing '%s' is correctly placed but "
+								 "DISABLED, so it never runs and whatever '%s' writes is never consumed by it. In the "
+								 "large majority of stacks this provider should be present AND ACTIVE, so the usual "
+								 "fix is simply to enable it — see candidate_providers. It is only correct as it "
+								 "stands if something ELSE performs the integration (a Niagara fluids solver is the "
+								 "standing case) or the transient values are consumed directly (written to a Niagara "
+								 "Data Channel, or read by a later module) without ever affecting this particle. "
+								 "Which is it? Left unaddressed this compiles clean and silently does nothing."),
+							*Dep.Id.ToString(), *ModuleLabel);
+						break;
 					default:
 						Remedy = FString::Printf(
-							TEXT("No usable module provides '%s' in this scope. Add one %s '%s' in %s — see "
-								 "suggested_providers for the modules that both provide it and are allowed in that "
-								 "stage."),
-							*Dep.Id.ToString(), Side, *ModuleLabel, *Module.StageKey);
+							TEXT("CONFIRM THIS IS DELIBERATE. Nothing in this scope provides '%s', so whatever '%s' "
+								 "writes is never consumed by a provider of that id. In the large majority of stacks "
+								 "that provider should be present and active, so the usual fix is to add one %s '%s' "
+								 "in %s — see suggested_providers for the modules that both provide it and are "
+								 "allowed in that stage. It is only correct as it stands if something ELSE performs "
+								 "the integration (a Niagara fluids solver is the standing case) or the transient "
+								 "values are consumed directly (written to a Niagara Data Channel, or read by a later "
+								 "module) without ever affecting this particle. Which is it? Left unaddressed this "
+								 "compiles clean and silently does nothing."),
+							*Dep.Id.ToString(), *ModuleLabel, Side, *ModuleLabel, *Module.StageKey);
 						break;
 					}
 					F->SetStringField(TEXT("remedy"), Remedy);
@@ -25961,7 +26009,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 							Warnings.Add(FString::Printf(
 								TEXT("No module asset in the project advertises ProvidedDependencies '%s'%s. Either the "
 									 "id is misspelled on '%s', or the providing module is deprecated/hidden (both are "
-									 "filtered out, mirroring the editor). The dependency is still genuinely unmet."),
+									 "filtered out, mirroring the editor). The dependency is still unmet; whether that "
+									 "MATTERS is what the finding's severity asks."),
 								*Dep.Id.ToString(),
 								RequiredUsage.IsSet() ? *FString::Printf(TEXT(" and is allowed in %s"), *Module.StageKey) : TEXT(""),
 								*ModuleLabel));
@@ -25987,7 +26036,29 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 	R->SetStringField(TEXT("system_path"), SystemPath);
 	R->SetBoolField(TEXT("read_only"), true);
 	R->SetArrayField(TEXT("findings"), Findings);
-	R->SetNumberField(TEXT("problem_count"), UnmetCount);
+	// 🛑 problem_count CHANGED MEANING on 2026-08-18. It used to be every unmet dependency (the
+	// number the editor's issue list matches); it is now only the DEFINITELY-WRONG subset, so that
+	// it agrees with `is_problem` on the findings. The old number is still returned, under its own
+	// name, because evidence written before that date quotes it (3 on NS_FixBtn_A_MissingSolver,
+	// 2 on NS_FixBtn_B_WrongOrder — both of which are now unmet_count, not problem_count).
+	R->SetNumberField(TEXT("problem_count"), DefiniteProblemCount);
+	// ⚠️ Named "unconfirmed_problem", not "info" or "advisory". These findings USUALLY still want
+	// fixing — Tim, 2026-08-18: "98% of the cases we'll want the solver to be present and active. if
+	// it's inactive, just ask." The name must not invite a caller to ignore the count.
+	R->SetNumberField(TEXT("unconfirmed_problem_count"), AuthorDecisionCount);
+	R->SetNumberField(TEXT("unmet_count"), UnmetCount);
+	R->SetStringField(TEXT("problem_count_meaning"),
+		TEXT("CHANGED 2026-08-18: problem_count now counts ONLY findings with is_problem=true — "
+			 "dependencies whose provider is PRESENT but mis-ordered or of a disallowed version, i.e. cases "
+			 "where the author's intent is unambiguous. It NO LONGER counts missing or disabled providers; "
+			 "those are counted by unconfirmed_problem_count (findings with needs_author_decision=true). "
+			 "🛑 unconfirmed_problem_count IS NOT AN 'INFO' COUNT: in the large majority of stacks the "
+			 "provider should be present and active, so those findings usually still want fixing — they are "
+			 "separated only because we cannot tell a deliberate omission from a mistake by reading metadata. "
+			 "unmet_count = problem_count + unconfirmed_problem_count and is the OLD problem_count, i.e. the "
+			 "figure comparable to the editor's stack-issue total and to any number recorded before "
+			 "2026-08-18. TREAT unmet_count AS THE HEADLINE NUMBER; problem_count is the subset we are "
+			 "willing to assert without asking."));
 	R->SetNumberField(TEXT("satisfied_count"), SatisfiedCount);
 	R->SetNumberField(TEXT("modules_checked"), ModulesChecked);
 	R->SetNumberField(TEXT("dependencies_evaluated"), DependenciesEvaluated);
@@ -25995,8 +26066,25 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 	R->SetArrayField(TEXT("scopes"), ScopesJson);
 	R->SetArrayField(TEXT("skipped"), SkippedJson);
 	R->SetStringField(TEXT("how_to_read"),
-		TEXT("problem_count is the number of unmet or mis-ordered dependencies, and is intended to match what the "
-			 "Niagara editor reports as stack issues of this kind — WITHOUT requiring a compile. Each finding names "
+		TEXT("A STACK ISSUE IS ABOUT INTENT; A COMPILE ERROR IS ABOUT VALIDITY. An unmet dependency does not make a "
+			 "system invalid — it means the stack may not do what its author meant. So findings come in two classes "
+			 "and you must not merge them. is_problem=true (severity 'problem') means DEFINITELY WRONG: a provider "
+			 "IS present, so the intent to use it is unambiguous, and only its ordering (wrong_order) or version "
+			 "(wrong_version) is off. needs_author_decision=true (severity 'probable_problem') means UNMET AND "
+			 "PROBABLY WRONG, BUT POSSIBLY DELIBERATE: no provider at all (missing), or the only one is switched off "
+			 "(disabled_provider). 🛑 THAT IS NOT A LESSER FINDING AND is_problem=false DOES NOT MEAN 'NO ACTION "
+			 "NEEDED' — in the large majority of stacks the provider should be present and active, so these usually "
+			 "still want fixing; they are separated only because metadata cannot distinguish a deliberate omission "
+			 "from a mistake. The legitimate case: force modules write transients (Output.Module.* / "
+			 "Transient.PhysicsForce) and a solver integrates them, so a stack with no solver still produces those "
+			 "transients on purpose when a Niagara fluids solver does the integration, or when the transients are "
+			 "consumed directly (written to a Niagara Data Channel) without affecting position or velocity. Left "
+			 "unaddressed, a genuinely unmet dependency compiles clean, looks correct and does nothing — no "
+			 "instrument we have can see it. So read every finding's remedy and severity_meaning and answer the "
+			 "question; do not filter on is_problem alone. Counts: unmet_count is the HEADLINE (problems + "
+			 "unconfirmed problems, and the figure comparable to the editor's stack-issue total); problem_count is "
+			 "the definite subset only (CHANGED 2026-08-18 — see problem_count_meaning); unconfirmed_problem_count "
+			 "is the rest. All findings of both classes are in findings[]. Each finding names "
 			 "the stage it was judged in; a dependency's engine_description is the author's own prose and often "
 			 "describes the remedy for more than one stage at once (e.g. Solve Forces and Velocity in Particle "
 			 "Update vs Apply Initial Forces in Particle Spawn), so read it together with 'stage' and use "
@@ -26005,18 +26093,30 @@ FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(c
 			 "single stage, so a cross-stage AllScripts dependency is in practice a presence check. This action "
 			 "never modifies anything."));
 
+	if (AuthorDecisionCount > 0)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("%d dependency(ies) are UNMET AND PROBABLY WRONG but need your confirmation "
+				 "(needs_author_decision=true, severity 'probable_problem'). They are in findings[] like any other "
+				 "finding, but they are NOT in problem_count — they are counted by unconfirmed_problem_count, and "
+				 "unmet_count (%d) is the total. 🛑 DO NOT READ is_problem=false AS 'FINE': in the large majority of "
+				 "stacks the provider should be present and active, and an unmet dependency of this kind compiles "
+				 "clean, looks correct and silently does nothing. It is only correct if something else performs the "
+				 "integration (a fluids solver) or the transient values are consumed directly (e.g. written to a "
+				 "Niagara Data Channel). Answer each one."), AuthorDecisionCount, UnmetCount));
+	}
 	if (bHasUsageFilter)
 	{
 		Warnings.Add(FString::Printf(
 			TEXT("A 'usage' filter (%s) was applied: only modules in that stage were EVALUATED. Provider searching "
-				 "still covered every stage, so no finding is invented — but problem_count is a SUBSET and must not "
-				 "be compared against the editor's total issue count."), *UsageFilterString));
+				 "still covered every stage, so no finding is invented — but every count here is a SUBSET, and "
+				 "unmet_count must not be compared against the editor's total issue count."), *UsageFilterString));
 	}
 	if (!EmitterFilter.IsEmpty())
 	{
 		Warnings.Add(FString::Printf(
 			TEXT("An 'emitter' filter (%s) was applied, so the system-stage scope was not evaluated and other "
-				 "emitters were not checked. problem_count is a SUBSET of the system's total."), *EmitterFilter));
+				 "emitters were not checked. Every count here is a SUBSET of the system's total."), *EmitterFilter));
 	}
 	if (SkippedJson.Num() > 0)
 	{
