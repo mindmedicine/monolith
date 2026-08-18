@@ -71,6 +71,13 @@
 #include "NiagaraEffectType.h"
 #include "NiagaraSimulationStageBase.h"
 #include "NiagaraParameterCollection.h"
+// validate_stack_dependencies — the ported decision core. The engine's own implementation is
+// unreachable: FNiagaraStackGraphUtilities::DependencyUtilities has no export macro
+// (NiagaraStackGraphUtilities.h:378-385) and the path is driven from an FNiagaraSystemViewModel.
+#include "MonolithNiagaraStackDependency.h"
+// reset_module_input_to_default's effective_value — which of UNiagaraScriptVariable's TWO default
+// stores to read. Reading the wrong one returned zeros and reported success (fixed 2026-08-18).
+#include "MonolithNiagaraScriptDefault.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -4305,6 +4312,16 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"), { TEXT("asset_path") })
 			.Optional(TEXT("version"), TEXT("string"), TEXT("Version GUID to read, or 'exposed' (default). Omit to read the exposed version; call once and read available_versions to discover GUIDs. A module PLACED in a stack pins its own version via SelectedScriptVersion and may differ from the exposed one."), { TEXT("version_guid") })
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("validate_stack_dependencies"),
+		TEXT("READ-ONLY: check a Niagara SYSTEM for unmet or mis-ordered module dependencies, WITHOUT requiring a compile. Walks each scope's placed modules in execution order (system spawn/update, then per emitter: emitter spawn/update, particle spawn/update, enabled simulation stages) and evaluates every module's declared RequiredDependencies against the modules that advertise them via ProvidedDependencies. Honours Pre/Post ordering, the SameScript constraint (a provider in another stage does NOT satisfy it), disabled providers, RequiredVersion, and the OnlyEvaluateInScriptUsage gate. Per finding: the dependent module and the stage it was judged in, the required id, Pre/Post, whether it is missing / mis-ordered / disabled / wrong-version, the stack indices involved, the dependency's own description text, every candidate provider with the reason it was rejected, and stage-filtered suggested providers (which is why Particle Update suggests Solve Forces and Velocity while Particle Spawn suggests Apply Initial Forces). NEVER modifies anything. Event-handler stages and disabled simulation stages are reported in skipped[] — the ENGINE's own check does not cover them either."),
+		FMonolithActionHandler::CreateStatic(&HandleValidateStackDependencies),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Niagara system asset path"), { TEXT("system_path") })
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Limit EVALUATION to one emitter (name or handle GUID). Provider searching is unaffected. Omitting it also checks the system-stage scope."))
+			.Optional(TEXT("usage"), TEXT("string"), TEXT("Limit EVALUATION to one stage: system_spawn, system_update, emitter_spawn, emitter_update, particle_spawn, particle_update, particle_simulation_stage. Providers are still searched across every stage, so no finding is invented — but the count becomes a subset."))
+			.Optional(TEXT("include_satisfied"), TEXT("bool"), TEXT("Also list dependencies that ARE met, with the provider that satisfies them (default: false — only problems are returned)."))
+			.Optional(TEXT("suggest_providers"), TEXT("bool"), TEXT("Look up which module assets could satisfy an unmet dependency in that stage (default: true). Set false to skip an asset-registry sweep that may load old assets to read their usage bitmask."))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_script_metadata"), TEXT("Set versioned metadata of a Niagara script asset: stages (usage bitmask), category, description, keywords, suggested/experimental/deprecated flags"),
 		FMonolithActionHandler::CreateStatic(&HandleSetScriptMetadata),
@@ -11315,6 +11332,7 @@ static const TMap<FString, FMonolithNiagaraBatchOp>& NA_GetBatchOpTable()
 		T.Add(TEXT("list_emitter_properties"), &FN::HandleListEmitterProperties);
 		T.Add(TEXT("get_module_input_value"), &FN::HandleGetModuleInputValue);
 		T.Add(TEXT("get_script_details"), &FN::HandleGetScriptDetails);
+		T.Add(TEXT("validate_stack_dependencies"), &FN::HandleValidateStackDependencies);
 		T.Add(TEXT("get_module_inputs"), &FN::HandleGetModuleInputs);
 		// Wave 3
 		T.Add(TEXT("configure_curve_keys"), &FN::HandleConfigureCurveKeys);
@@ -18591,36 +18609,75 @@ namespace
 	// everything it could not read and reported success, and gap #42's residual was a sentinel
 	// shipped with an authoritative-looking is_default flag. Only DefaultMode::Value is a literal at
 	// all — Binding and Custom defaults resolve at compile time and have no single string.
+	//
+	// 🛑 DEFECT FIXED 2026-08-18 — THIS READ USED THE WRONG STORE AND FABRICATED ZEROS.
+	//
+	// It previously read UNiagaraScriptVariable::GetDefaultValueData(), which returns the bytes of
+	// the PRIVATE `DefaultValueVariant` (NiagaraScriptVariable.h:194-201/248). That variant is
+	// allocated ZERO-FILLED by the private AllocateData() (:230-238) and is only ever populated by
+	// SetDefaultValueData (:186-192). A script variable whose default was authored by any other path
+	// therefore has a zeroed variant while carrying the REAL default in its `Variable` member — so
+	// the old code copied zeros, stringified them, and returned TRUE.
+	//
+	// Measured casualty (validator, 2026-08-18, Docs/staging/2026-08-18-validator-reset-input.md):
+	// stock SphereLocation's `Sphere Radius` reported "0.000000" when the compiled HLSL holds
+	// `float Constant64 = 100;`, and `Non Uniform Scale` reported "0.000,0.000,0.000" against a real
+	// (1,1,1). Both came back with success and effective_value_source "script_default", so the
+	// caller had nothing to distinguish them from a genuine zero. On a RECOVERY action that is the
+	// worst possible lie: someone resetting a corrupted input reads 0 and concludes the reset broke
+	// the value. Same defect class as #106.
+	//
+	// THE AUTHORITATIVE SOURCE, per the engine itself: UNiagaraNodeParameterMapGet::CreateDefaultPin
+	// populates a default pin from `Graph->GetVariable(Var)` + GetPinDefaultStringFromValue
+	// (NiagaraNodeParameterMapGet.cpp:130-143), and UNiagaraGraph::GetVariable returns
+	// `ScriptVariable->Variable` (NiagaraGraph.cpp:4314-4327) — NOT the variant. So `Variable` is
+	// what the editor's own default rendering reads, and it is what we read now.
+	//
+	// ⚠️ Why not call Graph->GetVariable / Graph->GetDefaultMode directly: neither carries an export
+	// macro (NiagaraGraph.h:503/505) and both would fail to link. GetScriptVariable(FName) at :373
+	// IS NIAGARAEDITOR_API, and UNiagaraScriptVariable::Variable is a public UPROPERTY (:162), so the
+	// same data is reached through the exported door.
+	//
+	// The variant is still read, as a CROSS-CHECK only: when both stores hold a value and they
+	// disagree, the caller is told rather than silently given one of them.
+	//
+	// CONTRACT: returns true ONLY when a real declared default was rendered. Absence — no script
+	// variable, a non-Value default mode, a type mismatch, no allocated data, or no pin-default
+	// utilities — returns FALSE so the caller omits the field. Nothing is ever default-constructed
+	// and stringified into a zero.
 	bool NA_TryReadScriptDeclaredDefault(UNiagaraNodeFunctionCall* ModuleNode, const FName& FullInputName,
-		const FNiagaraTypeDefinition& InputType, FString& OutValue)
+		const FNiagaraTypeDefinition& InputType, FString& OutValue,
+		FString* OutSource = nullptr, FString* OutAbsenceReason = nullptr, FString* OutDisagreement = nullptr)
 	{
 		OutValue.Reset();
-		if (!ModuleNode) return false;
+		if (OutSource) OutSource->Reset();
+		if (OutAbsenceReason) OutAbsenceReason->Reset();
+		if (OutDisagreement) OutDisagreement->Reset();
+
+		auto Absent = [&](const TCHAR* Reason) -> bool
+		{
+			if (OutAbsenceReason) *OutAbsenceReason = Reason;
+			return false;
+		};
+
+		if (!ModuleNode) return Absent(TEXT("no module node"));
 
 		UNiagaraGraph* CalledGraph = ModuleNode->GetCalledGraph();
-		if (!CalledGraph) return false;
-
-		UNiagaraScriptVariable* ScriptVariable = CalledGraph->GetScriptVariable(FullInputName);
-		if (!ScriptVariable) return false;
-		if (ScriptVariable->DefaultMode != ENiagaraDefaultMode::Value) return false;
+		if (!CalledGraph) return Absent(TEXT("the module's script graph could not be resolved"));
 
 		// GetScriptVariable(FName) matches on NAME ALONE (see the note on the script-variable map
-		// elsewhere in this file), so the type is confirmed before any bytes are copied — otherwise
-		// a same-named variable of a different type would memcpy the wrong width.
-		if (ScriptVariable->Variable.GetType() != InputType) return false;
+		// elsewhere in this file); the helper confirms the TYPE before rendering anything, so a
+		// same-named parameter of a different type is refused rather than read at the wrong width.
+		UNiagaraScriptVariable* ScriptVariable = CalledGraph->GetScriptVariable(FullInputName);
 
-		const uint8* DefaultData = ScriptVariable->GetDefaultValueData();
-		if (!DefaultData) return false;
+		MonolithNiagaraScriptDefault::FDefaultReadResult Result;
+		const bool bRead = MonolithNiagaraScriptDefault::TryRenderDeclaredDefault(ScriptVariable, InputType, Result);
 
-		FNiagaraEditorModule& NiagaraEditorModule = FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
-		TSharedPtr<INiagaraEditorTypeUtilities, ESPMode::ThreadSafe> TypeUtilities = NiagaraEditorModule.GetTypeUtilities(InputType);
-		if (!TypeUtilities.IsValid() || !TypeUtilities->CanHandlePinDefaults()) return false;
-
-		FNiagaraVariable Allocated(InputType, FullInputName);
-		Allocated.AllocateData();
-		Allocated.SetData(DefaultData);
-		OutValue = TypeUtilities->GetPinDefaultStringFromValue(Allocated);
-		return !OutValue.IsEmpty();
+		OutValue = Result.Value;
+		if (OutSource) *OutSource = Result.Source;
+		if (OutAbsenceReason) *OutAbsenceReason = Result.AbsenceReason;
+		if (OutDisagreement) *OutDisagreement = Result.Disagreement;
+		return bRead;
 	}
 }
 
@@ -18810,20 +18867,45 @@ FMonolithActionResult FMonolithNiagaraActions::HandleResetModuleInputToDefault(c
 		NoOp->SetBoolField(TEXT("override_pin_existed"), false);
 		NoOp->SetBoolField(TEXT("rapid_iteration_entry_existed"), false);
 		NoOp->SetArrayField(TEXT("stores_cleared"), TArray<TSharedPtr<FJsonValue>>());
-		NoOp->SetStringField(TEXT("effective_value_source"), TEXT("script_default"));
 
-		FString DefaultValueString;
-		if (NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType, DefaultValueString))
+		// Same contract as the main path below: the source is written AFTER the read, and a default
+		// that cannot be read is "unknown" with the field omitted — never a synthesised 0.
+		FString DefaultValueString, DefaultValueSource, DefaultAbsenceReason, DefaultDisagreement;
+		const bool bNoOpHaveDefault = NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType,
+			DefaultValueString, &DefaultValueSource, &DefaultAbsenceReason, &DefaultDisagreement);
+		if (bNoOpHaveDefault)
 		{
 			NoOp->SetStringField(TEXT("effective_value"), DefaultValueString);
+			NoOp->SetStringField(TEXT("effective_value_source"), DefaultValueSource);
+		}
+		else
+		{
+			NoOp->SetStringField(TEXT("effective_value_source"), TEXT("unknown"));
 		}
 
-		return FMonolithActionResult::Success(NoOp).WithWarning(FString::Printf(
+		TArray<FString> NoOpWarnings;
+		NoOpWarnings.Add(FString::Printf(
 			TEXT("Input '%s' was ALREADY at its script default — neither an override pin nor a rapid-iteration entry "
 				 "existed, so nothing was changed and nothing needed to be. This is reported as success rather than a "
 				 "refusal because reset is a recovery action and is safe to repeat; if you expected an override here, "
 				 "the value you are looking at is coming from the module script's own default, not from this system."),
 			*InputName));
+		if (!bNoOpHaveDefault)
+		{
+			NoOpWarnings.Add(FString::Printf(
+				TEXT("The module script's declared default for '%s' (type %s) could not be read: %s. 'effective_value' "
+					 "is OMITTED and 'effective_value_source' is \"unknown\". Do NOT read the missing field as zero."),
+				*InputName, *InputType.GetName(),
+				DefaultAbsenceReason.IsEmpty() ? TEXT("no reason recorded") : *DefaultAbsenceReason));
+		}
+		else if (!DefaultDisagreement.IsEmpty())
+		{
+			NoOpWarnings.Add(FString::Printf(
+				TEXT("Reporting 'effective_value' for '%s', but %s."), *InputName, *DefaultDisagreement));
+		}
+
+		// WithWarnings, matching the main path's tail below — the channel is deliberately unchanged.
+		return FMonolithActionResult::Success(NoOp).WithWarnings(NoOpWarnings);
 	}
 
 	// --- PLAN THE OVERRIDE TEARDOWN, and refuse BEFORE any transaction opens ------------------
@@ -18980,12 +19062,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleResetModuleInputToDefault(c
 	}
 	R->SetArrayField(TEXT("stores_cleared"), StoresJson);
 
-	R->SetStringField(TEXT("effective_value_source"), TEXT("script_default"));
-	FString DefaultValueString;
-	const bool bHaveDefault = NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType, DefaultValueString);
+	// effective_value_source is written AFTER the read, never before it. It previously said
+	// "script_default" unconditionally, which meant the field asserted a provenance for a value that
+	// might not exist — and, while the reader fabricated zeros, asserted it for a value that was
+	// simply wrong.
+	FString DefaultValueString, DefaultValueSource, DefaultAbsenceReason, DefaultDisagreement;
+	const bool bHaveDefault = NA_TryReadScriptDeclaredDefault(MN, MatchedFullName, InputType,
+		DefaultValueString, &DefaultValueSource, &DefaultAbsenceReason, &DefaultDisagreement);
 	if (bHaveDefault)
 	{
 		R->SetStringField(TEXT("effective_value"), DefaultValueString);
+		R->SetStringField(TEXT("effective_value_source"), DefaultValueSource);
+	}
+	else
+	{
+		// 🛑 Explicitly "unknown" — never omitted-and-implied, and never 0. A caller matching on
+		// effective_value_source must be able to tell "the default is X" from "we could not read it".
+		R->SetStringField(TEXT("effective_value_source"), TEXT("unknown"));
 	}
 
 	// Warnings are accumulated and attached ONCE at the end, so no field is written to the payload
@@ -19011,12 +19104,25 @@ FMonolithActionResult FMonolithNiagaraActions::HandleResetModuleInputToDefault(c
 	if (!bHaveDefault)
 	{
 		// Absence is reported as absence — never as 0 and never as a sentinel (gaps #106 / #42).
+		// This guard was previously UNREACHABLE for the commonest case: the reader returned true with
+		// a zeroed value, so a fabricated 0 shipped with no warning at all. It now fires whenever the
+		// default genuinely cannot be read, and the specific reason is included rather than a list of
+		// possibilities the caller has to guess between.
 		Warnings.Add(FString::Printf(
-			TEXT("Both stores were cleared, but the module script's declared default for '%s' could not be rendered as "
-				 "a string (its default mode may be Binding or Custom rather than Value, or %s has no pin-default "
-				 "utilities), so no 'effective_value' is reported. Do NOT read the missing field as zero or as unset — "
-				 "read the value back with get_module_input_value."),
-			*InputName, *InputType.GetName()));
+			TEXT("Both stores were cleared, but the module script's declared default for '%s' (type %s) could not be "
+				 "read: %s. 'effective_value' is therefore OMITTED and 'effective_value_source' is \"unknown\". Do NOT "
+				 "read the missing field as zero or as unset — read the value back with get_module_input_value."),
+			*InputName, *InputType.GetName(),
+			DefaultAbsenceReason.IsEmpty() ? TEXT("no reason recorded") : *DefaultAbsenceReason));
+	}
+	else if (!DefaultDisagreement.IsEmpty())
+	{
+		// Worth surfacing rather than resolving silently: a mismatch means the asset's two default
+		// stores are out of sync, which is a real authoring problem in the MODULE, not in this reset.
+		Warnings.Add(FString::Printf(
+			TEXT("Reporting 'effective_value' for '%s', but %s. The reported value is the one the editor renders and "
+				 "the one the compiler will use; the module script itself is inconsistent and worth re-saving."),
+			*InputName, *DefaultDisagreement));
 	}
 
 	if (ResetPlan.bRemoveOverridePin && !ResetPlan.bClearRapidIteration && NA_IsRapidIterationType(InputType))
@@ -24929,6 +25035,671 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetScriptDetails(const TSha
 	}
 
 	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
+}
+
+// ============================================================================
+// validate_stack_dependencies — READ-ONLY stack dependency checker (I-40).
+//
+// WHY THIS EXISTS. get_script_details can now read what a module DECLARES. This action is what
+// USES that: it walks the placed modules of a system in execution order and reports every declared
+// dependency that is unmet or mis-ordered.
+//
+// The only previous route to the same information was the native GetStackIssues, which
+//   (a) needs a compile to have been REQUESTED first — its internal wait cannot drive itself,
+//   (b) mis-reports: it applies a fix and returns an error, and
+//   (c) offers ALTERNATIVE fixes where the wrong one fails with "an acceptable location could not
+//       be found".
+// This check reads metadata and graph structure only. It needs NO COMPILE AT ALL.
+//
+// 🛑 IT NEVER FIXES ANYTHING. The engine's equivalent (GenerateDependencyIssues) generates issues
+// AND fixes; only the issue half is ported. The value of a no-compile checker is that it is safe to
+// run on anything, and that evaporates the moment it can mutate.
+//
+// FIDELITY. The rules are a line-by-line port of NiagaraStackModuleItem.cpp:800-911 — see
+// MonolithNiagaraStackDependency.h for the decision core and its citations. The port was forced,
+// not chosen: FNiagaraStackGraphUtilities::DependencyUtilities carries NO export macro
+// (NiagaraStackGraphUtilities.h:378-385), so DoesStackModuleProvideDependency /
+// GetModuleScriptAssetsByDependencyProvided would COMPILE AND FAIL TO LINK, and the whole engine
+// path is driven from an FNiagaraSystemViewModel that Monolith never constructs.
+//
+// THE THREE STRUCTURAL FACTS THAT MAKE THE ANSWER RIGHT OR WRONG:
+//
+//  1. **The index space is the whole SCOPE, not one stage.** The engine flattens
+//     System Spawn -> System Update -> Emitter Spawn -> Emitter Update -> Particle Spawn ->
+//     Particle Update -> each ENABLED simulation stage into ONE ordered list per emitter handle
+//     (FNiagaraSystemViewModel::GetOrderedScriptsForEmitter, NiagaraSystemViewModel.cpp:1325-1344;
+//     flattened by BuildStackModuleData, :3506-3533). Pre/Post compare positions in THAT list
+//     (NiagaraStackModuleItem.cpp:845-847). This is why a Particle Spawn module with an AllScripts
+//     dependency can be satisfied by a provider sitting anywhere in Particle Update — the ordering
+//     test passes on the global index no matter where in Update the provider sits, which makes such
+//     a check effectively PRESENCE-ONLY across stages.
+//
+//  2. **SameScript is honoured strictly.** A provider in another stage does NOT satisfy it; the
+//     usage must be equivalent AND the usage id must match (NiagaraStackGraphUtilities.cpp:4388-4391).
+//
+//  3. **Providers are found via ProvidedDependencies**, never by module name
+//     (NiagaraStackGraphUtilities.cpp:4381).
+//
+// TWO STAGES THE ENGINE ITSELF NEVER CHECKS, reported in `skipped[]` rather than silently passed:
+// event handler scripts (never added to the ordered script list at all) and DISABLED simulation
+// stages (:1336-1342 filters on bEnabled). For an event-stage module the engine's own
+// GenerateDependencyIssues cannot even find the module's index and bails at :816-818. Evaluating
+// them here would produce findings the editor does not report, so we do not — but we say so.
+//
+// VERSION: dependencies are read off the PLACED version (UNiagaraNodeFunctionCall::GetScriptData(),
+// NiagaraNodeFunctionCall.h:153, which resolves SelectedScriptVersion) — deliberately NOT the
+// exposed version that get_script_details defaults to.
+// ============================================================================
+namespace
+{
+	// One placed module in a scope's flattened, execution-ordered list.
+	struct FVSDModule
+	{
+		UNiagaraNodeFunctionCall* Node = nullptr;
+		ENiagaraScriptUsage Usage = ENiagaraScriptUsage::Module;
+		FGuid UsageId;
+		FString StageKey;    // "particle_update"
+		FString StageLabel;  // simulation-stage name, when the key alone is ambiguous
+		int32 IndexInStage = INDEX_NONE;
+		bool bEvaluate = false;  // false => present only as a candidate PROVIDER
+	};
+
+	// A scope == one entry of the engine's GuidToCachedStackModuleData map: the system scope (no
+	// emitter) or one emitter handle. The system scripts appear in EVERY scope, always first, and
+	// are EVALUATED only in the system scope — mirroring which stack view model owns which items,
+	// and keeping a system-stage module from being reported once per emitter.
+	struct FVSDScope
+	{
+		FString EmitterName;
+		FString EmitterId;
+		TArray<FVSDModule> Modules;
+		TArray<TSharedPtr<FJsonValue>> Stages;
+	};
+
+	// Reimplementation of FNiagaraStackGraphUtilities::DependencyUtilities::
+	// GetModuleScriptAssetsByDependencyProvided (NiagaraStackGraphUtilities.cpp:4398-4425), which is
+	// declared without an export macro and therefore cannot be linked against.
+	//
+	// THIS IS WHAT MAKES THE REMEDY STAGE-SPECIFIC. FGetFilteredScriptAssetsOptions::TargetUsageToMatch
+	// is tested against each candidate's ModuleUsageBitmask (NiagaraEditorUtilities.cpp:1443-1469),
+	// so asking with ParticleUpdateScript yields Solve Forces and Velocity while asking with
+	// ParticleSpawnScript yields Apply Initial Forces. That is precisely the difference the
+	// dependency's own Description prose describes, computed rather than parsed out of the text.
+	//
+	// ⚠️ Not free: for assets saved before FNiagaraCustomVersion::AddSimulationStageUsageEnum the
+	// engine LOADS the asset to read a trustworthy bitmask (:1451). Hence the caller's cache and the
+	// `suggest_providers` opt-out.
+	void NA_VSD_FindProviderAssets(FName DependencyId, TOptional<ENiagaraScriptUsage> RequiredUsage,
+		TArray<FAssetData>& OutAssets)
+	{
+		FNiagaraEditorUtilities::FGetFilteredScriptAssetsOptions Options;
+		Options.ScriptUsageToInclude = ENiagaraScriptUsage::Module;
+		Options.TargetUsageToMatch = RequiredUsage;
+		Options.bIncludeDeprecatedScripts = false;
+		Options.bIncludeNonLibraryScripts = true;
+
+		TArray<FAssetData> ModuleAssets;
+		FNiagaraEditorUtilities::GetFilteredScriptAssets(Options, ModuleAssets);
+
+		for (const FAssetData& ModuleAsset : ModuleAssets)
+		{
+			FString ProvidedDependenciesString;
+			if (ModuleAsset.GetTagValue(GET_MEMBER_NAME_CHECKED(FVersionedNiagaraScriptData, ProvidedDependencies),
+					ProvidedDependenciesString)
+				&& !ProvidedDependenciesString.IsEmpty())
+			{
+				TArray<FString> DependencyStrings;
+				ProvidedDependenciesString.ParseIntoArray(DependencyStrings, TEXT(","));
+				for (const FString& DependencyString : DependencyStrings)
+				{
+					if (FName(*DependencyString) == DependencyId)
+					{
+						OutAssets.Add(ModuleAsset);
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	// A module's own display label, preferring the stack name over the mangled function name.
+	FString NA_VSD_ModuleLabel(const UNiagaraNodeFunctionCall& Node)
+	{
+		const FString FunctionName = Node.GetFunctionName();
+		return FunctionName.IsEmpty() ? Node.GetName() : FunctionName;
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleValidateStackDependencies(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraStackDependency;
+
+	// --- ADDRESSING + REFUSALS (gap #26b: validate everything before doing anything) ------------
+	const FString SystemPath = NA_GetAssetPath(Params);
+	if (SystemPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(
+			TEXT("Missing required param: asset_path (or system_path) — the Niagara SYSTEM to check."));
+	}
+
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load system '%s'. This action reads a Niagara SYSTEM asset — not a module script. "
+				 "To read one script's declared dependencies instead, use get_script_details."), *SystemPath));
+	}
+
+	FString EmitterFilter;
+	Params->TryGetStringField(TEXT("emitter"), EmitterFilter);
+	if (!EmitterFilter.IsEmpty() && FindEmitterHandleIndex(System, EmitterFilter) == INDEX_NONE)
+	{
+		TArray<FString> Known;
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			Known.Add(Handle.GetName().ToString());
+		}
+		// Refuse rather than return an empty, plausible "no problems found".
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("System '%s' has no emitter '%s'. Emitters: [%s]. NOTHING WAS CHECKED — an empty result would "
+				 "have read as a clean bill of health."),
+			*SystemPath, *EmitterFilter, *FString::Join(Known, TEXT(", "))));
+	}
+
+	FString UsageFilterString;
+	Params->TryGetStringField(TEXT("usage"), UsageFilterString);
+	ENiagaraScriptUsage UsageFilter = ENiagaraScriptUsage::Module;
+	bool bHasUsageFilter = false;
+	if (!UsageFilterString.IsEmpty())
+	{
+		if (!ResolveScriptUsage(UsageFilterString, UsageFilter))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unrecognized usage '%s'. Valid values: system_spawn, system_update, emitter_spawn, "
+					 "emitter_update, particle_spawn (or spawn), particle_update (or update), particle_event "
+					 "(or event), particle_simulation_stage (or simulation_stage)."), *UsageFilterString));
+		}
+		bHasUsageFilter = true;
+	}
+
+	bool bIncludeSatisfied = false;
+	Params->TryGetBoolField(TEXT("include_satisfied"), bIncludeSatisfied);
+	bool bSuggestProviders = true;
+	Params->TryGetBoolField(TEXT("suggest_providers"), bSuggestProviders);
+
+	TArray<FString> Warnings;
+	TArray<TSharedPtr<FJsonValue>> SkippedJson;
+
+	// --- BUILD THE SCOPES ----------------------------------------------------------------------
+	auto AppendStage = [&](FVSDScope& Scope, const FString& EmitterId, ENiagaraScriptUsage Usage,
+		const FGuid& UsageId, const FString& StageKey, const FString& StageLabel, bool bEvaluate)
+	{
+		UNiagaraNodeOutput* OutputNode = FindOutputNode(System, EmitterId, Usage, UsageId);
+		if (!OutputNode)
+		{
+			return;
+		}
+
+		TArray<UNiagaraNodeFunctionCall*> ModuleNodes;
+		MonolithNiagaraHelpers::GetOrderedModuleNodes(*OutputNode, ModuleNodes);
+
+		const int32 FirstStackIndex = Scope.Modules.Num();
+		for (int32 i = 0; i < ModuleNodes.Num(); ++i)
+		{
+			if (!ModuleNodes[i]) continue;
+			FVSDModule M;
+			M.Node = ModuleNodes[i];
+			M.Usage = Usage;
+			M.UsageId = UsageId;
+			M.StageKey = StageKey;
+			M.StageLabel = StageLabel;
+			M.IndexInStage = i;
+			// The usage filter narrows what is EVALUATED, never what is searched for providers.
+			// Narrowing the provider search would invent findings: an AllScripts dependency whose
+			// provider lives in an excluded stage would read as missing.
+			M.bEvaluate = bEvaluate && (!bHasUsageFilter || UNiagaraScript::IsEquivalentUsage(Usage, UsageFilter));
+			Scope.Modules.Add(M);
+		}
+
+		TSharedRef<FJsonObject> StageJson = MakeShared<FJsonObject>();
+		StageJson->SetStringField(TEXT("usage"), StageKey);
+		if (!StageLabel.IsEmpty()) StageJson->SetStringField(TEXT("name"), StageLabel);
+		if (UsageId.IsValid()) StageJson->SetStringField(TEXT("usage_id"), UsageId.ToString());
+		StageJson->SetNumberField(TEXT("module_count"), Scope.Modules.Num() - FirstStackIndex);
+		StageJson->SetNumberField(TEXT("first_stack_index"), FirstStackIndex);
+		StageJson->SetBoolField(TEXT("evaluated"), bEvaluate);
+		Scope.Stages.Add(MakeShared<FJsonValueObject>(StageJson));
+	};
+
+	TArray<FVSDScope> Scopes;
+
+	// The SYSTEM scope: exactly the two system scripts, matching what the system stack view model
+	// caches under an invalid emitter handle id.
+	if (EmitterFilter.IsEmpty())
+	{
+		FVSDScope SystemScope;
+		AppendStage(SystemScope, FString(), ENiagaraScriptUsage::SystemSpawnScript, FGuid(), TEXT("system_spawn"), FString(), true);
+		AppendStage(SystemScope, FString(), ENiagaraScriptUsage::SystemUpdateScript, FGuid(), TEXT("system_update"), FString(), true);
+		Scopes.Add(MoveTemp(SystemScope));
+	}
+
+	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+	{
+		const FString HandleName = Handle.GetName().ToString();
+		const FString HandleId = Handle.GetId().ToString();
+		if (!EmitterFilter.IsEmpty()
+			&& !HandleName.Equals(EmitterFilter, ESearchCase::IgnoreCase)
+			&& !HandleId.Equals(EmitterFilter, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		FVSDScope Scope;
+		Scope.EmitterName = HandleName;
+		Scope.EmitterId = HandleId;
+
+		// System scripts are PROVIDERS here, never re-evaluated — they own their findings in the
+		// system scope. Without this a system-stage problem is reported once per emitter.
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::SystemSpawnScript,  FGuid(), TEXT("system_spawn"),  FString(), false);
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::SystemUpdateScript, FGuid(), TEXT("system_update"), FString(), false);
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::EmitterSpawnScript, FGuid(), TEXT("emitter_spawn"), FString(), true);
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::EmitterUpdateScript, FGuid(), TEXT("emitter_update"), FString(), true);
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::ParticleSpawnScript, FGuid(), TEXT("particle_spawn"), FString(), true);
+		AppendStage(Scope, HandleId, ENiagaraScriptUsage::ParticleUpdateScript, FGuid(), TEXT("particle_update"), FString(), true);
+
+		if (FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData())
+		{
+			for (UNiagaraSimulationStageBase* Stage : EmitterData->GetSimulationStages())
+			{
+				if (!Stage || !Stage->Script) continue;
+				const FString StageName = Stage->SimulationStageName.ToString();
+				if (!Stage->bEnabled)
+				{
+					// NiagaraSystemViewModel.cpp:1336-1342 — a disabled stage is not in the ordered
+					// script list, so the editor never checks its modules and never offers them as
+					// providers. Reported so this reads as a known blind spot, not as a pass.
+					TSharedRef<FJsonObject> Skip = MakeShared<FJsonObject>();
+					Skip->SetStringField(TEXT("emitter"), HandleName);
+					Skip->SetStringField(TEXT("usage"), TEXT("particle_simulation_stage"));
+					Skip->SetStringField(TEXT("name"), StageName);
+					Skip->SetStringField(TEXT("reason"),
+						TEXT("Simulation stage is DISABLED. The engine excludes disabled stages from the ordered "
+							 "script list (NiagaraSystemViewModel.cpp:1336-1342), so its modules are neither checked "
+							 "nor offered as dependency providers. Not checked here either, so this result stays in "
+							 "agreement with the editor."));
+					SkippedJson.Add(MakeShared<FJsonValueObject>(Skip));
+					continue;
+				}
+				AppendStage(Scope, HandleId, ENiagaraScriptUsage::ParticleSimulationStageScript,
+					Stage->Script->GetUsageId(), TEXT("particle_simulation_stage"), StageName, true);
+			}
+
+			for (const FNiagaraEventScriptProperties& Handler : EmitterData->GetEventHandlers())
+			{
+				if (!Handler.Script) continue;
+				TSharedRef<FJsonObject> Skip = MakeShared<FJsonObject>();
+				Skip->SetStringField(TEXT("emitter"), HandleName);
+				Skip->SetStringField(TEXT("usage"), TEXT("particle_event"));
+				Skip->SetStringField(TEXT("name"), Handler.SourceEventName.ToString());
+				Skip->SetStringField(TEXT("reason"),
+					TEXT("Event handler scripts are NEVER part of the engine's stack module data — "
+						 "FNiagaraSystemViewModel::GetOrderedScriptsForEmitter (NiagaraSystemViewModel.cpp:1325-1344) "
+						 "adds system, emitter, particle and enabled simulation-stage scripts only. The editor's own "
+						 "GenerateDependencyIssues therefore cannot locate an event-stage module's index and bails "
+						 "(NiagaraStackModuleItem.cpp:816-818). This is an ENGINE blind spot, not ours; checking it "
+						 "here would report problems the editor does not."));
+				SkippedJson.Add(MakeShared<FJsonValueObject>(Skip));
+			}
+		}
+
+		Scopes.Add(MoveTemp(Scope));
+	}
+
+	// --- EVALUATE ------------------------------------------------------------------------------
+	// Cache: one asset-registry sweep per (dependency id, target usage) pair rather than per finding.
+	TMap<FString, TArray<FAssetData>> ProviderAssetCache;
+
+	TArray<TSharedPtr<FJsonValue>> Findings;
+	TArray<TSharedPtr<FJsonValue>> ScopesJson;
+	int32 ModulesChecked = 0;
+	int32 DependenciesEvaluated = 0;
+	int32 DependenciesNotEnforcedHere = 0;
+	int32 SatisfiedCount = 0;
+	int32 UnmetCount = 0;
+
+	for (const FVSDScope& Scope : Scopes)
+	{
+		for (int32 ModuleIndex = 0; ModuleIndex < Scope.Modules.Num(); ++ModuleIndex)
+		{
+			const FVSDModule& Module = Scope.Modules[ModuleIndex];
+			if (!Module.bEvaluate || !Module.Node) continue;
+
+			if (!Module.Node->FunctionScript)
+			{
+				// A stack entry with no script asset — an "Set Parameters" assignment node or a
+				// broken reference. Neither declares dependencies; say so rather than skip silently.
+				continue;
+			}
+
+			FVersionedNiagaraScriptData* DependentData = Module.Node->GetScriptData();
+			if (!DependentData)
+			{
+				TSharedRef<FJsonObject> Skip = MakeShared<FJsonObject>();
+				Skip->SetStringField(TEXT("emitter"), Scope.EmitterName);
+				Skip->SetStringField(TEXT("usage"), Module.StageKey);
+				Skip->SetStringField(TEXT("module"), NA_VSD_ModuleLabel(*Module.Node));
+				Skip->SetStringField(TEXT("reason"),
+					TEXT("The placed module resolved to NO versioned script data for its pinned "
+						 "SelectedScriptVersion, so its declared dependencies cannot be read. This module was NOT "
+						 "checked."));
+				SkippedJson.Add(MakeShared<FJsonValueObject>(Skip));
+				continue;
+			}
+
+			++ModulesChecked;
+			if (DependentData->RequiredDependencies.Num() == 0) continue;
+
+			// NiagaraStackModuleItem.cpp:840 — read off the DEPENDENT's bitmask. See
+			// FProviderCandidate::bUsageSupportedByDependent for why that is probably an engine bug
+			// and why we mirror it anyway.
+			const TArray<ENiagaraScriptUsage> SupportedUsages =
+				UNiagaraScript::GetSupportedUsageContextsForBitmask(DependentData->ModuleUsageBitmask);
+
+			for (const FNiagaraModuleDependency& Dep : DependentData->RequiredDependencies)
+			{
+				// The OnlyEvaluateInScriptUsage gate — bit 1 is the first real phase.
+				if (!IsUsageAllowed(Module.Usage, Dep.OnlyEvaluateInScriptUsage))
+				{
+					++DependenciesNotEnforcedHere;
+					continue;
+				}
+				++DependenciesEvaluated;
+
+				TArray<FProviderCandidate> Candidates;
+				for (int32 ProviderIndex = 0; ProviderIndex < Scope.Modules.Num(); ++ProviderIndex)
+				{
+					const FVSDModule& Provider = Scope.Modules[ProviderIndex];
+					if (!Provider.Node || !Provider.Node->FunctionScript) continue;
+
+					FVersionedNiagaraScriptData* ProviderData = Provider.Node->GetScriptData();
+					if (!ProviderData || !ProviderData->ProvidedDependencies.Contains(Dep.Id)) continue;
+
+					// SameScript: same stage, strictly. A provider elsewhere does NOT count.
+					if (Dep.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::SameScript
+						&& (!UNiagaraScript::IsEquivalentUsage(Provider.Usage, Module.Usage)
+							|| Provider.UsageId != Module.UsageId))
+					{
+						continue;
+					}
+
+					FProviderCandidate Candidate;
+					Candidate.StackIndex = ProviderIndex;
+					Candidate.bEnabled = Provider.Node->GetDesiredEnabledState() == ENodeEnabledState::Enabled;
+					Candidate.bCorrectVersion = Dep.IsVersionAllowed(ProviderData->Version);
+					Candidate.bUsageSupportedByDependent =
+						UNiagaraScript::ContainsEquivilentUsage(SupportedUsages, Provider.Usage);
+					Candidates.Add(Candidate);
+				}
+
+				FVerdictDetail Detail;
+				const EDependencyVerdict Verdict = EvaluateDependency(Dep.Type, ModuleIndex, Candidates, Detail);
+
+				if (Verdict == EDependencyVerdict::Satisfied)
+				{
+					++SatisfiedCount;
+					if (!bIncludeSatisfied) continue;
+				}
+				else
+				{
+					++UnmetCount;
+				}
+
+				// --- the finding ----------------------------------------------------------------
+				TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+				F->SetStringField(TEXT("status"), VerdictToString(Verdict));
+				F->SetBoolField(TEXT("is_problem"), Verdict != EDependencyVerdict::Satisfied);
+
+				{
+					TSharedRef<FJsonObject> Mod = MakeShared<FJsonObject>();
+					Mod->SetStringField(TEXT("function_name"), NA_VSD_ModuleLabel(*Module.Node));
+					Mod->SetStringField(TEXT("node_guid"), Module.Node->NodeGuid.ToString());
+					Mod->SetStringField(TEXT("script_path"), Module.Node->FunctionScript->GetPathName());
+					Mod->SetNumberField(TEXT("index_in_stage"), Module.IndexInStage);
+					Mod->SetNumberField(TEXT("stack_index"), ModuleIndex);
+					Mod->SetBoolField(TEXT("enabled"),
+						Module.Node->GetDesiredEnabledState() == ENodeEnabledState::Enabled);
+					F->SetObjectField(TEXT("module"), Mod);
+				}
+				{
+					TSharedRef<FJsonObject> Stage = MakeShared<FJsonObject>();
+					Stage->SetStringField(TEXT("usage"), Module.StageKey);
+					if (!Module.StageLabel.IsEmpty()) Stage->SetStringField(TEXT("name"), Module.StageLabel);
+					if (Module.UsageId.IsValid()) Stage->SetStringField(TEXT("usage_id"), Module.UsageId.ToString());
+					Stage->SetStringField(TEXT("emitter"), Scope.EmitterName);
+					Stage->SetStringField(TEXT("scope"), Scope.EmitterName.IsEmpty()
+						? TEXT("system") : TEXT("emitter"));
+					F->SetObjectField(TEXT("stage"), Stage);
+				}
+				{
+					TSharedRef<FJsonObject> D = MakeShared<FJsonObject>();
+					D->SetStringField(TEXT("id"), Dep.Id.ToString());
+					NA_SetEnumField(D, TEXT("type"), Dep.Type);
+					D->SetStringField(TEXT("ordering"),
+						Dep.Type == ENiagaraModuleDependencyType::PreDependency
+							? TEXT("the provider must be placed BEFORE (above) this module")
+							: TEXT("the provider must be placed AFTER (below) this module"));
+					NA_SetEnumField(D, TEXT("script_constraint"), Dep.ScriptConstraint);
+					D->SetStringField(TEXT("script_constraint_meaning"),
+						Dep.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::SameScript
+							? TEXT("the provider must be in the SAME stage as this module; one in another stage does "
+								   "NOT satisfy it")
+							: TEXT("the provider may be in ANY stage of this scope as long as the ordering holds"));
+					D->SetStringField(TEXT("required_version"), Dep.RequiredVersion);
+
+					int32 UnexpectedBits = 0;
+					const TArray<FString> Usages = MonolithNiagaraDependencyUsage::DecodeUsageBitmask(
+						Dep.OnlyEvaluateInScriptUsage, &UnexpectedBits);
+					TArray<TSharedPtr<FJsonValue>> UsageJson;
+					for (const FString& U : Usages) { UsageJson.Add(MakeShared<FJsonValueString>(U)); }
+					D->SetArrayField(TEXT("only_evaluate_in_script_usage"), UsageJson);
+					D->SetNumberField(TEXT("only_evaluate_in_script_usage_raw"), Dep.OnlyEvaluateInScriptUsage);
+					if (UnexpectedBits != 0)
+					{
+						D->SetNumberField(TEXT("only_evaluate_in_script_usage_unrecognised_bits"), UnexpectedBits);
+					}
+
+					// The engine's own remedy prose, verbatim. It frequently describes the fix for
+					// SEVERAL stages at once; `stage` above says which one this finding is in, and
+					// `suggested_providers` below is the computed answer for THAT stage.
+					D->SetStringField(TEXT("engine_description"), Dep.Description.ToString());
+					F->SetObjectField(TEXT("dependency"), D);
+				}
+
+				// Every candidate and why it was rejected — this is what lets a caller diff us
+				// against the editor instead of taking the verdict on trust.
+				{
+					TArray<TSharedPtr<FJsonValue>> CandidateJson;
+					for (const FProviderCandidate& Candidate : Candidates)
+					{
+						const FVSDModule& Provider = Scope.Modules[Candidate.StackIndex];
+						const bool bCorrectOrder = IsCorrectOrder(Dep.Type, Candidate.StackIndex, ModuleIndex);
+
+						TSharedRef<FJsonObject> C = MakeShared<FJsonObject>();
+						C->SetStringField(TEXT("function_name"), NA_VSD_ModuleLabel(*Provider.Node));
+						C->SetStringField(TEXT("node_guid"), Provider.Node->NodeGuid.ToString());
+						C->SetStringField(TEXT("usage"), Provider.StageKey);
+						if (!Provider.StageLabel.IsEmpty()) C->SetStringField(TEXT("stage_name"), Provider.StageLabel);
+						C->SetNumberField(TEXT("stack_index"), Candidate.StackIndex);
+						C->SetNumberField(TEXT("index_in_stage"), Provider.IndexInStage);
+						C->SetBoolField(TEXT("correct_order"), bCorrectOrder);
+						C->SetBoolField(TEXT("enabled"), Candidate.bEnabled);
+						C->SetBoolField(TEXT("version_allowed"), Candidate.bCorrectVersion);
+						C->SetBoolField(TEXT("could_be_reordered"), Candidate.bUsageSupportedByDependent);
+
+						FString Rejection;
+						if (Candidate.StackIndex == Detail.SatisfyingCandidateStackIndex) Rejection = TEXT("none — this one satisfies the dependency");
+						else if (!bCorrectOrder && !Candidate.bUsageSupportedByDependent)
+							Rejection = TEXT("wrong side AND the dependent module's usage bitmask does not cover this "
+											 "provider's stage, so the engine does not even offer a reorder");
+						else if (!bCorrectOrder) Rejection = TEXT("wrong side of the dependent module");
+						else if (!Candidate.bEnabled) Rejection = TEXT("module is disabled");
+						else if (!Candidate.bCorrectVersion) Rejection = TEXT("version outside required_version");
+						else Rejection = TEXT("not reached — an earlier candidate already satisfied the dependency");
+						C->SetStringField(TEXT("rejected_because"), Rejection);
+
+						CandidateJson.Add(MakeShared<FJsonValueObject>(C));
+					}
+					F->SetArrayField(TEXT("candidate_providers"), CandidateJson);
+				}
+
+				// --- the stage-specific remedy ---------------------------------------------------
+				if (Verdict != EDependencyVerdict::Satisfied)
+				{
+					FString Remedy;
+					const FString ModuleLabel = NA_VSD_ModuleLabel(*Module.Node);
+					const TCHAR* Side = Dep.Type == ENiagaraModuleDependencyType::PreDependency
+						? TEXT("ABOVE") : TEXT("BELOW");
+
+					switch (Verdict)
+					{
+					case EDependencyVerdict::WrongOrder:
+						Remedy = FString::Printf(
+							TEXT("A module providing '%s' is present but on the wrong side. Move it %s '%s' "
+								 "(or move '%s' to the other side of it) in %s."),
+							*Dep.Id.ToString(), Side, *ModuleLabel, *ModuleLabel, *Module.StageKey);
+						break;
+					case EDependencyVerdict::DisabledProvider:
+						Remedy = FString::Printf(
+							TEXT("A module providing '%s' is correctly placed but DISABLED. Enable it — see "
+								 "candidate_providers."), *Dep.Id.ToString());
+						break;
+					case EDependencyVerdict::WrongVersion:
+						Remedy = FString::Printf(
+							TEXT("A module providing '%s' is correctly placed and enabled but its version does not "
+								 "satisfy required_version '%s'. Change its version — see candidate_providers."),
+							*Dep.Id.ToString(), *Dep.RequiredVersion);
+						break;
+					default:
+						Remedy = FString::Printf(
+							TEXT("No usable module provides '%s' in this scope. Add one %s '%s' in %s — see "
+								 "suggested_providers for the modules that both provide it and are allowed in that "
+								 "stage."),
+							*Dep.Id.ToString(), Side, *ModuleLabel, *Module.StageKey);
+						break;
+					}
+					F->SetStringField(TEXT("remedy"), Remedy);
+
+					if (bSuggestProviders)
+					{
+						// SameScript restricts the suggestion to modules allowed in THIS stage —
+						// which is what makes Particle Update suggest Solve Forces and Velocity while
+						// Particle Spawn suggests Apply Initial Forces.
+						TOptional<ENiagaraScriptUsage> RequiredUsage;
+						if (Dep.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::SameScript)
+						{
+							// The bitmask test shifts by the usage's enum value, so the interpolated
+							// spawn usage must be normalised or it would index a different bit.
+							RequiredUsage = Module.Usage == ENiagaraScriptUsage::ParticleSpawnScriptInterpolated
+								? ENiagaraScriptUsage::ParticleSpawnScript : Module.Usage;
+						}
+
+						const FString CacheKey = FString::Printf(TEXT("%s|%d"), *Dep.Id.ToString(),
+							RequiredUsage.IsSet() ? static_cast<int32>(RequiredUsage.GetValue()) : -1);
+						TArray<FAssetData>* Cached = ProviderAssetCache.Find(CacheKey);
+						if (!Cached)
+						{
+							TArray<FAssetData> Found;
+							NA_VSD_FindProviderAssets(Dep.Id, RequiredUsage, Found);
+							Cached = &ProviderAssetCache.Add(CacheKey, MoveTemp(Found));
+						}
+
+						TArray<TSharedPtr<FJsonValue>> SuggestJson;
+						for (const FAssetData& Asset : *Cached)
+						{
+							TSharedRef<FJsonObject> S = MakeShared<FJsonObject>();
+							S->SetStringField(TEXT("name"), Asset.AssetName.ToString());
+							S->SetStringField(TEXT("script_path"), Asset.GetObjectPathString());
+							SuggestJson.Add(MakeShared<FJsonValueObject>(S));
+						}
+						F->SetArrayField(TEXT("suggested_providers"), SuggestJson);
+						F->SetStringField(TEXT("suggested_providers_scope"), RequiredUsage.IsSet()
+							? FString::Printf(TEXT("modules whose ModuleUsageBitmask allows '%s' (the dependency is "
+													"SameScript, so only this stage can host the provider)"),
+									*Module.StageKey)
+							: FString(TEXT("modules providing this id in any stage (the dependency is AllScripts)")));
+
+						if (SuggestJson.Num() == 0)
+						{
+							Warnings.Add(FString::Printf(
+								TEXT("No module asset in the project advertises ProvidedDependencies '%s'%s. Either the "
+									 "id is misspelled on '%s', or the providing module is deprecated/hidden (both are "
+									 "filtered out, mirroring the editor). The dependency is still genuinely unmet."),
+								*Dep.Id.ToString(),
+								RequiredUsage.IsSet() ? *FString::Printf(TEXT(" and is allowed in %s"), *Module.StageKey) : TEXT(""),
+								*ModuleLabel));
+						}
+					}
+				}
+
+				Findings.Add(MakeShared<FJsonValueObject>(F));
+			}
+		}
+
+		TSharedRef<FJsonObject> ScopeJson = MakeShared<FJsonObject>();
+		ScopeJson->SetStringField(TEXT("scope"), Scope.EmitterName.IsEmpty() ? TEXT("system") : TEXT("emitter"));
+		ScopeJson->SetStringField(TEXT("emitter"), Scope.EmitterName);
+		if (!Scope.EmitterId.IsEmpty()) ScopeJson->SetStringField(TEXT("emitter_id"), Scope.EmitterId);
+		ScopeJson->SetNumberField(TEXT("module_count"), Scope.Modules.Num());
+		ScopeJson->SetArrayField(TEXT("ordered_stages"), Scope.Stages);
+		ScopesJson.Add(MakeShared<FJsonValueObject>(ScopeJson));
+	}
+
+	// --- RESPONSE ------------------------------------------------------------------------------
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("system_path"), SystemPath);
+	R->SetBoolField(TEXT("read_only"), true);
+	R->SetArrayField(TEXT("findings"), Findings);
+	R->SetNumberField(TEXT("problem_count"), UnmetCount);
+	R->SetNumberField(TEXT("satisfied_count"), SatisfiedCount);
+	R->SetNumberField(TEXT("modules_checked"), ModulesChecked);
+	R->SetNumberField(TEXT("dependencies_evaluated"), DependenciesEvaluated);
+	R->SetNumberField(TEXT("dependencies_not_enforced_in_their_stage"), DependenciesNotEnforcedHere);
+	R->SetArrayField(TEXT("scopes"), ScopesJson);
+	R->SetArrayField(TEXT("skipped"), SkippedJson);
+	R->SetStringField(TEXT("how_to_read"),
+		TEXT("problem_count is the number of unmet or mis-ordered dependencies, and is intended to match what the "
+			 "Niagara editor reports as stack issues of this kind — WITHOUT requiring a compile. Each finding names "
+			 "the stage it was judged in; a dependency's engine_description is the author's own prose and often "
+			 "describes the remedy for more than one stage at once (e.g. Solve Forces and Velocity in Particle "
+			 "Update vs Apply Initial Forces in Particle Spawn), so read it together with 'stage' and use "
+			 "'suggested_providers', which is filtered to modules actually allowed in that stage. Pre/Post ordering "
+			 "is compared across the WHOLE scope (system -> emitter -> particle -> simulation stages), not within a "
+			 "single stage, so a cross-stage AllScripts dependency is in practice a presence check. This action "
+			 "never modifies anything."));
+
+	if (bHasUsageFilter)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("A 'usage' filter (%s) was applied: only modules in that stage were EVALUATED. Provider searching "
+				 "still covered every stage, so no finding is invented — but problem_count is a SUBSET and must not "
+				 "be compared against the editor's total issue count."), *UsageFilterString));
+	}
+	if (!EmitterFilter.IsEmpty())
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("An 'emitter' filter (%s) was applied, so the system-stage scope was not evaluated and other "
+				 "emitters were not checked. problem_count is a SUBSET of the system's total."), *EmitterFilter));
+	}
+	if (SkippedJson.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(
+			TEXT("%d stage(s) or module(s) were NOT checked — see skipped[] for each reason. Event-handler stages "
+				 "and disabled simulation stages are blind spots in the ENGINE's own dependency check, so they are "
+				 "skipped here too in order to stay in agreement with the editor."), SkippedJson.Num()));
+	}
+
+	FMonolithJsonUtils::AddWarnings(R, Warnings);
+	return NA_SuccessObj(R);
 }
 
 FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params)

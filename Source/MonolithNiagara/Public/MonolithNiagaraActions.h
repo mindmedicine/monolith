@@ -227,6 +227,11 @@ public:
 	 *  stack ordering and that nothing in Monolith could previously read. Reads the EXPOSED version
 	 *  by default and always reports which version it read. */
 	static FMonolithActionResult HandleGetScriptDetails(const TSharedPtr<FJsonObject>& Params);
+	/** READ-ONLY (never fixes anything): walk a system's placed modules in execution order and report
+	 *  every declared dependency that is unmet or mis-ordered. Ports the editor's own rules
+	 *  (NiagaraStackModuleItem.cpp:800-911) because DependencyUtilities is not exported — so, unlike
+	 *  the native GetStackIssues, it needs NO COMPILE to have been requested. */
+	static FMonolithActionResult HandleValidateStackDependencies(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetScriptMetadata(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAuditStackWiring(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListStackWriters(const TSharedPtr<FJsonObject>& Params);
