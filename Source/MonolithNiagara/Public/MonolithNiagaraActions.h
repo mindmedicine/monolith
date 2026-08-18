@@ -269,6 +269,14 @@ public:
 	static FMonolithActionResult HandleRemoveMapParameterPin(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetScriptParameterType(const TSharedPtr<FJsonObject>& Params);
 
+	/**
+	 * Fire the propagation half of the script toolkit's Apply button on a script we already
+	 * mutated in place (I-19 / I-37). The signature-changing actions do this automatically;
+	 * this action exists to REPAIR an asset edited before that existed, and to run the
+	 * negative control (mutate with notify_applied=false, measure, then apply here).
+	 */
+	static FMonolithActionResult HandleApplyScriptChanges(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers (public for use by free functions) ---
 	/** Renders a parameter store entry as a value string, reporting FAILURE instead of
 	 *  substituting a sentinel. Gap #42 residual: SerializeParameterValue's "<unsupported>"

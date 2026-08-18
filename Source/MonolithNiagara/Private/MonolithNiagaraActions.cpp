@@ -49,6 +49,14 @@
 #include "NiagaraDecalRendererProperties.h"
 #include "NiagaraVolumeRendererProperties.h"
 #include "NiagaraEditorModule.h"
+// TObjectIterator<UNiagaraScript> — the loaded-script sweep NA_NotifyScriptApplied uses to find
+// placed callers, mirroring FNiagaraEditorUtilities::RefreshAllScriptsFromExternalChanges
+// (NiagaraEditorUtilities.cpp:3412).
+#include "UObject/UObjectIterator.h"
+// I-41 detection: FNiagaraScriptToolkit registers the ORIGINAL script as its editing object
+// (NiagaraScriptToolkit.cpp:319) while editing a TRANSIENT DUPLICATE (:202), so an open toolkit
+// is both findable and divergent. FindEditorsForAsset is UNREALED_API (AssetEditorSubsystem.h:163).
+#include "Subsystems/AssetEditorSubsystem.h"
 // Gap #32 — the per-type pin encoders/parsers the compiler itself reads through.
 // NiagaraEditorModule.h only FORWARD-declares INiagaraEditorTypeUtilities (:38), so the
 // interface header is required to call GetPinDefaultStringFromValue / SetValueFromPinDefaultString.
@@ -1369,6 +1377,238 @@ static void NA_ReportSave(const TSharedRef<FJsonObject>& R, const FMonolithSaveO
 	}
 	if (!Outcome.bSaved && !Outcome.Error.IsEmpty()) R->SetStringField(TEXT("save_error"), Outcome.Error);
 }
+
+// ---------------------------------------------------------------------------
+// Script "Apply" propagation — the missing half behind I-19 and I-37.
+//
+// Pressing Apply in the script toolkit does TWO things (NiagaraScriptToolkit.cpp:955-963,
+// OnApply):
+//   1. UpdateOriginalNiagaraScript() (:1065-1099) — compiles the edited copy, duplicates it
+//      over the original (:1082), then calls
+//      FNiagaraEditorUtilities::RefreshAllScriptsFromExternalChanges (:1095) and
+//      FNiagaraEditorModule::InvalidateCachedScriptAssetData (:1098).
+//   2. FNiagaraEditorModule::Get().ScriptApplied(OriginalScript, Version) (:962).
+//
+// Our writes land on the ORIGINAL asset, so the duplicate step is neither needed nor wanted.
+// What we never did is the PROPAGATION, which is two distinct mechanisms:
+//
+//   * RefreshAllScriptsFromExternalChanges sweeps every loaded UNiagaraScript and calls
+//     RefreshFromExternalChanges() on each node referencing the changed script
+//     (NiagaraEditorUtilities.cpp:3471-3493). On a function-call node that reallocates the
+//     node's pins from the called graph's CURRENT signature
+//     (NiagaraNodeFunctionCall.cpp:1145-1152: ReallocatePins +
+//     SynchronizeReferencingMapPinsWithFunctionCall). Because it REALLOCATES rather than
+//     diffs, it covers added, removed AND retyped inputs alike. This is the step the
+//     remove-and-re-add ritual was standing in for. It is gated on
+//     `CachedChangeId != Source->NodeGraph->GetChangeID()` (:1114), so the mutating action
+//     must have bumped the module graph's ChangeID first — every caller below does, via
+//     MarkNodeRequiresSynchronization/NotifyGraphChanged.
+//   * ScriptApplied broadcasts to FTraversalCache::OnScriptApplied (TraversalCache.cpp:177,
+//     bumps the serial that invalidates dependent cached traversal data),
+//     FNiagaraSystemViewModel's reset lambda (NiagaraSystemViewModel.cpp:184) and the stack
+//     hierarchy / summary view models.
+//
+// LINKAGE — checked before writing; this is WHY the sweep is reimplemented, not called:
+//   FNiagaraEditorUtilities::RefreshAllScriptsFromExternalChanges  NiagaraEditorUtilities.h:399  NO macro
+//   FNiagaraEditorModule::InvalidateCachedScriptAssetData          NiagaraEditorModule.h:284     NO macro
+//   UNiagaraGraph::MarkGraphRequiresSynchronization/GetAllReferencedGraphs
+//                                                                  NiagaraGraph.h:323/:314       NO macro
+//                                                                  (UCLASS(MinimalAPI) at :234)
+//   FNiagaraEditorModule::ScriptApplied                            NiagaraEditorModule.h:326     NIAGARAEDITOR_API  <- callable
+//   UNiagaraNode::RefreshFromExternalChanges / GetReferencedAsset  NiagaraNode.h:87/:83          VIRTUAL            <- vtable, no symbol
+//
+// KNOWN GAPS vs the engine — stated, not papered over:
+//   - NO TRANSITIVE PASS. The engine also collects scripts whose graph merely references the
+//     changed graph, via GetAllReferencedGraphs (:3504); that is unreachable. Direct callers
+//     are refreshed; a module called through an intermediate function script may still need a
+//     manual recompile.
+//   - InvalidateCachedScriptAssetData (browser/menu cached asset data) is not called.
+//   - The engine recompiles affected emitters (:3546-3557). We deliberately do not: this stays
+//     a notification so it cannot turn a cheap edit into a hidden multi-system compile. Callers
+//     drive compilation with request_compile as before.
+//   - Refreshed CALLER packages are left dirty in memory and are NOT saved here (saving another
+//     asset as a side effect of editing this one is its own hazard). Reported so it is visible.
+// ---------------------------------------------------------------------------
+struct FMonolithApplyOutcome
+{
+	bool bFired = false;
+	bool bOpenInAssetEditor = false;   // I-41 data-loss hazard, see NA_IsScriptOpenInAssetEditor
+	FGuid VersionNotified;
+	int32 CallerNodesRefreshed = 0;
+	TArray<FString> CallerAssets;
+};
+
+/**
+ * I-41 — is this script currently open in an asset editor?
+ *
+ * THIS IS A DATA-LOSS DETECTOR, not a nicety. FNiagaraScriptToolkit::Initialize duplicates the
+ * script into the transient package and edits THAT (NiagaraScriptToolkit.cpp:202), while
+ * registering the ORIGINAL with the asset-editor subsystem (:319). Our writes go to the original,
+ * so an open toolkit is holding a copy that diverges the moment we touch the asset — and every
+ * one of the toolkit's write-back paths copies its stale copy OVER the original:
+ *   OnApply                (:955-963)  -> UpdateOriginalNiagaraScript -> StaticDuplicateObject (:1082)
+ *   SaveAsset_Execute      (:1041-1051) -> same, gated on IsEditScriptDifferentFromOriginalScript
+ *   SaveAssetAs_Execute    (:1053-1063) -> same
+ *   OnRequestClose "Yes"   (:1102-1135) -> same
+ *
+ * The gate makes it WORSE rather than better: IsEditScriptDifferentFromOriginalScript (:950-952)
+ * compares base change ids, and OUR OWN WRITE bumps the original's. So after an MCP edit the ids
+ * differ even though the user typed nothing — which ENABLES the Apply button (:966-968) and makes
+ * a plain Ctrl+S in that window silently overwrite our work.
+ */
+static bool NA_IsScriptOpenInAssetEditor(UNiagaraScript* Script)
+{
+	if (!Script || !GEditor) return false;
+	UAssetEditorSubsystem* Subsystem = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
+	return Subsystem && Subsystem->FindEditorsForAsset(Script).Num() > 0;
+}
+
+/**
+ * Which version guid to broadcast. Mirrors the toolkit, which passes OriginalNiagaraScript.Version
+ * — an INVALID FGuid when versioning is disabled, the selected version otherwise. That matters
+ * because placed callers key the traversal cache off UNiagaraNodeFunctionCall::SelectedScriptVersion
+ * (TraversalBuilder.cpp:329) and FTraversalCache::OnScriptApplied only bumps its serial when that
+ * exact key is present (TraversalCache.cpp:179-183). A wrong guid is therefore SILENTLY INERT — it
+ * does not corrupt anything, it just fails to invalidate. Note GetExposedVersion().VersionGuid is a
+ * real guid even for an unversioned script (NiagaraScript.cpp:508-512), so it must NOT be used
+ * unconditionally.
+ */
+static FGuid NA_ResolveAppliedVersion(UNiagaraScript* Script, const FGuid& RequestedVersion)
+{
+	if (RequestedVersion.IsValid()) return RequestedVersion;
+	return Script->IsVersioningEnabled() ? Script->GetExposedVersion().VersionGuid : FGuid();
+}
+
+/** Do what Apply does, minus the transient-copy dance we do not need. Never fatal. */
+static FMonolithApplyOutcome NA_NotifyScriptApplied(UNiagaraScript* Script, const FGuid& RequestedVersion = FGuid())
+{
+	FMonolithApplyOutcome Outcome;
+	if (!Script) return Outcome;
+
+	Outcome.VersionNotified = NA_ResolveAppliedVersion(Script, RequestedVersion);
+	Outcome.bOpenInAssetEditor = NA_IsScriptOpenInAssetEditor(Script);
+
+	// --- half 1: re-read the placed callers from the new signature ---
+	for (TObjectIterator<UNiagaraScript> It; It; ++It)
+	{
+		UNiagaraScript* Other = *It;
+		if (Other == Script || !IsValid(Other)) continue;
+
+		UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Other->GetLatestSource());
+		if (!Source || !Source->NodeGraph) continue;
+
+		TArray<UNiagaraNode*> Nodes;
+		Source->NodeGraph->GetNodesOfClass<UNiagaraNode>(Nodes);
+
+		bool bRefreshedAny = false;
+		for (UNiagaraNode* Node : Nodes)
+		{
+			// GetReferencedAsset() is how the engine matches here (NiagaraEditorUtilities.cpp:3474)
+			// rather than FunctionScript directly, so convert/DI nodes are covered too.
+			if (!Node || Node->GetReferencedAsset() != Script) continue;
+
+			// MUST dispatch through the UNiagaraNode base pointer: the overrides carry no export
+			// macro, so a devirtualized direct call would emit an external symbol and fail to link
+			// (LNK2019). Same constraint NotifyPropagationChanged documents.
+			if (Node->RefreshFromExternalChanges())
+			{
+				++Outcome.CallerNodesRefreshed;
+				bRefreshedAny = true;
+			}
+		}
+
+		if (bRefreshedAny)
+		{
+			// MarkGraphRequiresSynchronization is the engine's call and is unreachable;
+			// NotifyGraphChanged is virtual, reachable, and updates the ChangeID too
+			// (NiagaraGraph.h:325-326) — the substitution rename_script_parameter already makes.
+			Source->NodeGraph->NotifyGraphChanged();
+			if (UObject* OwnerAsset = Other->GetOutermostObject())
+			{
+				Outcome.CallerAssets.AddUnique(OwnerAsset->GetPathName());
+			}
+		}
+	}
+
+	// --- half 2: the notification the Apply button fires ---
+	// LoadModuleChecked rather than FNiagaraEditorModule::Get() to match this file's existing
+	// access pattern (:2693, :2870, :2999).
+	FNiagaraEditorModule& NiagaraEditorModule =
+		FModuleManager::LoadModuleChecked<FNiagaraEditorModule>(TEXT("NiagaraEditor"));
+	NiagaraEditorModule.ScriptApplied(Script, Outcome.VersionNotified);
+	Outcome.bFired = true;
+
+	UE_LOG(LogMonolithNiagara, Log,
+		TEXT("ScriptApplied('%s', version %s): %d caller node(s) refreshed across %d asset(s)."),
+		*Script->GetPathName(),
+		Outcome.VersionNotified.IsValid() ? *Outcome.VersionNotified.ToString() : TEXT("<unversioned>"),
+		Outcome.CallerNodesRefreshed, Outcome.CallerAssets.Num());
+
+	return Outcome;
+}
+
+/** Merge apply reporting into an action response, so the propagation is never silent. */
+static void NA_ReportApplied(const TSharedRef<FJsonObject>& R, const FMonolithApplyOutcome& Outcome)
+{
+	R->SetBoolField(TEXT("script_applied"), Outcome.bFired);
+	if (!Outcome.bFired)
+	{
+		R->SetStringField(TEXT("apply_note"), TEXT(
+			"notify_applied=false: the edit was made but the editor's Apply propagation was NOT fired, so "
+			"placed callers still carry the OLD signature (I-19). This is the negative-control path — call "
+			"apply_script_changes to propagate, or remove and re-add the placed module."));
+		return;
+	}
+	R->SetStringField(TEXT("applied_version"),
+		Outcome.VersionNotified.IsValid() ? Outcome.VersionNotified.ToString() : TEXT("<unversioned>"));
+	R->SetNumberField(TEXT("callers_refreshed"), Outcome.CallerNodesRefreshed);
+
+	R->SetBoolField(TEXT("open_in_asset_editor"), Outcome.bOpenInAssetEditor);
+	if (Outcome.bOpenInAssetEditor)
+	{
+		R->SetStringField(TEXT("open_editor_hazard"), TEXT(
+			"DATA-LOSS HAZARD (I-41): this script is OPEN in an asset editor, which is editing a transient "
+			"DUPLICATE taken when the window opened (NiagaraScriptToolkit.cpp:202). That copy does not have this "
+			"change. Pressing Apply, SAVING that window, or closing it and answering Yes will copy the stale "
+			"duplicate back over the asset and DESTROY this edit (:1082). Worse, our write bumps the change id the "
+			"toolkit compares (:950-952), so its Apply button is now enabled although the user typed nothing. "
+			"CLOSE THE SCRIPT EDITOR WITHOUT SAVING, then re-open it to see this change."));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Assets;
+	for (const FString& A : Outcome.CallerAssets) Assets.Add(MakeShared<FJsonValueString>(A));
+	R->SetArrayField(TEXT("caller_assets_refreshed"), Assets);
+
+	if (Outcome.CallerNodesRefreshed > 0)
+	{
+		R->SetStringField(TEXT("apply_note"), TEXT(
+			"Placed callers were re-read from this script's current signature — the propagation half of the "
+			"editor's Apply button. Those caller ASSETS are now dirty IN MEMORY and are NOT saved by this "
+			"action: save them, or they revert on restart. Verify with a compiled dump, not read-back alone."));
+	}
+}
+
+/**
+ * notify_applied — default TRUE. false runs the NEGATIVE CONTROL: mutate without propagating, so
+ * I-19 can be measured rather than assumed. Without this there is no way to observe the pre-fix
+ * behaviour, and "it works now" with no control is not evidence.
+ */
+static bool NA_ShouldNotifyApplied(const TSharedPtr<FJsonObject>& Params)
+{
+	if (Params.IsValid() && Params->HasTypedField<EJson::Boolean>(TEXT("notify_applied")))
+	{
+		return Params->GetBoolField(TEXT("notify_applied"));
+	}
+	return true;
+}
+
+/** The shared schema blurb, so all five signature-changing actions document it identically. */
+#define MONOLITH_NOTIFY_APPLIED_DESC TEXT( \
+	"Default TRUE. Fires the propagation half of the script toolkit's Apply button after the edit " \
+	"(re-reads placed callers from the new signature, then broadcasts ScriptApplied), which is what " \
+	"makes a signature change reach already-placed modules without removing and re-adding them " \
+	"(I-19/I-37). false = mutate SILENTLY, leaving callers on the old signature — the negative " \
+	"control; follow it with apply_script_changes to propagate separately.")
 
 namespace
 {
@@ -4149,6 +4389,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara script asset path"))
 			.Required(TEXT("hlsl"), TEXT("string"), TEXT("Replacement HLSL body text"))
 			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Specific CustomHlsl node GUID when the script contains multiple nodes"))
+			.Optional(TEXT("notify_applied"), TEXT("bool"), MONOLITH_NOTIFY_APPLIED_DESC)
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("add_module"), TEXT("Add a module to a script stage"),
 		FMonolithActionHandler::CreateStatic(&HandleAddModule),
@@ -4492,6 +4733,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("type"), TEXT("string"), TEXT("Niagara type (float, int, bool, vec3, position, a data interface class name, ...). Required UNLESS enum_path is given, and MUTUALLY EXCLUSIVE with it. Enum types cannot be named here — use enum_path."))
 			.Optional(TEXT("enum_path"), TEXT("string"), TEXT("Enum-typed pin: the UEnum as a full object path ('/Script/Niagara.ENiagaraCoordinateSpace') or a bare name ('ENiagaraCoordinateSpace'). MUTUALLY EXCLUSIVE with 'type' — passing both is refused rather than silently resolved (gap #69); it used to win silently. This is the same route add_graph_node's switch_type=enum takes — an enum module input can only be read onto a MapGet this way."))
 			.Optional(TEXT("existing"), TEXT("bool"), TEXT("true = reference a parameter that already exists instead of creating a new one (the pin is repaired onto the existing parameter). Default false, which refuses a name that is already taken."))
+			.Optional(TEXT("notify_applied"), TEXT("bool"), MONOLITH_NOTIFY_APPLIED_DESC)
 			.Build());
 
 	// --- Script parameter metadata / default mode / hierarchy ---
@@ -4565,6 +4807,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("new_name"), TEXT("string"), TEXT("New fully-namespaced name (e.g. 'Module.Intensity'). A name with no namespace is accepted but warned about — a bare name is a different parameter from the namespaced one."))
 			.Optional(TEXT("allow_merge"), TEXT("bool"), TEXT("Default false. true = permit renaming ONTO a parameter that already exists with the same type; the two merge, the TARGET's metadata wins and this parameter's is discarded (NiagaraGraph.cpp:2859-2874)."))
 			.Optional(TEXT("fix_placed_callers"), TEXT("bool"), TEXT("Default TRUE. Traverse every referencing Niagara asset (which LOADS and re-saves them) and rename each placed module's stale override pin so the caller keeps working. false = the old warn-only behaviour: the rename still happens and the callers break on next load (I-38)."))
+			.Optional(TEXT("notify_applied"), TEXT("bool"), MONOLITH_NOTIFY_APPLIED_DESC)
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_map_parameter_pin"), TEXT("Remove one parameter pin from a ParameterMapGet (read) or ParameterMapSet (write) node — the inverse of add_map_parameter_pin, and the sweep for read pins left dangling by an earlier edit (gap #66). On a MapGet the engine's own OnPinRemoved takes the paired default-value input pin with it and clears the pin-pair guid map (NiagaraNodeParameterMapGet.cpp:175-199), so this reproduces the editor's context-menu 'Remove pin' exactly. It does NOT remove the parameter from the script's registry — that is remove_script_parameter's job, and the response says whether the parameter is now unreferenced. Refuses a pin that still has connections unless break_links=true, listing every link it would break. Requires the engine-private wizard build (dev builds only)."),
@@ -4574,6 +4817,7 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("ParameterMapGet or ParameterMapSet node guid"))
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Pin name to remove, i.e. the parameter it carries (e.g. 'Module.Shape Origin'). Match list_graph_node_pins exactly — the match is case-sensitive."))
 			.Optional(TEXT("break_links"), TEXT("bool"), TEXT("Default false, which REFUSES a connected pin and names every connection. true = break the connections and remove the pin anyway."))
+			.Optional(TEXT("notify_applied"), TEXT("bool"), MONOLITH_NOTIFY_APPLIED_DESC)
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_script_parameter_type"), TEXT("Change the TYPE of an existing module-script parameter, retyping every pin that carries it and keeping the connections that still typecheck (UNiagaraGraph::ChangeParameterType — the editor's own Change Type). Connections that cannot be kept become ORPHANED pins rather than vanishing, exactly as the editor's script toolkit does (NiagaraParameterPanelViewModel.cpp:2907); the response reports every orphan created. Re-derives the engine's own admission rules: refuses static switch parameters, static-typed parameters, parameters subscribed to a Parameter Definition, and target types the editor's own Change Type submenu filters out (data interfaces, enums, UObjects, payload and internal types — NiagaraParameterPanelViewModel.cpp:594). WARNS when the script is already placed in a system (gap #62). Not exposed through batch_execute."),
@@ -4583,6 +4827,22 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("parameter"), TEXT("string"), TEXT("Parameter name (e.g. 'Module.Amount')"))
 			.Required(TEXT("type"), TEXT("string"), TEXT("New Niagara type: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix. Enum and data-interface types are refused here on purpose — the editor does not offer them either; build an enum-typed pin with add_map_parameter_pin's enum_path instead."))
 			.Optional(TEXT("allow_orphaned_pins"), TEXT("bool"), TEXT("Default true, matching the editor's script-toolkit path. false = do NOT create orphaned pins; connections that no longer typecheck are then left in place at the wrong type, which the response calls out."))
+			.Optional(TEXT("notify_applied"), TEXT("bool"), MONOLITH_NOTIFY_APPLIED_DESC)
+			.Build());
+
+	Registry.RegisterAction(TEXT("niagara"), TEXT("apply_script_changes"),
+		TEXT("Fire the propagation half of the script toolkit's APPLY button on a module / dynamic-input / function "
+		     "script that was already edited in place. Re-reads every LOADED placed caller from the script's current "
+		     "signature (the step that makes an added/removed/retyped input reach modules already in a system without "
+		     "removing and re-adding them — I-19/I-37), then broadcasts ScriptApplied, which invalidates the traversal "
+		     "cache and resets open system view models. The signature-changing actions (set_custom_hlsl_text, "
+		     "add_map_parameter_pin, remove_map_parameter_pin, rename_script_parameter, set_script_parameter_type) "
+		     "already do this automatically; use this action to REPAIR a script edited before that existed, or after a "
+		     "deliberate notify_applied=false. Does NOT compile and does NOT save the refreshed caller assets."),
+		FMonolithActionHandler::CreateStatic(&HandleApplyScriptChanges),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("script_path"), TEXT("Niagara module / dynamic-input / function script asset path"))
+			.Optional(TEXT("version"), TEXT("string"), TEXT("Version GUID to notify for. Omit to mirror the Apply button: the exposed version's guid when the script has versioning enabled, and the unversioned form otherwise. Placed callers key the traversal cache off their own SelectedScriptVersion, so a guid that matches nothing is silently inert rather than harmful."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_debug_draw"), TEXT("Toggle a placed module's debug visualization — the 'eye' icon in the stack. Only works on modules that contain a Function.DebugState static switch (e.g. the stock ShapeLocation); the response reports supports_debug_draw either way. Drawing is done by the module's own DebugDraw data interface and is globally gated by the cvar fx.Niagara.DebugDraw.Enabled. Omit 'enabled' to just query the current state."),
@@ -5746,6 +6006,65 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRequestCompile(const TShare
 	return NA_SuccessStr(TEXT("Compile requested"));
 }
 
+FMonolithActionResult FMonolithNiagaraActions::HandleApplyScriptChanges(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString ScriptPath = Params->HasField(TEXT("script_path"))
+		? Params->GetStringField(TEXT("script_path")) : NA_GetAssetPath(Params);
+	if (ScriptPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: script_path"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ScriptPath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ScriptPath));
+
+	// An explicit version wins; otherwise mirror the toolkit (see NA_ResolveAppliedVersion).
+	FGuid RequestedVersion;
+	if (Params->HasField(TEXT("version")))
+	{
+		const FString VersionText = Params->GetStringField(TEXT("version"));
+		if (!VersionText.IsEmpty() && !FGuid::Parse(VersionText, RequestedVersion))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'version' is not a parseable GUID: '%s'. Omit it to use the script's exposed version "
+				     "(or the unversioned form, matching what the Apply button passes). NOTHING WAS CHANGED."),
+				*VersionText));
+		}
+	}
+
+	const FMonolithApplyOutcome ApplyOutcome = NA_NotifyScriptApplied(Script, RequestedVersion);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	NA_ReportApplied(R, ApplyOutcome);
+	R->SetStringField(TEXT("script_path"), ScriptPath);
+	R->SetBoolField(TEXT("versioning_enabled"), Script->IsVersioningEnabled());
+
+	TArray<FString> Warnings;
+	if (ApplyOutcome.bOpenInAssetEditor)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"'%s' is OPEN in an asset editor (I-41). That window edits a transient duplicate taken when it opened, so "
+			"it does not contain the change being applied — and Apply/Save/close-Yes in that window will copy the stale "
+			"copy back over the asset. Close it WITHOUT saving before relying on this."), *ScriptPath));
+	}
+	if (ApplyOutcome.CallerNodesRefreshed == 0)
+	{
+		// Distinguish "nothing to do" from "did not work" — RefreshFromExternalChanges returns
+		// false when the caller's CachedChangeId already matches the called graph
+		// (NiagaraNodeFunctionCall.cpp:1114), which is also the shape of an ALREADY-applied script.
+		Warnings.Add(TEXT(
+			"No caller node reported a refresh. Either nothing references this script, the referencing assets are "
+			"not LOADED (this sweeps loaded scripts only, as the engine's own does), or every caller was already "
+			"in sync — RefreshFromExternalChanges returns false when the caller's cached change id already matches "
+			"(NiagaraNodeFunctionCall.cpp:1114). It does NOT by itself mean the apply failed."));
+	}
+	if (ApplyOutcome.CallerAssets.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d caller asset(s) were modified IN MEMORY and are NOT saved by this action: %s. Save them or the "
+			"refresh is lost on restart."),
+			ApplyOutcome.CallerAssets.Num(), *FString::Join(ApplyOutcome.CallerAssets, TEXT(", "))));
+	}
+	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
+}
+
 FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystem(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SavePath = Params->GetStringField(TEXT("save_path"));
@@ -6619,8 +6938,17 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetCustomHLSLText(const TSh
 	Script->MarkPackageDirty();
 	Script->RequestCompile(Script->GetExposedVersion().VersionGuid, false);
 
+	// Compile first, then propagate — the order OnApply uses (UpdateOriginalNiagaraScript
+	// compiles at NiagaraScriptToolkit.cpp:1081 before refreshing callers at :1095).
+	FMonolithApplyOutcome ApplyOutcome;
+	if (NA_ShouldNotifyApplied(Params))
+	{
+		ApplyOutcome = NA_NotifyScriptApplied(Script);
+	}
+
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
 	R->SetBoolField(TEXT("success"), true);
+	NA_ReportApplied(R, ApplyOutcome);
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("node_guid"), TargetNode->NodeGuid.ToString());
 	R->SetNumberField(TEXT("length"), HlslText.Len());
@@ -29222,7 +29550,16 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddMapParameterPin(const TS
 	GEditor->EndTransaction();
 	SavePackageFor(Script);
 
+	// Adding a Module.* pin IS a signature change: without this the placed callers keep the old
+	// input list until removed and re-added (I-19).
+	FMonolithApplyOutcome ApplyOutcome;
+	if (NA_ShouldNotifyApplied(Params))
+	{
+		ApplyOutcome = NA_NotifyScriptApplied(Script);
+	}
+
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	NA_ReportApplied(R, ApplyOutcome);
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 	R->SetStringField(TEXT("kind"), Kind);
@@ -30244,9 +30581,16 @@ namespace MonolithNiagaraIOSurgery
 	 * analogous case (a static switch added to a placed module: 72 compile errors, "Ensure condition
 	 * failed: SelectorValue != INDEX_NONE") and established that NO action refreshes a placed
 	 * caller — saving, re-opening the system editor and toggling the module's enabled flag were all
-	 * tried and all failed. So this warns, names the assets, and states the only remedy that is
-	 * known to work; it does not offer a refresh, because there is none to offer (defect pattern 5:
-	 * never suggest a fix without something that verifies the fix exists).
+	 * tried and all failed.
+	 *
+	 * SUPERSEDED 2026-08-18: a refresh DOES exist now. apply_script_changes mirrors the editor's
+	 * Apply — UpdateOriginalNiagaraScript's RefreshAllScriptsFromExternalChanges sweep plus
+	 * FNiagaraEditorModule::ScriptApplied — and was measured with controls on add, remove and retype
+	 * to refresh placed callers IN PLACE while preserving their other override values. The three
+	 * things #62 tried all failed because none of them is Apply; Compile is not Apply, which is the
+	 * whole point. What survives from #62 is the STATIC SWITCH case, which is still untested here.
+	 * So this warning now points at apply_script_changes and names the two residuals it does not
+	 * clean up (#114 dead override pin after a remove, #115 two same-named inputs after a retype).
 	 *
 	 * The referencer list comes from the asset-registry PACKAGE graph — the same call
 	 * find_niagara_references makes (IAssetRegistry.h:592). It loads nothing, so it is safe to run
@@ -30298,14 +30642,15 @@ namespace MonolithNiagaraIOSurgery
 		R->SetArrayField(TEXT("referencing_packages"), RefArr);
 
 		Warnings.Add(FString::Printf(TEXT(
-			"PLACED CALLERS: %d package(s) reference this script (%s%s). %s does NOT update a placed module node — it "
-			"keeps the pins it was built with, so %s No action refreshes a placed caller today (gap #62: saving, "
-			"re-opening the system editor and toggling the module's enabled flag were all measured and all failed). The "
-			"only remedy known to work is the engine's own remove-and-re-add — remove_module then add_module on each "
-			"placed instance — and that DISCARDS every non-default value set on it, which is precisely the I-19 churn "
-			"this action exists to avoid. Open each system and check its stack. find_niagara_references on this script "
-			"lists them all; that list is the asset-registry package graph, so it is a superset — a referencing package "
-			"is not proof of a placed call."),
+			"PLACED CALLERS: %d package(s) reference this script (%s%s). %s does NOT update a placed module node "
+			"by itself — it keeps the pins it was built with, so %s CALL apply_script_changes ON THIS SCRIPT: "
+			"measured 2026-08-18 with controls on add, remove and retype, it refreshes placed callers in place AND "
+			"PRESERVES their other override values — which the old remove-and-re-add remedy destroyed. Prefer it; "
+			"remove_module + add_module is now the worse option, not the only one. Two residuals it does NOT clean up, "
+			"and a compile shows neither: removing an input leaves a dead override pin, and retyping one leaves the old "
+			"override so two same-named inputs exist at different types (gaps #114/#115) — inspect the caller's inputs "
+			"afterwards. find_niagara_references on this script lists the referencing packages; that list is the "
+			"asset-registry package graph, so it is a superset — a referencing package is not proof of a placed call."),
 			Referencers.Num(),
 			*FString::Join(Shown, TEXT(", ")),
 			Referencers.Num() > Shown.Num() ? *FString::Printf(TEXT(", +%d more"), Referencers.Num() - Shown.Num()) : TEXT(""),
@@ -30609,6 +30954,16 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		}
 	}
 
+	// A rename changes the signature, so placed callers must re-read it. This runs AFTER the
+	// override-pin repair above on purpose: RefreshFromExternalChanges reallocates the caller's
+	// pins from the new signature, and the repair has already moved the override onto the new
+	// name, so the two agree. Firing it first would reallocate against un-repaired overrides.
+	FMonolithApplyOutcome ApplyOutcome;
+	if (NA_ShouldNotifyApplied(Params))
+	{
+		ApplyOutcome = NA_NotifyScriptApplied(Script);
+	}
+
 	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
 
 	// A repaired caller that is never written back is worse than no repair at all: the script
@@ -30649,6 +31004,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 	CollectParameterReferences(Graph, ParamName, RefsAfterOld);
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	NA_ReportApplied(R, ApplyOutcome);
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("parameter"), ParamName);
 	R->SetStringField(TEXT("new_name"), NewName);
@@ -30927,6 +31283,14 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRemoveMapParameterPin(const
 	Graph->ConditionalRefreshParameterReferences();
 	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
 
+	// Removing a Module.* pin is a signature change; ReallocatePins drops the stale caller pin
+	// (NiagaraNodeFunctionCall.cpp:1148), so removal propagates the same way an add does.
+	FMonolithApplyOutcome ApplyOutcome;
+	if (NA_ShouldNotifyApplied(Params))
+	{
+		ApplyOutcome = NA_NotifyScriptApplied(Script);
+	}
+
 	// --- verify off the NODE, not off the request (defect pattern 2) ------------------------
 	TArray<TSharedPtr<FJsonValue>> RemovedArr;
 	TArray<FString> RemovedText;
@@ -30949,6 +31313,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRemoveMapParameterPin(const
 
 	TArray<FString> Warnings;
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	NA_ReportApplied(R, ApplyOutcome);
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 	R->SetStringField(TEXT("kind"), Kind);
@@ -31224,6 +31589,14 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptParameterType(cons
 	Graph->ConditionalRefreshParameterReferences();
 	const FMonolithSaveOutcome SaveOutcome = MonolithNiagaraGraphAuthoring::SavePackageFor(Script);
 
+	// A RETYPE is a signature change too, and ReallocatePins rebuilds the caller pin at the new
+	// type rather than diffing names (NiagaraNodeFunctionCall.cpp:1148) — so the same call covers it.
+	FMonolithApplyOutcome ApplyOutcome;
+	if (NA_ShouldNotifyApplied(Params))
+	{
+		ApplyOutcome = NA_NotifyScriptApplied(Script);
+	}
+
 	// --- verify off the GRAPH, not off the request (defect pattern 2) -----------------------
 	TArray<FNiagaraVariable> NewKeys;
 	TArray<UNiagaraScriptVariable*> NewVars;
@@ -31264,6 +31637,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetScriptParameterType(cons
 	}
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	NA_ReportApplied(R, ApplyOutcome);
 	R->SetStringField(TEXT("script_path"), ScriptPath);
 	R->SetStringField(TEXT("parameter"), ParamName);
 	R->SetStringField(TEXT("old_type"), OldType.GetName());
