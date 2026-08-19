@@ -97,6 +97,14 @@ public:
 	static FMonolithActionResult HandleCaptureMaterialGrid(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCaptureWithOverlay(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Asset-viewer preview-scene profile control ---
+	// Read / mutate UAssetViewerSettings::Profiles (the shared background, floor
+	// and environment settings every asset editor's FAdvancedPreviewScene reads).
+	// Settings-level, so a write reaches ALREADY-OPEN asset editors. Bodies live
+	// in MonolithEditorPreviewSceneActions.cpp.
+	static FMonolithActionResult HandleGetPreviewScene(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetPreviewScene(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Automation tests ---
 	static FMonolithActionResult HandleRunAutomationTests(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListAutomationTests(const TSharedPtr<FJsonObject>& Params);

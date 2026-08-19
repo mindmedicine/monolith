@@ -721,6 +721,26 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60}"))
 			.Build());
 
+	// --- Asset-viewer preview-scene profile control ---
+	// Bodies live in MonolithEditorPreviewSceneActions.cpp.
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("get_preview_scene"),
+		TEXT("Read the ASSET-VIEWER PREVIEW-SCENE profiles (UAssetViewerSettings::Profiles) — the shared background / floor / environment settings that every asset editor viewport reads: Niagara (system + sim-cache + Baker), PCG, Material, Static Mesh, Persona, Dataflow, Chaos Cloth, TextureGraph. Returns, per profile: index, profile_name, show_environment, show_floor, use_sky_lighting, post_processing_enabled, environment_color [r,g,b,a], environment_intensity, sky_light_intensity, shared_profile, is_engine_default_profile — plus active_profile_index (UEditorPerProjectUserSettings::AssetViewerProfileIndex, which is UPROPERTY(Config)-only and therefore unreadable from Python). NOTE: `Profiles` is a TRANSIENT array assembled at startup from [/Script/AdvancedPreviewScene.SharedProfiles] and [/Script/AdvancedPreviewScene.LocalProfiles]; the section [/Script/AdvancedPreviewScene.AssetViewerSettings] is read by nothing. This reports the PROFILE state, which is not the same as the per-viewport Background/Floor toggles a given viewport currently shows."),
+		FMonolithActionHandler::CreateStatic(&HandleGetPreviewScene),
+		MakeShared<FJsonObject>());
+
+	Registry.RegisterAction(TEXT("editor"), TEXT("set_preview_scene"),
+		TEXT("MUTATE asset-viewer preview-scene profile fields IN PLACE and broadcast the settings-changed event, which reaches ALREADY-OPEN asset editors with no reopen (every FAdvancedPreviewScene subscribes to the settings singleton at construction). Applies only the parameters present. Returns the full post-write state via the same read path as get_preview_scene, so the response is a round-trip rather than an echo. NEVER adds or removes profiles: an unknown `target` name is REFUSED (changing the array length makes open preview scenes ignore the refresh). show_environment / show_floor are the most reliable levers — the engine applies them unconditionally on every scene update; the flat background colour is environment_color * environment_intensity and only shows when show_environment=false. CAUTION 1: this changes the PROFILE, which is NOT the same state as a given viewport's own Background/Floor toggles — a viewport can show neither while the profile says both are on. CAUTION 2: Niagara and PCG viewports write show_floor=false into the shared active profile when they OPEN, so floor state is not stable across editor opens. CAUTION 3: save=true calls UAssetViewerSettings::Save(), which writes shared profiles into the PROJECT's tracked Config/DefaultEditor.ini (plus the per-user Saved/Config Editor.ini); it defaults to false and the change is otherwise session-local because the profile array is transient."),
+		FMonolithActionHandler::CreateStatic(&HandleSetPreviewScene),
+		FParamSchemaBuilder()
+			.Optional(TEXT("target"), TEXT("string"), TEXT("Which profile(s) to mutate: \"active\" (the profile at AssetViewerProfileIndex), \"all\" (every profile), or a literal profile name (e.g. \"Grey Ambient\", \"Epic Headquarters\", \"Grey Wireframe\"). An unknown name is an error listing the available names — profiles are never created. Default \"active\"."), TEXT("active"))
+			.Optional(TEXT("show_environment"), TEXT("bool"), TEXT("FPreviewSceneProfile::bShowEnvironment — visibility of the environment/sky sphere. When false the viewport shows the flat environment_color * environment_intensity instead."))
+			.Optional(TEXT("show_floor"), TEXT("bool"), TEXT("FPreviewSceneProfile::bShowFloor — visibility of the preview floor mesh."))
+			.Optional(TEXT("environment_color"), TEXT("array|object|string"), TEXT("FPreviewSceneProfile::EnvironmentColor as [r,g,b] / [r,g,b,a], {r,g,b,a}, or \"(R=..,G=..,B=..,A=..)\". Linear, 0..1. Only visible when show_environment=false. Omitting alpha keeps the profile's existing alpha."))
+			.Optional(TEXT("environment_intensity"), TEXT("number"), TEXT("FPreviewSceneProfile::EnvironmentIntensity (UI range 0..20). Multiplies environment_color for the flat background."))
+			.Optional(TEXT("save"), TEXT("bool"), TEXT("Persist via UAssetViewerSettings::Save(). WRITES THE PROJECT'S Config/DefaultEditor.ini (a tracked settings file) for shared profiles and Saved/Config/<Platform>/Editor.ini for local ones. Default false — without it the change is session-local, because UAssetViewerSettings::Profiles is transient."), TEXT("false"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("editor"), TEXT("capture_sequence_frames"),
 		TEXT("Capture multiple frames of an animated effect at specified timestamps"),
 		FMonolithActionHandler::CreateStatic(&HandleCaptureSequenceFrames),
