@@ -105,6 +105,34 @@ public:
 	static FMonolithActionResult HandleGetPreviewScene(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetPreviewScene(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Editor viewport client enumeration ---
+	// READ-ONLY walk of GEditor->GetAllViewportClients() (EditorEngine.h:718-719) —
+	// the engine-owned registry every FEditorViewportClient adds itself to in its
+	// base constructor (EditorViewportClient.cpp:601). This is the ONLY route to the
+	// per-asset-editor PREVIEW viewports: they are not UObjects, expose no UFUNCTION,
+	// and their owning widgets live behind private headers.
+	//
+	// Reports `effective_camera_location` RECOMPUTED from the orbit matrix rather
+	// than echoing `view_location` — in orbit mode (the default for preview
+	// viewports) the stored location is NOT where the camera renders from, yet it
+	// round-trips perfectly through GetViewLocation(). Body lives in
+	// MonolithEditorViewportCameraActions.cpp.
+	static FMonolithActionResult HandleListViewports(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Editor viewport camera control ---
+	// MOVE the camera of ONE viewport client resolved by `target`. The primary
+	// interface is deliberately look_at + distance + a named angle preset rather
+	// than an absolute location: in orbit mode (the default for preview viewports)
+	// SetViewLocation() cannot place the camera at all — only its distance from
+	// the pivot survives — so an absolute `location` is REFUSED on an orbiting
+	// viewport rather than accepted and silently ignored.
+	//
+	// Shares its target resolver and its whole response shape with
+	// HandleListViewports, so the keys that action prints are the keys this one
+	// accepts, and the response is a genuine post-write re-read. Body lives in
+	// MonolithEditorViewportCameraActions.cpp.
+	static FMonolithActionResult HandleSetViewportCamera(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Automation tests ---
 	static FMonolithActionResult HandleRunAutomationTests(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleListAutomationTests(const TSharedPtr<FJsonObject>& Params);
