@@ -105,6 +105,15 @@ public:
 	static FMonolithActionResult HandleGetPreviewScene(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetPreviewScene(const TSharedPtr<FJsonObject>& Params);
 
+	// SWITCH the ACTIVE preview-scene profile by name via FPreviewProfileController
+	// (the same bridge the editor's own profile dropdown drives). Returns a
+	// three-way verdict (switched / already_active / not_found error) derived
+	// from its own pre-check + post-call re-read — NEVER the engine's raw bool,
+	// which is false both for "no such profile" and "already active"
+	// (PreviewProfileController.cpp:81). Body lives in
+	// MonolithEditorPreviewSceneActions.cpp.
+	static FMonolithActionResult HandleSetPreviewProfile(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Editor viewport client enumeration ---
 	// READ-ONLY walk of GEditor->GetAllViewportClients() (EditorEngine.h:718-719) —
 	// the engine-owned registry every FEditorViewportClient adds itself to in its

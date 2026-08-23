@@ -3,7 +3,7 @@
 // =============================================================================
 // MonolithEditorPreviewSceneActions.cpp
 //
-// Two editor:: actions for the ASSET-VIEWER PREVIEW SCENE profiles — the
+// Three editor:: actions for the ASSET-VIEWER PREVIEW SCENE profiles — the
 // shared background / floor / environment settings every asset editor viewport
 // (Niagara, PCG, Material, Static Mesh, Persona, Dataflow, TextureGraph, ...)
 // reads from:
@@ -13,6 +13,47 @@
 //   editor::set_preview_scene   — MUTATE profile fields in place and broadcast
 //                                 the settings-changed event, which reaches
 //                                 ALREADY-OPEN asset editors with no reopen.
+//   editor::set_preview_profile — SWITCH which profile is ACTIVE, by name, via
+//                                 FPreviewProfileController (the same bridge
+//                                 the editor's own profile dropdown drives).
+//
+// -----------------------------------------------------------------------------
+// WHY set_preview_profile RETURNS A THREE-WAY VERDICT, NOT THE ENGINE'S BOOL
+// -----------------------------------------------------------------------------
+//
+// FPreviewProfileController::SetActiveProfile collapses two unrelated outcomes
+// into one return value (PreviewProfileController.cpp:81):
+//
+//     int32 Index = AssetViewerProfileNames.IndexOfByKey(ProfileName);
+//     if (Index != INDEX_NONE && Index != PerProjectSettings->AssetViewerProfileIndex)
+//
+// so `false` means EITHER "no such profile" OR "already active" — a naive
+// caller reports FAILED on a working switch (or a working no-op). The handler
+// therefore derives its verdict from its own pre-check of the profile list
+// plus a post-call re-read of AssetViewerProfileIndex, and returns
+// `switched` / `already_active` / a not_found error. The raw bool is reported
+// as `engine_return_value` for the record only.
+//
+// Name resolution mirrors the engine's exactly: IndexOfByKey on
+// TArray<FString> uses FString::operator== (ESearchCase::IgnoreCase), i.e.
+// case-insensitive, first match wins (PreviewProfileController.cpp:80).
+//
+// On success the controller writes UEditorPerProjectUserSettings::
+// AssetViewerProfileIndex, syncs its cache, and broadcasts
+// OnAssetViewerSettingsChanged(ProfileName) (PreviewProfileController.cpp:84-88)
+// — every live FAdvancedPreviewScene picks that up, so open editors restyle
+// with no reopen. It never calls SaveConfig(): the selection persists via the
+// editor's normal per-user settings save (Saved/Config/<Platform>/
+// EditorPerProjectUserSettings.ini), and this action writes no file.
+//
+// CRASH GUARD: every live FPreviewProfileController's settings-changed lambda
+// indexes its cached name array UNGUARDED — AssetViewerProfileNames
+// [CurrentProfileIndex] (PreviewProfileController.cpp:24), with
+// CurrentProfileIndex cached from AssetViewerProfileIndex (cpp:58). If the
+// stored index is out of range (a state get_preview_scene already warns
+// about), broadcasting would range-check-fail on the game thread inside any
+// OTHER live controller (asset-editor toolbars). The handler REFUSES to
+// switch in that state instead of risking the editor.
 //
 // -----------------------------------------------------------------------------
 // WHY THIS IS C++ AND NOT PYTHON / AN INI EDIT (UE 5.8 source, read 2026-08-18)
@@ -110,6 +151,7 @@
 
 #include "AssetViewerSettings.h"
 #include "Editor/EditorPerProjectUserSettings.h"
+#include "PreviewProfileController.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogMonolithPreviewScene, Log, All);
 
@@ -639,6 +681,152 @@ FMonolithActionResult FMonolithEditorActions::HandleSetPreviewScene(
 	{
 		FMonolithJsonUtils::AddWarning(Result,
 			TEXT("save=true wrote the project's Config/DefaultEditor.ini ([/Script/AdvancedPreviewScene.SharedProfiles]) and the per-user Saved/Config/.../Editor.ini. DefaultEditor.ini is a tracked project-settings file."));
+	}
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// =============================================================================
+// editor::set_preview_profile
+// =============================================================================
+
+FMonolithActionResult FMonolithEditorActions::HandleSetPreviewProfile(
+	const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Params object is null"),
+			FMonolithJsonUtils::ErrInvalidParams);
+	}
+
+	FString Name;
+	Params->TryGetStringField(TEXT("name"), Name);
+	Name = Name.TrimStartAndEnd();
+	if (Name.IsEmpty())
+	{
+		return FMonolithActionResult::Error(
+			TEXT("'name' (string) is required — the profile to activate. Read the available names from editor::get_preview_scene."),
+			FMonolithJsonUtils::ErrInvalidParams);
+	}
+
+	UAssetViewerSettings* Settings = UAssetViewerSettings::Get();
+	if (!Settings)
+	{
+		return FMonolithActionResult::Error(TEXT("UAssetViewerSettings::Get() returned null"));
+	}
+	if (Settings->Profiles.Num() == 0)
+	{
+		return FMonolithActionResult::Error(
+			TEXT("UAssetViewerSettings has no profiles — nothing to switch to."));
+	}
+
+	// --- Pre-read. The engine's return value cannot distinguish "no such
+	// --- profile" from "already active" (see the file header), so every
+	// --- verdict below is derived from this pre-check plus the post-call
+	// --- re-read — never from that boolean.
+	const int32 PreviousIndex = GetActiveProfileIndex();
+	const bool bPreviousValid = Settings->Profiles.IsValidIndex(PreviousIndex);
+	const FString PreviousName =
+		bPreviousValid ? Settings->Profiles[PreviousIndex].ProfileName : FString();
+
+	if (!bPreviousValid)
+	{
+		// Crash guard — see the file header: live controllers cache this index
+		// and index their name arrays with it unguarded on broadcast
+		// (PreviewProfileController.cpp:24).
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("AssetViewerProfileIndex (%d) is out of range for %d profiles — switching now could range-check-crash live profile controllers that cached the invalid index (PreviewProfileController.cpp:24). Repair the selection via the editor's preview-profile dropdown first."),
+			PreviousIndex, Settings->Profiles.Num()));
+	}
+
+	// First case-insensitive match — mirrors the engine's own lookup
+	// (IndexOfByKey via FString::operator==, PreviewProfileController.cpp:80).
+	int32 TargetIndex = INDEX_NONE;
+	for (int32 i = 0; i < Settings->Profiles.Num(); ++i)
+	{
+		if (Settings->Profiles[i].ProfileName.Equals(Name, ESearchCase::IgnoreCase))
+		{
+			TargetIndex = i;
+			break;
+		}
+	}
+
+	// --- Verdict 1 of 3: not_found. Refused BEFORE any engine call, with the
+	// --- available names — the engine's mute `false` never enters the picture.
+	if (TargetIndex == INDEX_NONE)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("not_found: no preview-scene profile named '%s'. This action only ACTIVATES an existing profile and never creates one. Available: %s"),
+			*Name, *JoinProfileNames(Settings)),
+			FMonolithJsonUtils::ErrInvalidParams);
+	}
+
+	// The engine call is made with the profile's canonical stored name, not the
+	// caller's casing.
+	const FString CanonicalName = Settings->Profiles[TargetIndex].ProfileName;
+
+	// --- Verdict 2 of 3: already_active. The engine call is SKIPPED — it would
+	// --- change nothing and return the same `false` it returns for an unknown
+	// --- name (PreviewProfileController.cpp:81). An honest no-op beats a mute one.
+	if (TargetIndex == PreviousIndex)
+	{
+		TSharedPtr<FJsonObject> Result = BuildPreviewSceneState(Settings);
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetStringField(TEXT("result"), TEXT("already_active"));
+		Result->SetStringField(TEXT("requested_name"), Name);
+		Result->SetStringField(TEXT("target_profile_name"), CanonicalName);
+		Result->SetNumberField(TEXT("target_profile_index"), TargetIndex);
+		Result->SetNumberField(TEXT("previous_profile_index"), PreviousIndex);
+		Result->SetStringField(TEXT("previous_profile_name"), PreviousName);
+		Result->SetBoolField(TEXT("engine_call_made"), false);
+		Result->SetStringField(TEXT("read_back_note"),
+			TEXT("active_profile_* and profiles[] are RE-READ state (same path as get_preview_scene), not an echo of the request."));
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// --- Verdict 3 of 3 needs the call. FPreviewProfileController is the same
+	// --- bridge the editor's own toolbar dropdown drives: it writes
+	// --- UEditorPerProjectUserSettings::AssetViewerProfileIndex and broadcasts
+	// --- OnAssetViewerSettingsChanged(ProfileName), which every live
+	// --- FAdvancedPreviewScene picks up (PreviewProfileController.cpp:84-88).
+	// --- A stack instance is safe: ctor subscribes to the settings delegates,
+	// --- dtor unsubscribes, and the switch itself is synchronous.
+	FPreviewProfileController Controller;
+	const bool bEngineReturn = Controller.SetActiveProfile(CanonicalName);
+
+	// --- The verdict instrument is the RE-READ, never the boolean.
+	const int32 PostIndex = GetActiveProfileIndex();
+	if (PostIndex != TargetIndex)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Switch FAILED: profile '%s' exists (index %d) and was not active (index %d), yet after FPreviewProfileController::SetActiveProfile the re-read AssetViewerProfileIndex is %d (raw engine return value: %s — unreliable by design, see PreviewProfileController.cpp:81). State did not change as requested; escalate rather than retry."),
+			*CanonicalName, TargetIndex, PreviousIndex, PostIndex,
+			bEngineReturn ? TEXT("true") : TEXT("false")));
+	}
+
+	UE_LOG(LogMonolithPreviewScene, Log,
+		TEXT("set_preview_profile: switched '%s' (index %d) -> '%s' (index %d); broadcast ProfileName."),
+		*PreviousName, PreviousIndex, *CanonicalName, TargetIndex);
+
+	TSharedPtr<FJsonObject> Result = BuildPreviewSceneState(Settings);
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("result"), TEXT("switched"));
+	Result->SetStringField(TEXT("requested_name"), Name);
+	Result->SetStringField(TEXT("target_profile_name"), CanonicalName);
+	Result->SetNumberField(TEXT("target_profile_index"), TargetIndex);
+	Result->SetNumberField(TEXT("previous_profile_index"), PreviousIndex);
+	Result->SetStringField(TEXT("previous_profile_name"), PreviousName);
+	Result->SetBoolField(TEXT("engine_call_made"), true);
+	Result->SetBoolField(TEXT("engine_return_value"), bEngineReturn);
+	Result->SetStringField(TEXT("read_back_note"),
+		TEXT("active_profile_* and profiles[] are RE-READ after the call (same path as get_preview_scene), not an echo of the request. Callers should still verify against the rendered viewport."));
+
+	if (!bEngineReturn)
+	{
+		// Should be unreachable given the pre-check, but if the boolean ever
+		// disagrees with a verified switch, say so rather than hide it.
+		FMonolithJsonUtils::AddWarning(Result,
+			TEXT("SetActiveProfile returned false, yet the re-read confirms the switch landed. The return value lied (its known failure mode); trust the read-back."));
 	}
 
 	return FMonolithActionResult::Success(Result);
