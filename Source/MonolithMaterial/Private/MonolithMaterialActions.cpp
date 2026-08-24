@@ -926,34 +926,77 @@ TSharedPtr<FJsonObject> FMonolithMaterialActions::SerializeExpression(const UMat
 	return ExprJson;
 }
 
-/** Map string property name to EMaterialProperty. */
+/** Material output entries for connection graph */
+struct FMaterialOutputEntry
+{
+	EMaterialProperty Property;
+	const TCHAR* Name;
+};
+
+static const FMaterialOutputEntry MaterialOutputEntries[] =
+{
+	{ MP_BaseColor,              TEXT("BaseColor") },
+	{ MP_Metallic,               TEXT("Metallic") },
+	{ MP_Specular,               TEXT("Specular") },
+	{ MP_Roughness,              TEXT("Roughness") },
+	{ MP_Anisotropy,             TEXT("Anisotropy") },
+	{ MP_EmissiveColor,          TEXT("EmissiveColor") },
+	{ MP_Opacity,                TEXT("Opacity") },
+	{ MP_OpacityMask,            TEXT("OpacityMask") },
+	{ MP_Normal,                 TEXT("Normal") },
+	{ MP_WorldPositionOffset,    TEXT("WorldPositionOffset") },
+	{ MP_SubsurfaceColor,        TEXT("SubsurfaceColor") },
+	{ MP_AmbientOcclusion,       TEXT("AmbientOcclusion") },
+	{ MP_Refraction,             TEXT("Refraction") },
+	{ MP_PixelDepthOffset,       TEXT("PixelDepthOffset") },
+	{ MP_ShadingModel,           TEXT("ShadingModel") },
+	{ MP_Tangent,                TEXT("Tangent") },
+	{ MP_Displacement,           TEXT("Displacement") },
+	{ MP_CustomData0,            TEXT("ClearCoat") },
+	{ MP_CustomData1,            TEXT("ClearCoatRoughness") },
+	{ MP_SurfaceThickness,       TEXT("SurfaceThickness") },
+	{ MP_FrontMaterial,          TEXT("FrontMaterial") },
+	{ MP_MaterialAttributes,     TEXT("MaterialAttributes") },
+};
+
+/**
+ * Map string property name to EMaterialProperty.
+ *
+ * Gap #126: this used to be a second hand-maintained map that had drifted from
+ * MaterialOutputEntries — it lacked Tangent, Displacement, ClearCoat, ClearCoatRoughness,
+ * SurfaceThickness, FrontMaterial and MaterialAttributes, so Substrate node networks could
+ * be authored but never connected to the output. The parse map is now derived from
+ * MaterialOutputEntries so the two cannot drift again. Each entry is accepted both in its
+ * canonical spelling ("FrontMaterial") and the editor's spaced display spelling
+ * ("Front Material"), mirroring the spaced rows the old map held by hand.
+ */
 static EMaterialProperty ParseMaterialProperty(const FString& PropName)
 {
-	static const TMap<FString, EMaterialProperty> Map = {
-		{ TEXT("BaseColor"),            MP_BaseColor },
-		{ TEXT("Base Color"),           MP_BaseColor },
-		{ TEXT("Metallic"),             MP_Metallic },
-		{ TEXT("Specular"),             MP_Specular },
-		{ TEXT("Roughness"),            MP_Roughness },
-		{ TEXT("Anisotropy"),           MP_Anisotropy },
-		{ TEXT("EmissiveColor"),        MP_EmissiveColor },
-		{ TEXT("Emissive Color"),       MP_EmissiveColor },
-		{ TEXT("Opacity"),              MP_Opacity },
-		{ TEXT("OpacityMask"),          MP_OpacityMask },
-		{ TEXT("Opacity Mask"),         MP_OpacityMask },
-		{ TEXT("Normal"),               MP_Normal },
-		{ TEXT("WorldPositionOffset"),  MP_WorldPositionOffset },
-		{ TEXT("World Position Offset"),MP_WorldPositionOffset },
-		{ TEXT("SubsurfaceColor"),      MP_SubsurfaceColor },
-		{ TEXT("Subsurface Color"),     MP_SubsurfaceColor },
-		{ TEXT("AmbientOcclusion"),     MP_AmbientOcclusion },
-		{ TEXT("Ambient Occlusion"),    MP_AmbientOcclusion },
-		{ TEXT("Refraction"),           MP_Refraction },
-		{ TEXT("PixelDepthOffset"),     MP_PixelDepthOffset },
-		{ TEXT("Pixel Depth Offset"),   MP_PixelDepthOffset },
-		{ TEXT("ShadingModel"),         MP_ShadingModel },
-		{ TEXT("Shading Model"),        MP_ShadingModel },
-	};
+	static const TMap<FString, EMaterialProperty> Map = []()
+	{
+		TMap<FString, EMaterialProperty> Result;
+		for (const FMaterialOutputEntry& Entry : MaterialOutputEntries)
+		{
+			const FString Name(Entry.Name);
+			Result.Add(Name, Entry.Property);
+
+			// Spaced display variant: "WorldPositionOffset" -> "World Position Offset".
+			FString Spaced;
+			for (int32 Index = 0; Index < Name.Len(); ++Index)
+			{
+				if (Index > 0 && FChar::IsUpper(Name[Index]) && !FChar::IsUpper(Name[Index - 1]))
+				{
+					Spaced.AppendChar(TEXT(' '));
+				}
+				Spaced.AppendChar(Name[Index]);
+			}
+			if (Spaced != Name)
+			{
+				Result.Add(Spaced, Entry.Property);
+			}
+		}
+		return Result;
+	}();
 
 	const EMaterialProperty* Found = Map.Find(PropName);
 	return Found ? *Found : MP_MAX;
@@ -1011,28 +1054,22 @@ static FString CustomOutputTypeToString(ECustomMaterialOutputType Type)
 	}
 }
 
-/** Map EMaterialProperty to string name. */
+/**
+ * Map EMaterialProperty to string name.
+ *
+ * Gap #126: derived from MaterialOutputEntries rather than a third hand-maintained copy —
+ * the old switch lacked the Substrate-era properties and reported "" for them.
+ */
 static FString MaterialPropertyToString(EMaterialProperty Prop)
 {
-	switch (Prop)
+	for (const FMaterialOutputEntry& Entry : MaterialOutputEntries)
 	{
-	case MP_BaseColor:            return TEXT("BaseColor");
-	case MP_Metallic:             return TEXT("Metallic");
-	case MP_Specular:             return TEXT("Specular");
-	case MP_Roughness:            return TEXT("Roughness");
-	case MP_Anisotropy:           return TEXT("Anisotropy");
-	case MP_EmissiveColor:        return TEXT("EmissiveColor");
-	case MP_Opacity:              return TEXT("Opacity");
-	case MP_OpacityMask:          return TEXT("OpacityMask");
-	case MP_Normal:               return TEXT("Normal");
-	case MP_WorldPositionOffset:  return TEXT("WorldPositionOffset");
-	case MP_SubsurfaceColor:      return TEXT("SubsurfaceColor");
-	case MP_AmbientOcclusion:     return TEXT("AmbientOcclusion");
-	case MP_Refraction:           return TEXT("Refraction");
-	case MP_PixelDepthOffset:     return TEXT("PixelDepthOffset");
-	case MP_ShadingModel:         return TEXT("ShadingModel");
-	default:                      return TEXT("");
+		if (Entry.Property == Prop)
+		{
+			return Entry.Name;
+		}
 	}
+	return TEXT("");
 }
 
 /** All material properties for iteration */
@@ -1044,39 +1081,6 @@ static const EMaterialProperty AllMaterialProperties[] =
 	MP_Refraction, MP_PixelDepthOffset, MP_ShadingModel,
 	MP_Tangent, MP_Displacement, MP_CustomData0, MP_CustomData1,
 	MP_SurfaceThickness, MP_FrontMaterial, MP_MaterialAttributes,
-};
-
-/** Material output entries for connection graph */
-struct FMaterialOutputEntry
-{
-	EMaterialProperty Property;
-	const TCHAR* Name;
-};
-
-static const FMaterialOutputEntry MaterialOutputEntries[] =
-{
-	{ MP_BaseColor,              TEXT("BaseColor") },
-	{ MP_Metallic,               TEXT("Metallic") },
-	{ MP_Specular,               TEXT("Specular") },
-	{ MP_Roughness,              TEXT("Roughness") },
-	{ MP_Anisotropy,             TEXT("Anisotropy") },
-	{ MP_EmissiveColor,          TEXT("EmissiveColor") },
-	{ MP_Opacity,                TEXT("Opacity") },
-	{ MP_OpacityMask,            TEXT("OpacityMask") },
-	{ MP_Normal,                 TEXT("Normal") },
-	{ MP_WorldPositionOffset,    TEXT("WorldPositionOffset") },
-	{ MP_SubsurfaceColor,        TEXT("SubsurfaceColor") },
-	{ MP_AmbientOcclusion,       TEXT("AmbientOcclusion") },
-	{ MP_Refraction,             TEXT("Refraction") },
-	{ MP_PixelDepthOffset,       TEXT("PixelDepthOffset") },
-	{ MP_ShadingModel,           TEXT("ShadingModel") },
-	{ MP_Tangent,                TEXT("Tangent") },
-	{ MP_Displacement,           TEXT("Displacement") },
-	{ MP_CustomData0,            TEXT("ClearCoat") },
-	{ MP_CustomData1,            TEXT("ClearCoatRoughness") },
-	{ MP_SurfaceThickness,       TEXT("SurfaceThickness") },
-	{ MP_FrontMaterial,          TEXT("FrontMaterial") },
-	{ MP_MaterialAttributes,     TEXT("MaterialAttributes") },
 };
 
 // ============================================================================
