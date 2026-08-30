@@ -238,6 +238,8 @@ public:
 	static FMonolithActionResult HandleListScriptVersions(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddScriptVersion(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetExposedScriptVersion(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleReportModuleVersions(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetModuleVersion(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetNodeComment(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleCleanStackOrphans(const TSharedPtr<FJsonObject>& Params);
 

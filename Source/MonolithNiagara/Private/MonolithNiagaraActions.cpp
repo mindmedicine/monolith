@@ -135,6 +135,12 @@ DEFINE_LOG_CATEGORY_STATIC(LogMonolithNiagara, Log, All);
 #include "NiagaraNodeStaticSwitch.h"
 #include "NiagaraNodeReroute.h"
 #include "NiagaraNodeConvert.h"
+// Module-version sweep (gap #131). UpgradeNiagaraScriptResults.h is already pulled in
+// transitively by NiagaraNodeFunctionCall.h:12, but FNiagaraScriptVersionUpgradeContext is
+// CONSTRUCTED here, not just named, so it is included explicitly. UObjectHash.h is for
+// GetObjectsWithOuter, which is how the exhaustive package walk finds embedded script graphs.
+#include "UpgradeNiagaraScriptResults.h"
+#include "UObject/UObjectHash.h"
 
 // Forward-declarations for engine-PRIVATE NiagaraEditor symbols. These are defined only in
 // NiagaraEditor/Private/Widgets/DataChannel/NiagaraDataChannelWizard.cpp — there is NO public
@@ -4613,6 +4619,25 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("guid"), TEXT("string"), TEXT("Version guid (from list_script_versions)"))
 			.Optional(TEXT("major"), TEXT("integer"), TEXT("Major version number (with minor, alternative to guid)"))
 			.Optional(TEXT("minor"), TEXT("integer"), TEXT("Minor version number"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("report_module_versions"), TEXT("READ-ONLY. For every placement of a module script across every system/emitter that references it: the owning asset, the graph, the node guid, the pinned version guid, what it resolves to NOW, what it will resolve to AFTER THE NEXT LOAD, and a state. The states that matter: 'unpinned_safe' (empty pin + module versioning OFF — genuinely auto-follows, leave alone) vs 'unpinned_doomed' (empty pin + module versioning ON — the engine stamps this to the OLDEST version at PostLoad, so the placement is already silently downgrading and NEEDS an explicit pin). Also 'pinned_current', 'pinned_stale', 'pinned_dangling', 'pinned_on_unversioned'. Reports a 'coverage' block that runs TWO graph walks (curated container list vs exhaustive package walk) and names the graphs each one misses, because the curated walk cannot see embedded script objects. Mutates nothing."),
+		FMonolithActionHandler::CreateStatic(&HandleReportModuleVersions),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("module_path"), TEXT("Module/dynamic-input script asset path (the script whose consumers you want listed)"), { TEXT("script_path") })
+			.Optional(TEXT("state"), TEXT("string"), TEXT("Only report placements in this state (pinned_current | pinned_stale | pinned_dangling | unpinned_safe | unpinned_doomed | pinned_on_unversioned). Counts in 'state_totals' are always over ALL placements, never over the filtered subset."))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_module_version"), TEXT("Re-point placed module calls at a different script version (gap #131). DRY-RUN BY DEFAULT — pass dry_run:false to actually write. Calls the engine's own UNiagaraNodeFunctionCall::ChangeScriptVersion, so the version change also repairs override pins (retypes changed-type overrides, deletes overrides for inputs the new version no longer has). DOES NOT SAVE: changed packages are left dirty in memory and are listed in 'dirty_unsaved' — save them yourself (editor:save_packages) or the change is lost on restart. An UNPINNED placement can only be written by naming BOTH include_unpinned:true AND its node_guid, so no bulk call can ever touch one. Run report_module_versions first."),
+		FMonolithActionHandler::CreateStatic(&HandleSetModuleVersion),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("module_path"), TEXT("Module/dynamic-input script asset path to re-point placements OF"), { TEXT("script_path") })
+			.Optional(TEXT("guid"), TEXT("string"), TEXT("Target version guid (from list_script_versions). Alternative to major+minor."))
+			.Optional(TEXT("major"), TEXT("integer"), TEXT("Target major version (with minor, alternative to guid)"))
+			.Optional(TEXT("minor"), TEXT("integer"), TEXT("Target minor version"))
+			.OptionalAssetPath(TEXT("asset_path"), TEXT("Limit to placements inside this consumer system/emitter asset. Omit to sweep every consumer."), { TEXT("system_path") })
+			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Limit to ONE placement (from report_module_versions). Mandatory when include_unpinned is true."))
+			.Optional(TEXT("dry_run"), TEXT("bool"), TEXT("DEFAULT TRUE. Report what would change and touch nothing. Pass false to write."))
+			.Optional(TEXT("include_unpinned"), TEXT("bool"), TEXT("Default false. Allow writing a guid onto a placement whose pin is currently EMPTY. Requires node_guid — an unpinned placement is never touched by a bulk call. On a module with versioning OFF an empty pin is correct and self-maintaining; on a module with versioning ON it is already doomed to the oldest version. This action reports which, and refuses to choose for you."))
+			.Optional(TEXT("skip_python_upgrade"), TEXT("bool"), TEXT("DEFAULT TRUE, matching the engine's own graph-level path. False runs the module author's Python upgrade scripts for every intermediate version — arbitrary user code."))
 			.Build());
 	Registry.RegisterAction(TEXT("niagara"), TEXT("set_node_comment"), TEXT("Set (or clear with empty text) the comment bubble on a node in a Niagara script graph — improves graph readability. Find node guids via get_module_graph."),
 		FMonolithActionHandler::CreateStatic(&HandleSetNodeComment),
@@ -32092,5 +32117,863 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCleanStackOrphans(const TSh
 	R->SetNumberField(TEXT("removed_count"), Removed.Num());
 	R->SetArrayField(TEXT("removed"), Removed);
 	return NA_SuccessObj(R);
+}
+
+// ====================================================================================
+// MODULE VERSION SWEEP — report_module_versions / set_module_version. Gap #131.
+//
+// WHAT PROBLEM THIS SOLVES. The version a placed module runs is an FGuid
+// (SelectedScriptVersion) on the CONSUMER's UNiagaraNodeFunctionCall
+// (NiagaraNodeFunctionCall.h:65). Nothing on the module side records who uses it, so a
+// module upgrade is hand-work across every consumer system.
+//
+// 🛑 THE RULE THAT INVERTED, AND IT IS THE REASON THE READER EXISTS. An EMPTY pin does
+// NOT mean "always follow the newest exposed version". It means that only while the
+// module has versioning DISABLED. The moment versioning is ENABLED, an empty pin is
+// rewritten to the OLDEST version:
+//
+//   NiagaraNodeFunctionCall.cpp:999-1027   FixupFunctionScriptVersion()
+//     if (FunctionScript->IsVersioningEnabled())
+//     {
+//         if (!SelectedScriptVersion.IsValid())
+//             SelectedScriptVersion = FunctionScript->GetAllAvailableVersions()[0].VersionGuid;  // :1011
+//         else if (<guid not in the version list>)
+//             { InvalidScriptVersionReference = SelectedScriptVersion;                           // :1017
+//               SelectedScriptVersion = GetExposedVersion().VersionGuid; }                       // :1018
+//     }
+//     else { SelectedScriptVersion = FGuid(); ... }                                              // :1021-1026
+//
+// [0] is the OLDEST: GetAllAvailableVersions preserves VersionData's order
+// (NiagaraScript.cpp:498-506) and VersionData is sorted ascending (NiagaraScript.cpp:555).
+// It runs from PostLoad (:59) and from RefreshFromExternalChanges (:1107) — those are the
+// only two call sites in the plugin.
+//
+// So enabling versioning on a module to publish a v2.0 does NOT propagate to its
+// previously-unpinned placements: it FREEZES them at v1.0 on the next load. Measured on
+// two fixtures, both directions, two read routes each
+// (Docs/staging/2026-08-29-validator-empty-guid-falsifier.md). The failure is invisible —
+// it compiles clean, it does NOT dirty the package, there is no in-session symptom, and it
+// reaches disk on the next unrelated save. Surfacing it is most of this reader's value,
+// which is why 'unpinned_safe' and 'unpinned_doomed' are DIFFERENT states and an
+// undifferentiated "unpinned" column would be actively misleading.
+//
+// 🛑 THEREFORE THE READER MUST NEVER CALL RefreshFromExternalChanges(). It calls
+// FixupFunctionScriptVersion() first (:1107), so refreshing an untouched empty-pinned node
+// is itself the mutation we are reporting on. Read-only means read-only.
+//
+// ENUMERATION HONESTY. CollectCallerGraphs (:30465, above) walks a CURATED list of known
+// containers — the system spawn graph plus one graph per emitter handle. It cannot see
+// UNiagaraScript objects EMBEDDED in the consumer's own package, which is where 2 of 3
+// measured WorldPositionToCameraUV call sites actually live. So this sweep also does an
+// EXHAUSTIVE package walk (GetObjectsWithOuter, nested objects included) and reports the
+// disagreement between the two as explicit lists, per side, never as a net count. A count
+// that could only ever have come back "fine" is not a test; this one has a wrong answer it
+// is capable of giving.
+// ====================================================================================
+
+namespace MonolithNiagaraVersionSweep
+{
+	/** "2.0" for display. Empty version data prints as "<none>". */
+	static FString VersionLabel(const FNiagaraAssetVersion& V)
+	{
+		return FString::Printf(TEXT("%d.%d"), V.MajorVersion, V.MinorVersion);
+	}
+
+	/** Everything about the MODULE that every placement's state is computed against. */
+	struct FModuleVersionFacts
+	{
+		bool bVersioningEnabled = false;
+		bool bLazilyInitialised = false;   // CheckVersionDataAvailable had to synthesise VersionData
+		TArray<FNiagaraAssetVersion> Versions;
+		FGuid   ExposedGuid;
+		FString ExposedLabel;
+		FGuid   OldestGuid;
+		FString OldestLabel;
+
+		const FNiagaraAssetVersion* Find(const FGuid& G) const
+		{
+			return Versions.FindByPredicate([&G](const FNiagaraAssetVersion& V) { return V.VersionGuid == G; });
+		}
+	};
+
+	/** One placed call of the module, plus which of the two graph walks found its graph. */
+	struct FPlacement
+	{
+		UNiagaraNodeFunctionCall* Node = nullptr;
+		UNiagaraGraph*  Graph = nullptr;
+		UObject*        OwnerAsset = nullptr;
+		FString         AssetPath;
+		FString         GraphPath;
+		FString         FunctionName;
+		FString         NodeGuid;
+		FGuid           PinnedGuid;
+		bool            bFoundByCurated = false;
+		bool            bFoundByExhaustive = false;
+	};
+
+	/**
+	 * What this run can and cannot promise. Reported verbatim on every response, because a
+	 * count over a tree someone else may be writing to is a claim with a timestamp, not a
+	 * property of the project.
+	 */
+	struct FCoverage
+	{
+		int32 PackagesScanned = 0;
+		int32 NonNiagaraReferencers = 0;
+		bool  bAssetRegistryReady = false;
+		FString TakenAt;
+		TArray<FString> PackagesUnreadable;
+		TArray<FString> GraphsCurated;
+		TArray<FString> GraphsExhaustive;
+		TArray<FString> GraphsOnlyCurated;      // exhaustive walk missed these
+		TArray<FString> GraphsOnlyExhaustive;   // curated walk missed these (expected: embedded scripts)
+	};
+
+	/**
+	 * EXHAUSTIVE by construction: a UNiagaraNodeFunctionCall must live in a UNiagaraGraph, and
+	 * a graph inside a consumer package must be an object under that package's outer. Embedded
+	 * scripts, scratch pads, event and simulation-stage scripts are reached without needing to
+	 * know they exist.
+	 */
+	static void CollectAllGraphsInPackage(UPackage* Pkg, TSet<UNiagaraGraph*>& Out)
+	{
+		if (!Pkg) return;
+		TArray<UObject*> Objects;
+		// EGetObjectsFlags::IncludeNestedObjects, not the bool overload — the bool form is
+		// UE_INCLUDENESTEDOBJECTS_BOOL_DEPRECATED in 5.8 (UObjectHash.h:130) and is documented as
+		// not compiling in the next release.
+		GetObjectsWithOuter(Pkg, Objects, EGetObjectsFlags::IncludeNestedObjects);
+		for (UObject* Obj : Objects)
+		{
+			if (UNiagaraGraph* Graph = Cast<UNiagaraGraph>(Obj))
+			{
+				if (IsValid(Graph)) Out.Add(Graph);
+			}
+		}
+	}
+
+	/**
+	 * Read the module's version facts.
+	 *
+	 * ⚠️ HONEST ABOUT ITS ONE SIDE EFFECT. CheckVersionDataAvailable() is NOT a pure read: on a
+	 * pre-versioning asset whose VersionData is still empty it appends a default entry and sets
+	 * ExposedVersion (NiagaraScript.cpp:669-699). It does not Modify() and does not dirty the
+	 * package, and PostLoad/FixupFunctionScriptVersion calls it anyway (:1005) — but a reader
+	 * that claims to mutate nothing must say when it happened, so bLazilyInitialised is
+	 * reported rather than swallowed.
+	 */
+	static void ReadModuleFacts(UNiagaraScript* Script, FModuleVersionFacts& Out)
+	{
+		Out.bLazilyInitialised = (Script->GetAllAvailableVersions().Num() == 0);
+		Script->CheckVersionDataAvailable();
+
+		Out.bVersioningEnabled = Script->IsVersioningEnabled();
+		Out.Versions           = Script->GetAllAvailableVersions();
+
+		const FNiagaraAssetVersion Exposed = Script->GetExposedVersion();
+		Out.ExposedGuid  = Exposed.VersionGuid;
+		Out.ExposedLabel = VersionLabel(Exposed);
+
+		// Guarded where the engine is not: FixupFunctionScriptVersion indexes [0] unconditionally
+		// at :1011, having just called CheckVersionDataAvailable. We do not assume it succeeded.
+		if (Out.Versions.Num() > 0)
+		{
+			Out.OldestGuid  = Out.Versions[0].VersionGuid;
+			Out.OldestLabel = VersionLabel(Out.Versions[0]);
+		}
+		else
+		{
+			Out.OldestLabel = TEXT("<none>");
+		}
+	}
+
+	/** The load-bearing classification. See the header comment for why the two unpinned states differ. */
+	static FString ClassifyState(const FModuleVersionFacts& Facts, const FGuid& PinnedGuid)
+	{
+		if (!PinnedGuid.IsValid())
+		{
+			// Empty pin. Which of the two states it is depends ENTIRELY on the module, not on
+			// the placement — this is the split that inverts the safety rule.
+			return Facts.bVersioningEnabled ? TEXT("unpinned_doomed") : TEXT("unpinned_safe");
+		}
+		if (!Facts.bVersioningEnabled)
+		{
+			// A guid on an unversioned module: harmless, and the engine clears it on the next
+			// load (:1021-1026). GetScriptData returns VersionData[0] regardless
+			// (NiagaraScript.cpp:471-474), so the body it runs is not in question.
+			return TEXT("pinned_on_unversioned");
+		}
+		if (Facts.Find(PinnedGuid) == nullptr)
+		{
+			// The version was deleted. The engine records InvalidScriptVersionReference and falls
+			// back to the exposed version on the next load (:1013-1019).
+			return TEXT("pinned_dangling");
+		}
+		return (PinnedGuid == Facts.ExposedGuid) ? TEXT("pinned_current") : TEXT("pinned_stale");
+	}
+
+	/** What the placement runs RIGHT NOW, in memory, before anything reloads it. */
+	static FString ResolvesNow(const FModuleVersionFacts& Facts, const FGuid& PinnedGuid)
+	{
+		if (!Facts.bVersioningEnabled)
+		{
+			return Facts.Versions.Num() > 0 ? VersionLabel(Facts.Versions[0]) : TEXT("<none>");
+		}
+		if (!PinnedGuid.IsValid())
+		{
+			return Facts.ExposedLabel;   // GetScriptData falls through to the exposed entry, NiagaraScript.cpp:476-487
+		}
+		if (const FNiagaraAssetVersion* V = Facts.Find(PinnedGuid))
+		{
+			return VersionLabel(*V);
+		}
+		// GetScriptData returns nullptr for a guid it cannot find (NiagaraScript.cpp:495).
+		return TEXT("<unresolvable — GetScriptData returns null for this guid>");
+	}
+
+	/** What the placement will run AFTER the next load, once FixupFunctionScriptVersion has run. */
+	static FString ResolvesAfterLoad(const FModuleVersionFacts& Facts, const FGuid& PinnedGuid)
+	{
+		if (!Facts.bVersioningEnabled)
+		{
+			return Facts.Versions.Num() > 0 ? VersionLabel(Facts.Versions[0]) : TEXT("<none>");
+		}
+		if (!PinnedGuid.IsValid())
+		{
+			return Facts.OldestLabel;    // :1011 — the whole point of this action
+		}
+		if (const FNiagaraAssetVersion* V = Facts.Find(PinnedGuid))
+		{
+			return VersionLabel(*V);
+		}
+		return Facts.ExposedLabel;       // :1018
+	}
+
+	static FString RecommendedAction(const FString& State)
+	{
+		if (State == TEXT("pinned_stale"))          return TEXT("repoint");
+		if (State == TEXT("pinned_dangling"))       return TEXT("investigate — the pinned version no longer exists");
+		if (State == TEXT("unpinned_safe"))         return TEXT("leave_alone — this genuinely auto-follows while the module stays unversioned");
+		if (State == TEXT("unpinned_doomed"))       return TEXT("decide — leaving it alone is ALSO a silent downgrade to the oldest version on the next load; pinning it freezes it. This action will not choose for you.");
+		if (State == TEXT("pinned_on_unversioned")) return TEXT("none — the engine clears this pin on the next load and the module has only one body");
+		return TEXT("none");
+	}
+
+	/**
+	 * Count the override pins this placement currently carries.
+	 *
+	 * Same identification the rename surgery above documents at :30516-30518: override pins are
+	 * the only pins on the override node named "<FunctionName>.<Leaf>". Returns -1 when the node
+	 * has no override node at all, which is a real and distinct answer — UpdateOverridePins is a
+	 * no-op in that case (NiagaraNodeFunctionCall.cpp:1574-1575), so "0" and "not applicable"
+	 * must not print the same.
+	 */
+	static int32 CountOverridePins(UNiagaraNodeFunctionCall& Call)
+	{
+		UEdGraphPin* MapIn = MonolithNiagaraHelpers::GetParameterMapPin(Call, EGPD_Input);
+		if (!MapIn || MapIn->LinkedTo.Num() != 1 || !MapIn->LinkedTo[0]) return -1;
+		UEdGraphNode* OverrideNode = MapIn->LinkedTo[0]->GetOwningNode();
+		if (!OverrideNode) return -1;
+
+		const FString Prefix = Call.GetFunctionName() + TEXT(".");
+		int32 Count = 0;
+		for (UEdGraphPin* P : OverrideNode->Pins)
+		{
+			if (P && P->Direction == EGPD_Input && P->PinName.ToString().StartsWith(Prefix)) ++Count;
+		}
+		return Count;
+	}
+
+	/**
+	 * Every placement of Script, found two ways.
+	 *
+	 * The candidate-package stage is a PROVABLE superset for hard references: FunctionScript is
+	 * a hard UPROPERTY object reference (NiagaraNodeFunctionCall.h:61-62), so a referencing
+	 * package is necessarily in the asset-registry reference graph. Its remaining failure modes
+	 * are narrow and nameable — an unscanned registry, and content outside the scanned roots —
+	 * and both are reported rather than assumed away.
+	 */
+	static void SweepPlacements(UNiagaraScript* Script, TArray<FPlacement>& OutPlacements, FCoverage& Cov)
+	{
+		Cov.TakenAt = FDateTime::UtcNow().ToIso8601();
+
+		UPackage* ModulePkg = Script ? Script->GetOutermost() : nullptr;
+		if (!ModulePkg) return;
+
+		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		Cov.bAssetRegistryReady = !AR.IsLoadingAssets();
+
+		// An EMBEDDED script (scratch pad / event / sim stage) is not its package's asset, so its
+		// callers live in its own package and the referencer graph would answer a different
+		// question. Same test the rename surgery uses at :30577.
+		const bool bEmbedded = !(Script->GetOuter() == ModulePkg && Script->HasAnyFlags(RF_Public | RF_Standalone));
+
+		TArray<FName> PackagesToInspect;
+		if (bEmbedded)
+		{
+			PackagesToInspect.Add(FName(*ModulePkg->GetName()));
+		}
+		else
+		{
+			AR.GetReferencers(FName(*ModulePkg->GetName()), PackagesToInspect);
+		}
+
+		const FTopLevelAssetPath SystemClassPath  = UNiagaraSystem::StaticClass()->GetClassPathName();
+		const FTopLevelAssetPath EmitterClassPath = UNiagaraEmitter::StaticClass()->GetClassPathName();
+
+		for (const FName& PackageName : PackagesToInspect)
+		{
+			++Cov.PackagesScanned;
+
+			TArray<FAssetData> Assets;
+			AR.GetAssetsByPackageName(PackageName, Assets, /*bIncludeOnlyOnDiskAssets=*/false);
+
+			TSet<UNiagaraGraph*> Curated;
+			TSet<UNiagaraGraph*> Exhaustive;
+			UObject* PrimaryAsset = nullptr;
+			bool bAnyNiagara = false;
+
+			for (const FAssetData& AssetData : Assets)
+			{
+				if (AssetData.AssetClassPath != SystemClassPath && AssetData.AssetClassPath != EmitterClassPath)
+				{
+					continue;
+				}
+				bAnyNiagara = true;
+
+				UObject* Asset = AssetData.GetAsset();
+				if (!Asset)
+				{
+					// An asset that failed to load is not an asset without placements.
+					Cov.PackagesUnreadable.AddUnique(AssetData.GetObjectPathString());
+					continue;
+				}
+				if (!PrimaryAsset) PrimaryAsset = Asset;
+
+				TArray<UNiagaraGraph*> CuratedForAsset;
+				MonolithNiagaraIOSurgery::CollectCallerGraphs(Asset, CuratedForAsset);
+				for (UNiagaraGraph* Graph : CuratedForAsset)
+				{
+					if (Graph) Curated.Add(Graph);
+				}
+			}
+
+			if (!bAnyNiagara)
+			{
+				++Cov.NonNiagaraReferencers;
+				continue;
+			}
+			if (!PrimaryAsset) continue;   // every Niagara asset in the package was unreadable; already recorded
+
+			// One exhaustive walk per PACKAGE, not per asset — a package with two Niagara assets
+			// would otherwise double-count its graphs.
+			CollectAllGraphsInPackage(PrimaryAsset->GetOutermost(), Exhaustive);
+
+			// Coverage, reported as SETS with each side separate. A net-zero is not a zero.
+			for (UNiagaraGraph* Graph : Curated)
+			{
+				Cov.GraphsCurated.AddUnique(Graph->GetPathName());
+				if (!Exhaustive.Contains(Graph)) Cov.GraphsOnlyCurated.AddUnique(Graph->GetPathName());
+			}
+			for (UNiagaraGraph* Graph : Exhaustive)
+			{
+				Cov.GraphsExhaustive.AddUnique(Graph->GetPathName());
+				if (!Curated.Contains(Graph)) Cov.GraphsOnlyExhaustive.AddUnique(Graph->GetPathName());
+			}
+
+			TSet<UNiagaraGraph*> AllGraphs = Curated;
+			AllGraphs.Append(Exhaustive);
+
+			for (UNiagaraGraph* Graph : AllGraphs)
+			{
+				TArray<UNiagaraNodeFunctionCall*> Calls;
+				Graph->GetNodesOfClass<UNiagaraNodeFunctionCall>(Calls);
+				for (UNiagaraNodeFunctionCall* Call : Calls)
+				{
+					// Keyed on the loaded UNiagaraScript*, i.e. on (asset, guid) by construction:
+					// an identical version guid on a DIFFERENT module asset is never a candidate.
+					if (!Call || Call->FunctionScript != Script) continue;
+
+					FPlacement P;
+					P.Node               = Call;
+					P.Graph              = Graph;
+					P.OwnerAsset         = PrimaryAsset;
+					P.AssetPath          = PrimaryAsset->GetPathName();
+					P.GraphPath          = Graph->GetPathName();
+					P.FunctionName       = Call->GetFunctionName();
+					P.NodeGuid           = Call->NodeGuid.ToString();
+					P.PinnedGuid         = Call->SelectedScriptVersion;   // public UPROPERTY, NiagaraNodeFunctionCall.h:65
+					P.bFoundByCurated    = Curated.Contains(Graph);
+					P.bFoundByExhaustive = Exhaustive.Contains(Graph);
+					OutPlacements.Add(P);
+				}
+			}
+		}
+	}
+
+	static void CoverageToJson(const TSharedRef<FJsonObject>& R, const FCoverage& Cov)
+	{
+		auto ToArr = [](const TArray<FString>& In)
+		{
+			TArray<TSharedPtr<FJsonValue>> Arr;
+			for (const FString& S : In) Arr.Add(MakeShared<FJsonValueString>(S));
+			return Arr;
+		};
+
+		TSharedRef<FJsonObject> C = MakeShared<FJsonObject>();
+		C->SetNumberField(TEXT("packages_scanned"), Cov.PackagesScanned);
+		C->SetNumberField(TEXT("non_niagara_referencers"), Cov.NonNiagaraReferencers);
+		C->SetBoolField(TEXT("asset_registry_ready"), Cov.bAssetRegistryReady);
+		C->SetStringField(TEXT("taken_at"), Cov.TakenAt);
+		C->SetArrayField(TEXT("packages_unreadable"), ToArr(Cov.PackagesUnreadable));
+		C->SetNumberField(TEXT("graphs_curated"), Cov.GraphsCurated.Num());
+		C->SetNumberField(TEXT("graphs_exhaustive"), Cov.GraphsExhaustive.Num());
+		C->SetArrayField(TEXT("graphs_only_found_by_exhaustive"), ToArr(Cov.GraphsOnlyExhaustive));
+		C->SetArrayField(TEXT("graphs_only_found_by_curated"), ToArr(Cov.GraphsOnlyCurated));
+		C->SetStringField(TEXT("scope_note"), TEXT(
+			"Complete with respect to HARD references in packages the asset registry had scanned at taken_at, and "
+			"exhaustive within each of those packages (every UNiagaraGraph under the package outer, nested objects "
+			"included). It cannot see: content outside the scanned roots, packages the registry had not finished "
+			"scanning (see asset_registry_ready), or assets that failed to load (see packages_unreadable). "
+			"graphs_only_found_by_exhaustive names the graphs the curated container walk is blind to — embedded "
+			"script objects live there; a non-empty list is the exhaustive walk proving it fires."));
+		R->SetObjectField(TEXT("coverage"), C);
+	}
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleReportModuleVersions(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraVersionSweep;
+
+	FString ModulePath = Params->HasField(TEXT("module_path")) ? Params->GetStringField(TEXT("module_path")) : FString();
+	if (ModulePath.IsEmpty() && Params->HasField(TEXT("script_path"))) ModulePath = Params->GetStringField(TEXT("script_path"));
+	if (ModulePath.IsEmpty()) ModulePath = NA_GetAssetPath(Params);
+	if (ModulePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: module_path"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ModulePath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ModulePath));
+
+	const FString StateFilter = Params->HasField(TEXT("state")) ? Params->GetStringField(TEXT("state")) : FString();
+
+	FModuleVersionFacts Facts;
+	ReadModuleFacts(Script, Facts);
+
+	TArray<FPlacement> Placements;
+	FCoverage Cov;
+	SweepPlacements(Script, Placements, Cov);
+
+	// State totals are over ALL placements, never over the filtered subset — a filtered count
+	// that reads like a total is how a partial sweep gets mistaken for a clean bill of health.
+	TMap<FString, int32> StateTotals;
+	TArray<TSharedPtr<FJsonValue>> Rows;
+
+	for (const FPlacement& P : Placements)
+	{
+		const FString State = ClassifyState(Facts, P.PinnedGuid);
+		StateTotals.FindOrAdd(State)++;
+
+		if (!StateFilter.IsEmpty() && !State.Equals(StateFilter, ESearchCase::IgnoreCase)) continue;
+
+		TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("asset_path"), P.AssetPath);
+		Row->SetStringField(TEXT("graph_path"), P.GraphPath);
+		Row->SetStringField(TEXT("function_name"), P.FunctionName);
+		Row->SetStringField(TEXT("node_guid"), P.NodeGuid);
+		Row->SetStringField(TEXT("pinned_guid"), P.PinnedGuid.IsValid() ? P.PinnedGuid.ToString() : TEXT(""));
+		Row->SetBoolField(TEXT("pinned"), P.PinnedGuid.IsValid());
+		Row->SetStringField(TEXT("state"), State);
+		Row->SetStringField(TEXT("resolves_now"), ResolvesNow(Facts, P.PinnedGuid));
+		Row->SetStringField(TEXT("resolves_after_next_load"), ResolvesAfterLoad(Facts, P.PinnedGuid));
+		Row->SetStringField(TEXT("recommended_action"), RecommendedAction(State));
+		Row->SetBoolField(TEXT("found_by_curated_walk"), P.bFoundByCurated);
+		Row->SetBoolField(TEXT("found_by_exhaustive_walk"), P.bFoundByExhaustive);
+		Row->SetNumberField(TEXT("override_pin_count"), CountOverridePins(*P.Node));
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> VersionArr;
+	for (const FNiagaraAssetVersion& V : Facts.Versions)
+	{
+		TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+		E->SetStringField(TEXT("version"), VersionLabel(V));
+		E->SetStringField(TEXT("guid"), V.VersionGuid.ToString());
+		E->SetBoolField(TEXT("is_exposed"), V.VersionGuid == Facts.ExposedGuid);
+		E->SetBoolField(TEXT("is_oldest"), V.VersionGuid == Facts.OldestGuid && Facts.OldestGuid.IsValid());
+		VersionArr.Add(MakeShared<FJsonValueObject>(E));
+	}
+
+	TSharedRef<FJsonObject> Totals = MakeShared<FJsonObject>();
+	for (const TPair<FString, int32>& Pair : StateTotals) Totals->SetNumberField(Pair.Key, Pair.Value);
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("module_path"), ModulePath);
+	R->SetBoolField(TEXT("module_versioning_enabled"), Facts.bVersioningEnabled);
+	R->SetStringField(TEXT("exposed_version"), Facts.ExposedLabel);
+	R->SetStringField(TEXT("exposed_guid"), Facts.ExposedGuid.IsValid() ? Facts.ExposedGuid.ToString() : TEXT(""));
+	R->SetStringField(TEXT("oldest_version"), Facts.OldestLabel);
+	R->SetStringField(TEXT("oldest_guid"), Facts.OldestGuid.IsValid() ? Facts.OldestGuid.ToString() : TEXT(""));
+	R->SetArrayField(TEXT("versions"), VersionArr);
+	R->SetNumberField(TEXT("placement_count"), Placements.Num());
+	R->SetNumberField(TEXT("reported_count"), Rows.Num());
+	R->SetObjectField(TEXT("state_totals"), Totals);
+	R->SetArrayField(TEXT("placements"), Rows);
+	CoverageToJson(R, Cov);
+
+	TArray<FString> Warnings;
+	if (Facts.bLazilyInitialised)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"'%s' had no VersionData in memory, so CheckVersionDataAvailable() synthesised the implicit v1.0 entry "
+			"(NiagaraScript.cpp:669-699). That is an IN-MEMORY change made by this otherwise read-only action. It does "
+			"not Modify() the object and does not dirty the package, and PostLoad does the same thing on every load — "
+			"but it is disclosed rather than swallowed."), *ModulePath));
+	}
+	if (const int32* Doomed = StateTotals.Find(TEXT("unpinned_doomed")))
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d placement(s) are UNPINNED on a module that has versioning ENABLED. Each will be rewritten to the OLDEST "
+			"version (%s) the next time its consumer package loads (NiagaraNodeFunctionCall.cpp:1011), NOT to the exposed "
+			"version (%s). This compiles clean, does not dirty the package and has no in-session symptom, so it reaches "
+			"disk on the next unrelated save. These are the placements a naive 'unpinned = auto-follows, leave alone' "
+			"sweep would skip."), *Doomed, *Facts.OldestLabel, *Facts.ExposedLabel));
+	}
+	if (Cov.GraphsOnlyExhaustive.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d graph(s) were found ONLY by the exhaustive package walk and are invisible to the curated container walk "
+			"(CollectCallerGraphs) that Monolith's other caller-sweeping actions use: %s. Placements in those graphs are "
+			"included here and would be MISSED by a curated-only tool."),
+			Cov.GraphsOnlyExhaustive.Num(), *FString::Join(Cov.GraphsOnlyExhaustive, TEXT(", "))));
+	}
+	if (Cov.GraphsOnlyCurated.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d graph(s) were found ONLY by the curated walk and NOT by the exhaustive package walk: %s. That should be "
+			"impossible for a graph living under the consumer's package outer — investigate before trusting this run's "
+			"coverage."), Cov.GraphsOnlyCurated.Num(), *FString::Join(Cov.GraphsOnlyCurated, TEXT(", "))));
+	}
+	if (!Cov.bAssetRegistryReady)
+	{
+		Warnings.Add(TEXT(
+			"The asset registry is STILL SCANNING. GetReferencers under-reports while that is true, so this placement "
+			"list is a floor, not a census. Re-run once scanning completes."));
+	}
+	if (Cov.PackagesUnreadable.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d referencing Niagara asset(s) could not be loaded and were NOT inspected: %s. An asset that failed to load "
+			"is not an asset without placements."),
+			Cov.PackagesUnreadable.Num(), *FString::Join(Cov.PackagesUnreadable, TEXT(", "))));
+	}
+	if (Placements.Num() == 0)
+	{
+		Warnings.Add(TEXT(
+			"No placements found. That is a valid answer (nothing places this module), but it is also what a wrong module "
+			"path or an unscanned registry looks like. Check coverage.packages_scanned before reading it as 'unused'."));
+	}
+
+	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
+}
+
+FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSharedPtr<FJsonObject>& Params)
+{
+	using namespace MonolithNiagaraVersionSweep;
+
+	FString ModulePath = Params->HasField(TEXT("module_path")) ? Params->GetStringField(TEXT("module_path")) : FString();
+	if (ModulePath.IsEmpty() && Params->HasField(TEXT("script_path"))) ModulePath = Params->GetStringField(TEXT("script_path"));
+	if (ModulePath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required param: module_path"));
+
+	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ModulePath);
+	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ModulePath));
+
+	// dry_run DEFAULTS TRUE. A caller must opt in to writing.
+	const bool bDryRun = Params->HasField(TEXT("dry_run")) ? Params->GetBoolField(TEXT("dry_run")) : true;
+	const bool bSkipPython = Params->HasField(TEXT("skip_python_upgrade")) ? Params->GetBoolField(TEXT("skip_python_upgrade")) : true;
+	const bool bIncludeUnpinned = Params->HasField(TEXT("include_unpinned")) && Params->GetBoolField(TEXT("include_unpinned"));
+	const FString AssetFilter = Params->HasField(TEXT("asset_path")) ? Params->GetStringField(TEXT("asset_path"))
+		: (Params->HasField(TEXT("system_path")) ? Params->GetStringField(TEXT("system_path")) : FString());
+	const FString NodeFilter  = Params->HasField(TEXT("node_guid")) ? Params->GetStringField(TEXT("node_guid")) : FString();
+
+	FModuleVersionFacts Facts;
+	ReadModuleFacts(Script, Facts);
+
+	// ---- everything below refuses BEFORE any mutation and before any transaction opens ----
+
+	if (!Facts.bVersioningEnabled)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT(
+			"'%s' has versioning DISABLED, so a placement cannot be pinned to a version at all: "
+			"FixupFunctionScriptVersion forces SelectedScriptVersion back to empty on the next load "
+			"(NiagaraNodeFunctionCall.cpp:1021-1026), which would silently undo anything written here. "
+			"Enable versioning first (add_script_version), then re-run report_module_versions — note that "
+			"enabling versioning is exactly what turns this module's unpinned placements from 'auto-following' "
+			"into 'about to be stamped to the oldest version'."), *ModulePath));
+	}
+
+	// Resolve the target guid. Validated against the real version list BEFORE calling
+	// ChangeScriptVersion, which dereferences GetScriptData(old) and GetScriptData(new) with no
+	// null check on the Python-upgrade path (NiagaraNodeFunctionCall.cpp:1536-1540) — a bad guid
+	// there is a crash, not an error.
+	FGuid TargetGuid;
+	if (Params->HasField(TEXT("guid")))
+	{
+		if (!FGuid::Parse(Params->GetStringField(TEXT("guid")), TargetGuid))
+			return FMonolithActionResult::Error(TEXT("Invalid guid format. NOTHING WAS READ OR CHANGED."));
+	}
+	else if (Params->HasField(TEXT("major")) && Params->HasField(TEXT("minor")))
+	{
+		const int32 Major = static_cast<int32>(Params->GetNumberField(TEXT("major")));
+		const int32 Minor = static_cast<int32>(Params->GetNumberField(TEXT("minor")));
+		for (const FNiagaraAssetVersion& V : Facts.Versions)
+		{
+			if (V.MajorVersion == Major && V.MinorVersion == Minor) { TargetGuid = V.VersionGuid; break; }
+		}
+		if (!TargetGuid.IsValid())
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("No version %d.%d on '%s' (see list_script_versions). NOTHING WAS CHANGED."), Major, Minor, *ModulePath));
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("Provide either 'guid' or 'major'+'minor'. NOTHING WAS CHANGED."));
+	}
+
+	const FNiagaraAssetVersion* TargetVersion = Facts.Find(TargetGuid);
+	if (TargetVersion == nullptr)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT(
+			"Guid %s is not a version of '%s' (see list_script_versions). Refusing: ChangeScriptVersion dereferences "
+			"GetScriptData(new) unguarded on the Python-upgrade path, so a bad guid is a crash rather than an error. "
+			"NOTHING WAS CHANGED."), *TargetGuid.ToString(), *ModulePath));
+	}
+	const FString TargetLabel = VersionLabel(*TargetVersion);
+
+	if (bIncludeUnpinned && NodeFilter.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT(
+			"include_unpinned requires node_guid. Writing a guid onto an EMPTY pin is never done in bulk: on a module "
+			"with versioning off an empty pin is correct and self-maintaining, and on a module with versioning on it is "
+			"already doomed to the oldest version — the right answer differs per placement and is not this action's to "
+			"guess. Run report_module_versions, read the 'state' column, and name one node_guid at a time. "
+			"NOTHING WAS CHANGED."));
+	}
+
+	TArray<FPlacement> Placements;
+	FCoverage Cov;
+	SweepPlacements(Script, Placements, Cov);
+
+	auto PathMatches = [](const FString& PlacementPath, const FString& Wanted)
+	{
+		if (PlacementPath.Equals(Wanted, ESearchCase::IgnoreCase)) return true;
+		auto PackagePart = [](const FString& In)
+		{
+			int32 Dot = INDEX_NONE;
+			FString Out = In;
+			if (Out.FindChar(TEXT('.'), Dot)) Out.LeftInline(Dot);
+			return Out;
+		};
+		return PackagePart(PlacementPath).Equals(PackagePart(Wanted), ESearchCase::IgnoreCase);
+	};
+
+	TArray<TSharedPtr<FJsonValue>> ToChange, AlreadyOnTarget, SkippedUnpinned, Failed;
+	TArray<FPlacement> Selected;
+
+	for (const FPlacement& P : Placements)
+	{
+		if (!AssetFilter.IsEmpty() && !PathMatches(P.AssetPath, AssetFilter)) continue;
+		if (!NodeFilter.IsEmpty() && !P.NodeGuid.Equals(NodeFilter, ESearchCase::IgnoreCase)) continue;
+
+		const FString State = ClassifyState(Facts, P.PinnedGuid);
+
+		TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("asset_path"), P.AssetPath);
+		Row->SetStringField(TEXT("graph_path"), P.GraphPath);
+		Row->SetStringField(TEXT("function_name"), P.FunctionName);
+		Row->SetStringField(TEXT("node_guid"), P.NodeGuid);
+		Row->SetStringField(TEXT("state"), State);
+		Row->SetStringField(TEXT("guid_before"), P.PinnedGuid.IsValid() ? P.PinnedGuid.ToString() : TEXT(""));
+
+		if (!P.PinnedGuid.IsValid() && !bIncludeUnpinned)
+		{
+			Row->SetStringField(TEXT("reason"), State == TEXT("unpinned_doomed")
+				? TEXT("Empty pin on a VERSIONED module: this placement will be stamped to the oldest version on the next "
+				       "load. Leaving it alone is a silent downgrade; pinning it freezes it. Pass include_unpinned:true "
+				       "WITH this node_guid to decide deliberately.")
+				: TEXT("Empty pin on an UNVERSIONED module: correct as-is, follows the exposed version. Left alone."));
+			SkippedUnpinned.Add(MakeShared<FJsonValueObject>(Row));
+			continue;
+		}
+
+		if (P.PinnedGuid == TargetGuid)
+		{
+			Row->SetStringField(TEXT("reason"), TEXT(
+				"Already pinned to the target version. ChangeScriptVersion would early-out silently here "
+				"(NiagaraNodeFunctionCall.cpp:1525-1528), so it is reported rather than called."));
+			AlreadyOnTarget.Add(MakeShared<FJsonValueObject>(Row));
+			continue;
+		}
+
+		Row->SetNumberField(TEXT("override_pins_before"), CountOverridePins(*P.Node));
+		ToChange.Add(MakeShared<FJsonValueObject>(Row));
+		Selected.Add(P);
+	}
+
+	// ---- write ----
+	TArray<FString> DirtyUnsaved;
+	int32 Applied = 0, Landed = 0, Reloaded = 0;
+
+	if (!bDryRun && Selected.Num() > 0)
+	{
+		GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModuleVersion", "Set Module Version"));
+
+		for (int32 i = 0; i < Selected.Num(); ++i)
+		{
+			const FPlacement& P = Selected[i];
+			TSharedPtr<FJsonObject> Row = ToChange[i]->AsObject();
+
+			// The engine's own graph-level recipe (NiagaraFunctionCallNodeDetails.cpp:246-248).
+			// The two clipboard callbacks on the context are consumed ONLY by the Python-upgrade
+			// path (UpgradeNiagaraScriptResults.h:167-172), so with bSkipPythonScript they are
+			// never invoked and a default-constructed context is sufficient headless.
+			FNiagaraScriptVersionUpgradeContext UpgradeContext;
+			UpgradeContext.bSkipPythonScript = bSkipPython;
+
+			// bShowNotesInStack=false: there is no stack to show an upgrade note in, and it is what
+			// decides whether PreviousScriptVersion records the OLD version or the new one (:1549).
+			P.Node->ChangeScriptVersion(TargetGuid, UpgradeContext, /*bShowNotesInStack=*/false,
+				/*bDeferOverridePinUpdate=*/false);
+
+			// MUST dispatch through the UNiagaraNode base pointer. RefreshFromExternalChanges carries
+			// no export macro on UNiagaraNodeFunctionCall (NiagaraNodeFunctionCall.h:112); the base
+			// declaration is an inline virtual (NiagaraNode.h:87), so this is pure vtable dispatch and
+			// emits no external symbol. Same constraint NA_NotifyScriptApplied documents at :1510-1512.
+			UNiagaraNode* AsNiagaraNode = P.Node;
+			const bool bReloadedThis = AsNiagaraNode->RefreshFromExternalChanges();
+
+			const FGuid After = P.Node->SelectedScriptVersion;
+			const bool bLandedThis = (After == TargetGuid);
+
+			++Applied;
+			if (bLandedThis) ++Landed;
+			if (bReloadedThis) ++Reloaded;
+
+			Row->SetBoolField(TEXT("applied"), true);
+			Row->SetStringField(TEXT("guid_after"), After.IsValid() ? After.ToString() : TEXT(""));
+			Row->SetBoolField(TEXT("landed"), bLandedThis);
+			Row->SetBoolField(TEXT("refresh_reloaded"), bReloadedThis);
+			Row->SetNumberField(TEXT("override_pins_after"), CountOverridePins(*P.Node));
+
+			if (!bReloadedThis)
+			{
+				// RefreshFromExternalChanges returns false when the caller's CachedChangeId already
+				// matches the called graph's change id (NiagaraNodeFunctionCall.cpp:1114) — it
+				// SILENTLY DOES NOTHING. After a version change that moved the guid, that is a
+				// contradiction: each version owns a separately duplicated source graph
+				// (NiagaraScript.cpp:544-546), so the ids should differ.
+				Row->SetStringField(TEXT("refresh_note"), TEXT(
+					"RefreshFromExternalChanges returned FALSE — ReallocatePins did NOT run, so the node's pins were not "
+					"rebuilt against the new version's signature. Surfaced, not swallowed: verify the placed module's "
+					"input list before believing the re-point propagated."));
+			}
+
+			if (P.Graph) P.Graph->NotifyGraphChanged();
+			if (P.OwnerAsset)
+			{
+				if (UPackage* Pkg = P.OwnerAsset->GetOutermost()) DirtyUnsaved.AddUnique(Pkg->GetName());
+			}
+		}
+
+		GEditor->EndTransaction();
+	}
+
+	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+	R->SetStringField(TEXT("module_path"), ModulePath);
+	R->SetBoolField(TEXT("dry_run"), bDryRun);
+	R->SetStringField(TEXT("target_version"), TargetLabel);
+	R->SetStringField(TEXT("target_guid"), TargetGuid.ToString());
+	R->SetBoolField(TEXT("skip_python_upgrade"), bSkipPython);
+	R->SetNumberField(TEXT("placement_count"), Placements.Num());
+	// Four SEPARATE lists, never a difference of counts — offsetting faults cancel to a clean pass.
+	R->SetArrayField(TEXT("to_change"), ToChange);
+	R->SetArrayField(TEXT("already_on_target"), AlreadyOnTarget);
+	R->SetArrayField(TEXT("skipped_unpinned"), SkippedUnpinned);
+	R->SetArrayField(TEXT("failed"), Failed);
+	R->SetNumberField(TEXT("applied_count"), Applied);
+	R->SetNumberField(TEXT("landed_count"), Landed);
+	R->SetNumberField(TEXT("refresh_reloaded_count"), Reloaded);
+	{
+		TArray<TSharedPtr<FJsonValue>> DirtyArr;
+		for (const FString& S : DirtyUnsaved) DirtyArr.Add(MakeShared<FJsonValueString>(S));
+		R->SetArrayField(TEXT("dirty_unsaved"), DirtyArr);
+	}
+	CoverageToJson(R, Cov);
+
+	TArray<FString> Warnings;
+	if (bDryRun)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"DRY RUN — nothing was changed. %d placement(s) would be re-pointed to %s. Pass dry_run:false to write."),
+			ToChange.Num(), *TargetLabel));
+	}
+	else if (Applied > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d package(s) were changed IN MEMORY and are NOT saved by this action: %s. Unlike add_script_version, this "
+			"action deliberately does not save — the decision is yours. Save them (editor:save_packages) or the re-point "
+			"is lost on restart."), DirtyUnsaved.Num(), *FString::Join(DirtyUnsaved, TEXT(", "))));
+		if (Landed != Applied)
+		{
+			Warnings.Add(FString::Printf(TEXT(
+				"%d of %d node(s) did NOT end up on the target guid after the call. ChangeScriptVersion returns void and "
+				"early-outs silently (:1525-1528), so the per-row guid_before/guid_after is the only in-process evidence "
+				"there is. Read the rows."), Applied - Landed, Applied));
+		}
+		if (Reloaded != Applied)
+		{
+			Warnings.Add(FString::Printf(TEXT(
+				"%d of %d node(s) reported refresh_reloaded=false, meaning ReallocatePins did not run and their pins were "
+				"NOT rebuilt against the new version's signature (NiagaraNodeFunctionCall.cpp:1114,1145-1156). Check each "
+				"placed module's input list against the new version before treating this as done."),
+				Applied - Reloaded, Applied));
+		}
+		Warnings.Add(TEXT(
+			"UpdateOverridePins ran as part of ChangeScriptVersion. It RETYPES overrides whose input type changed and "
+			"DELETES overrides for inputs the new version no longer has (NiagaraNodeFunctionCall.cpp:1596-1612) — "
+			"including inputs that were merely RENAMED, whose values are lost silently on this graph-level path. Compare "
+			"override_pins_before/override_pins_after on each row; a drop is real data removed, not a display artefact. "
+			"A count of -1 means the node has no override node at all, in which case UpdateOverridePins was a no-op "
+			"(:1574-1575)."));
+		Warnings.Add(TEXT(
+			"NOT COMPILED. MarkNodeRequiresSynchronization invalidates the graph's change id; it does not compile. Run "
+			"niagara:request_compile and read the diagnostics — and note that a clean compile is NOT evidence the "
+			"re-point landed."));
+	}
+	if (Cov.GraphsOnlyExhaustive.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d graph(s) in this sweep are visible ONLY to the exhaustive package walk: %s. Placements there were "
+			"included; a curated-container tool would have missed them."),
+			Cov.GraphsOnlyExhaustive.Num(), *FString::Join(Cov.GraphsOnlyExhaustive, TEXT(", "))));
+	}
+	if (!Cov.bAssetRegistryReady)
+	{
+		Warnings.Add(TEXT(
+			"The asset registry is STILL SCANNING, so the consumer list is a floor rather than a census. Some placements "
+			"may not have been considered at all."));
+	}
+	if (Cov.PackagesUnreadable.Num() > 0)
+	{
+		Warnings.Add(FString::Printf(TEXT(
+			"%d referencing Niagara asset(s) could not be loaded and were NOT inspected: %s."),
+			Cov.PackagesUnreadable.Num(), *FString::Join(Cov.PackagesUnreadable, TEXT(", "))));
+	}
+	if (!bSkipPython)
+	{
+		Warnings.Add(TEXT(
+			"skip_python_upgrade was set FALSE, so the module author's Python upgrade scripts ran for every version "
+			"between the old and new one (NiagaraNodeFunctionCall.cpp:1532-1545). That is arbitrary user code and its "
+			"effects are not reported here."));
+	}
+
+	return FMonolithActionResult::Success(R).WithWarnings(Warnings);
 }
 
