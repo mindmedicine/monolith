@@ -30266,6 +30266,104 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRemoveScriptParameter(const
 // pin and leaves the registry alone — and the two compose: remove the pins, then sweep.
 // ============================================================================
 
+// ============================================================================
+// SHARED CALLER-SWEEP PRIMITIVES — one definition, for every action in this file
+// that answers "which graphs place this script?".
+//
+// WHY THIS NAMESPACE EXISTS. The same candidate-package filter was written out
+// THREE times — report_module_versions, set_module_version, and the rename
+// surgery below — and every copy carried the same defect: it accepted
+// UNiagaraSystem and UNiagaraEmitter only, so A MODULE THAT PLACES ANOTHER
+// MODULE was skipped before anything looked inside its package. Measured on
+// UniFX WorldPositionToCameraUV: ground truth 3 call sites, the sweep reported
+// 2, and the third was tallied as a "non-Niagara referencer".
+// [MEASURED: Docs/staging/2026-08-30-validator-version-actions-test.md s1]
+//
+// Two copies of one rule agree by luck rather than by construction, and when
+// they drift they both still read as authoritative. One shared definition
+// removes the class of drift; an agreement test between copies only samples
+// for it.
+// ============================================================================
+namespace MonolithNiagaraCallerSweep
+{
+	/**
+	 * THE THREE GRAPH-BEARING NIAGARA ASSET CLASSES, and no others.
+	 *
+	 * UNiagaraScript is the one the old two-class filter omitted, and omitting it is not a
+	 * marginal miss: MODULES PLACE MODULES. A shared module asset that calls the target holds a
+	 * real placement, in a real UNiagaraGraph, that any caller sweep must see. Every other
+	 * Niagara asset class (ParameterCollection, EffectType, SimCache, DataChannel) owns no
+	 * UNiagaraGraph and genuinely cannot hold a placement.
+	 * [INFERENCE: the enumeration of "no other class owns a graph" is reasoned, not swept.]
+	 *
+	 * Exact class-path comparison FIRST, because it answers without needing the UClass loaded.
+	 * IsInstanceOf widens the test to subclasses but returns false for an unloaded class BY
+	 * DESIGN (EResolveClass::No is the default, AssetData.h:469-482). Either test alone has a
+	 * silent-miss mode; the pair does not.
+	 */
+	static bool IsGraphBearingNiagaraAsset(const FAssetData& AssetData)
+	{
+		const FTopLevelAssetPath SystemClassPath  = UNiagaraSystem::StaticClass()->GetClassPathName();
+		const FTopLevelAssetPath EmitterClassPath = UNiagaraEmitter::StaticClass()->GetClassPathName();
+		const FTopLevelAssetPath ScriptClassPath  = UNiagaraScript::StaticClass()->GetClassPathName();
+
+		return AssetData.AssetClassPath == SystemClassPath
+			|| AssetData.AssetClassPath == EmitterClassPath
+			|| AssetData.AssetClassPath == ScriptClassPath
+			|| AssetData.IsInstanceOf<UNiagaraSystem>()
+			|| AssetData.IsInstanceOf<UNiagaraEmitter>()
+			|| AssetData.IsInstanceOf<UNiagaraScript>();
+	}
+
+	/**
+	 * EXHAUSTIVE by construction: a UNiagaraNodeFunctionCall must live in a UNiagaraGraph, and a
+	 * graph inside a consumer package must be an object under that package's outer. Embedded
+	 * scripts, scratch pads, event and simulation-stage scripts are reached without needing to
+	 * know they exist — which is precisely what the curated container walk
+	 * (MonolithNiagaraIOSurgery::CollectCallerGraphs) cannot do.
+	 */
+	static void CollectAllGraphsInPackage(UPackage* Pkg, TSet<UNiagaraGraph*>& Out)
+	{
+		if (!Pkg) return;
+		TArray<UObject*> Objects;
+		// EGetObjectsFlags::IncludeNestedObjects, not the bool overload — the bool form is
+		// UE_INCLUDENESTEDOBJECTS_BOOL_DEPRECATED in 5.8 (UObjectHash.h:130) and is documented as
+		// not compiling in the next release.
+		GetObjectsWithOuter(Pkg, Objects, EGetObjectsFlags::IncludeNestedObjects);
+		for (UObject* Obj : Objects)
+		{
+			if (UNiagaraGraph* Graph = Cast<UNiagaraGraph>(Obj))
+			{
+				if (IsValid(Graph)) Out.Add(Graph);
+			}
+		}
+	}
+
+	/**
+	 * The referencer-depth argument, stated once so neither caller has to re-derive it.
+	 *
+	 * DEPTH IS EXACTLY ONE, AND THAT IS A PROOF RATHER THAN A BUDGET. "Modules place modules"
+	 * sounds like it demands a recursive descent; it does not. A PLACEMENT is a hard
+	 * FunctionScript UPROPERTY pointer (NiagaraNodeFunctionCall.h:61-62), so every package
+	 * holding one is a DIRECT referencer of the module package and already appears in the flat
+	 * GetReferencers list. A -> B -> C needs no traversal: the graph in B that calls C is found
+	 * when sweeping C, because B directly references C.
+	 *
+	 * Two consequences worth stating:
+	 *   - There is no recursion, so a module cycle (A places B, B places A) CANNOT hang the
+	 *     walk. Each candidate package is visited once, from a list built before the loop starts.
+	 *   - It reports PLACEMENTS, not transitive impact. A consumer that embeds its own duplicated
+	 *     copy of a module holds a SEPARATE placement in the consumer's package.
+	 */
+	static const TCHAR* DepthNote()
+	{
+		return TEXT(
+			"Referencer depth is ONE and that is complete, not a budget: a placement is a hard FunctionScript "
+			"pointer, so every package holding one is a direct referencer. Nothing recurses, so a module cycle "
+			"cannot hang this walk.");
+	}
+}
+
 namespace MonolithNiagaraIOSurgery
 {
 	/**
@@ -30471,14 +30569,42 @@ namespace MonolithNiagaraIOSurgery
 	{
 		UNiagaraNodeFunctionCall* Node = nullptr;
 		UNiagaraGraph*  OwnerGraph = nullptr;
-		UObject*        OwnerAsset = nullptr;     // the UNiagaraSystem / UNiagaraEmitter to re-save
+		UObject*        OwnerAsset = nullptr;     // a UNiagaraSystem / UNiagaraEmitter / UNiagaraScript to re-save
 		FString         AssetPath;
+		FString         GraphPath;                // which graph the call actually lives in
 		FString         FunctionName;             // the placed module's unique name in its stack
 		UEdGraphNode*   OverrideNode = nullptr;   // the ParameterMapSet carrying the override pin
 		UEdGraphPin*    OverridePin = nullptr;    // null == this caller never overrode the parameter
 		FString         OldPinName;
 		FString         NewPinName;
 		FString         Blocker;                  // non-empty == unrepairable; abort everything
+		bool            bFoundByCurated = false;
+		bool            bFoundByExhaustive = false;
+	};
+
+	/**
+	 * What the caller sweep can and cannot promise, reported on every response.
+	 *
+	 * This exists because the action's contract is ALL-OR-NOTHING, i.e. a COMPLETENESS PROMISE —
+	 * and a completeness promise resting on an unreported sweep is the exact defect this repair
+	 * is for. A sweep that finds nothing satisfies "I updated every caller I found" perfectly.
+	 *
+	 * PackagesSkipped replaces a bare int32 called `non_niagara_referencers`, which was wrong in
+	 * the one way that costs a caller real work: it counted a UNiagaraScript — a shared MODULE
+	 * that places the target — and the caller read it as "a level references this" and moved on.
+	 * A bare count could never have been checked; naming the package and the classes found in it
+	 * means a reader can see WHAT was skipped and judge whether the skip was right.
+	 */
+	struct FCallerSweepCoverage
+	{
+		int32 PackagesScanned = 0;
+		bool  bAssetRegistryReady = false;
+		FString TakenAt;
+		TArray<TPair<FString, FString>> PackagesSkipped;   // (package, asset classes actually found)
+		TArray<FString> GraphsCurated;
+		TArray<FString> GraphsExhaustive;
+		TArray<FString> GraphsOnlyCurated;      // exhaustive walk missed these
+		TArray<FString> GraphsOnlyExhaustive;   // curated walk missed these (expected: embedded scripts)
 	};
 
 	/**
@@ -30579,22 +30705,48 @@ namespace MonolithNiagaraIOSurgery
 	 *
 	 * The referencer list is the asset-registry PACKAGE graph, which is a SUPERSET and is all the
 	 * warning path has ever had (it loads nothing and traverses nothing). Repairing requires the
-	 * real thing, so this LOADS each referencing Niagara asset. Only assets whose registry class is
-	 * UNiagaraSystem or UNiagaraEmitter are loaded — a referencing level or Blueprint is counted
-	 * and skipped, never loaded.
+	 * real thing, so this LOADS each referencing Niagara asset. Only assets whose registry class
+	 * is graph-bearing are loaded — a referencing level or Blueprint is recorded and skipped,
+	 * never loaded.
+	 *
+	 * 🛑 REPAIRED 2026-08-30 (gap #132). This function had BOTH of the blind spots that made
+	 * report_module_versions under-report, and they were worse here because this action's
+	 * contract is ALL-OR-NOTHING — a completeness promise:
+	 *
+	 *   1. THE CANDIDATE FILTER accepted UNiagaraSystem and UNiagaraEmitter only, so a MODULE
+	 *      THAT PLACES ANOTHER MODULE was skipped before anything looked inside its package.
+	 *      Now MonolithNiagaraCallerSweep::IsGraphBearingNiagaraAsset, which is the one shared
+	 *      definition and includes UNiagaraScript.
+	 *   2. IT WALKED ONLY THE CURATED CollectCallerGraphs, which was measured to find ZERO of
+	 *      the UniFX WorldPositionToCameraUV placements — not a partial miss, a total one
+	 *      (found_by_curated_walk: false on every reported row).
+	 *      [MEASURED: Docs/staging/2026-08-30-validator-version-actions-test.md s1b]
+	 *      Now curated UNION exhaustive, per package, with each side reported separately.
+	 *
+	 * So before this change, renaming an input on a UniFX module located 0 callers, REPORTED
+	 * SUCCESS, and left every real caller holding an override pin naming a parameter the script
+	 * no longer declares — a dead read that compiles clean and returns a default forever (I-38).
+	 *
+	 * ⚠️ CONSEQUENCE, AND IT IS DELIBERATE: a rename that used to SUCCEED can now ABORT, because
+	 * finding more callers can mean finding one that cannot be repaired. That is an improvement,
+	 * not a regression — those renames were never actually succeeding, they were leaving silent
+	 * dead links. A loud, named refusal replaces silent corruption. The refusal names every
+	 * blocking caller, its graph, and which walk found it, so a caller who now gets a failure
+	 * where they used to get success can see exactly what changed.
 	 *
 	 * OutUnreadable collects Niagara packages that could not be resolved to an asset. Those are
 	 * BLOCKERS when repair is on: a caller we cannot see is a caller we cannot promise about.
 	 */
 	static void CollectPlacedCallers(UNiagaraScript* Script, const FString& OldFullName, const FString& NewFullName,
-		TArray<FPlacedCaller>& OutCallers, TArray<FString>& OutUnreadable, int32& OutNonNiagaraReferencers)
+		TArray<FPlacedCaller>& OutCallers, TArray<FString>& OutUnreadable, FCallerSweepCoverage& Cov)
 	{
-		OutNonNiagaraReferencers = 0;
+		Cov.TakenAt = FDateTime::UtcNow().ToIso8601();
 
 		UPackage* Pkg = Script ? Script->GetOutermost() : nullptr;
 		if (!Pkg) return;
 
 		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		Cov.bAssetRegistryReady = !AR.IsLoadingAssets();
 
 		// An EMBEDDED script (scratch pad / event / sim stage) is not its package's asset, so its
 		// caller is the owning asset itself and the referencer graph would answer about that
@@ -30611,18 +30763,26 @@ namespace MonolithNiagaraIOSurgery
 			AR.GetReferencers(FName(*Pkg->GetName()), PackagesToInspect);
 		}
 
-		const FTopLevelAssetPath SystemClassPath  = UNiagaraSystem::StaticClass()->GetClassPathName();
-		const FTopLevelAssetPath EmitterClassPath = UNiagaraEmitter::StaticClass()->GetClassPathName();
-
 		for (const FName& PackageName : PackagesToInspect)
 		{
+			++Cov.PackagesScanned;
+
 			TArray<FAssetData> Assets;
 			AR.GetAssetsByPackageName(PackageName, Assets, /*bIncludeOnlyOnDiskAssets=*/false);
 
+			TSet<UNiagaraGraph*> Curated;
+			TSet<UNiagaraGraph*> Exhaustive;
+			UObject* PrimaryAsset = nullptr;
 			bool bAnyNiagara = false;
+			TArray<FString> ClassesSeen;
+
 			for (const FAssetData& AssetData : Assets)
 			{
-				if (AssetData.AssetClassPath != SystemClassPath && AssetData.AssetClassPath != EmitterClassPath)
+				// Recorded for EVERY asset, matched or not — a skip that cannot name what it
+				// skipped is the defect this sweep is being repaired for.
+				ClassesSeen.AddUnique(AssetData.AssetClassPath.GetAssetName().ToString());
+
+				if (!MonolithNiagaraCallerSweep::IsGraphBearingNiagaraAsset(AssetData))
 				{
 					continue;
 				}
@@ -30631,69 +30791,126 @@ namespace MonolithNiagaraIOSurgery
 				UObject* Asset = AssetData.GetAsset();
 				if (!Asset)
 				{
-					OutUnreadable.Add(AssetData.GetObjectPathString());
+					// An asset that failed to load is not an asset without placements, and under
+					// an all-or-nothing contract that difference is the whole ballgame.
+					OutUnreadable.AddUnique(AssetData.GetObjectPathString());
 					continue;
 				}
+				if (!PrimaryAsset) PrimaryAsset = Asset;
 
-				TArray<UNiagaraGraph*> Graphs;
-				CollectCallerGraphs(Asset, Graphs);
-				for (UNiagaraGraph* Graph : Graphs)
+				// CollectCallerGraphs understands UNiagaraSystem and UNiagaraEmitter ONLY. For a
+				// UNiagaraScript referencer it returns nothing, so such a package is
+				// exhaustive-only BY CONSTRUCTION — not a sign the curated walk failed.
+				TArray<UNiagaraGraph*> CuratedForAsset;
+				CollectCallerGraphs(Asset, CuratedForAsset);
+				for (UNiagaraGraph* Graph : CuratedForAsset)
 				{
-					if (!Graph) continue;
-					TArray<UNiagaraNodeFunctionCall*> FunctionCalls;
-					Graph->GetNodesOfClass<UNiagaraNodeFunctionCall>(FunctionCalls);
-					for (UNiagaraNodeFunctionCall* Call : FunctionCalls)
-					{
-						if (!Call || Call->FunctionScript != Script) continue;
-
-						FPlacedCaller C;
-						C.Node         = Call;
-						C.OwnerGraph   = Graph;
-						C.OwnerAsset   = Asset;
-						C.AssetPath    = Asset->GetPathName();
-						C.FunctionName = Call->GetFunctionName();
-
-						// The override pin carries the ALIASED handle: "Module.X" on the script is
-						// "<FunctionName>.X" on the caller. CreateAliasedModuleParameterHandle
-						// returns the name UNCHANGED for anything outside the Module namespace
-						// (NiagaraParameterHandle.cpp:55-70) — which is right: a Local.*/Particles.*
-						// parameter is not a module input and has no override pin to find.
-						const FName OldAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-							FName(*OldFullName), FName(*C.FunctionName)).GetParameterHandleString();
-						const FName NewAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-							FName(*NewFullName), FName(*C.FunctionName)).GetParameterHandleString();
-						C.OldPinName = OldAliased.ToString();
-						C.NewPinName = NewAliased.ToString();
-
-						C.OverridePin = FindFunctionOverridePin(*Call, OldAliased, C.OverrideNode);
-
-						// Safety net that should never fire: a pin for this parameter on the
-						// function-call NODE itself would mean the parameter is exposed as a
-						// UNiagaraNodeInput or a static switch, and those need ReallocatePins,
-						// not a pin rename. Static switches are refused earlier by interlock 1;
-						// report anything else rather than half-repair it.
-						if (NodeHasInputPinNamed(Call, FName(*OldFullName)) || NodeHasInputPinNamed(Call, OldAliased))
-						{
-							C.Blocker = FString::Printf(TEXT(
-								"the module node itself carries a pin named '%s', so this parameter is exposed as a node "
-								"input or static switch rather than a map-get module input; that needs a pin "
-								"reallocation, which this action does not do"), *OldFullName);
-						}
-						else if (C.OverridePin != nullptr && NodeHasInputPinNamed(C.OverrideNode, NewAliased))
-						{
-							C.Blocker = FString::Printf(TEXT(
-								"its override node already has a pin named '%s', so renaming '%s' onto it would leave two "
-								"pins sharing one name"), *C.NewPinName, *C.OldPinName);
-						}
-
-						OutCallers.Add(C);
-					}
+					if (Graph) Curated.Add(Graph);
 				}
 			}
 
 			if (!bAnyNiagara)
 			{
-				++OutNonNiagaraReferencers;
+				Cov.PackagesSkipped.Emplace(PackageName.ToString(),
+					ClassesSeen.Num() > 0 ? FString::Join(ClassesSeen, TEXT(", ")) : TEXT("<no asset rows in the registry>"));
+				continue;
+			}
+			if (!PrimaryAsset) continue;   // every Niagara asset in the package was unreadable; already recorded
+
+			// One exhaustive walk per PACKAGE, not per asset — a package with two Niagara assets
+			// would otherwise double-count its graphs.
+			MonolithNiagaraCallerSweep::CollectAllGraphsInPackage(PrimaryAsset->GetOutermost(), Exhaustive);
+
+			// Coverage reported as SETS, each side separately. A net-zero is not a zero.
+			for (UNiagaraGraph* Graph : Curated)
+			{
+				Cov.GraphsCurated.AddUnique(Graph->GetPathName());
+				if (!Exhaustive.Contains(Graph)) Cov.GraphsOnlyCurated.AddUnique(Graph->GetPathName());
+			}
+			for (UNiagaraGraph* Graph : Exhaustive)
+			{
+				Cov.GraphsExhaustive.AddUnique(Graph->GetPathName());
+				if (!Curated.Contains(Graph)) Cov.GraphsOnlyExhaustive.AddUnique(Graph->GetPathName());
+			}
+
+			TSet<UNiagaraGraph*> AllGraphs = Curated;
+			AllGraphs.Append(Exhaustive);
+
+			for (UNiagaraGraph* Graph : AllGraphs)
+			{
+				if (!Graph) continue;
+
+				// OwnerAsset is deliberately the package's PRIMARY asset rather than the graph's
+				// own outer: its only jobs are the save target and the "same package as the
+				// edited script?" test, and both are package-level (NA_ResolveSaveTarget resolves
+				// through FindAssetInPackage). Keying on the primary asset also means ONE save
+				// per package instead of one per graph. GraphPath below carries the precise
+				// location, so nothing is lost from the report.
+				TArray<UNiagaraNodeFunctionCall*> FunctionCalls;
+				Graph->GetNodesOfClass<UNiagaraNodeFunctionCall>(FunctionCalls);
+				for (UNiagaraNodeFunctionCall* Call : FunctionCalls)
+				{
+					if (!Call || Call->FunctionScript != Script) continue;
+
+					FPlacedCaller C;
+					C.Node               = Call;
+					C.OwnerGraph         = Graph;
+					C.OwnerAsset         = PrimaryAsset;
+					C.AssetPath          = PrimaryAsset->GetPathName();
+					C.GraphPath          = Graph->GetPathName();
+					C.FunctionName       = Call->GetFunctionName();
+					C.bFoundByCurated    = Curated.Contains(Graph);
+					C.bFoundByExhaustive = Exhaustive.Contains(Graph);
+
+					// The override pin carries the ALIASED handle: "Module.X" on the script is
+					// "<FunctionName>.X" on the caller. CreateAliasedModuleParameterHandle
+					// returns the name UNCHANGED for anything outside the Module namespace
+					// (NiagaraParameterHandle.cpp:55-70) — which is right: a Local.*/Particles.*
+					// parameter is not a module input and has no override pin to find.
+					const FName OldAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+						FName(*OldFullName), FName(*C.FunctionName)).GetParameterHandleString();
+					const FName NewAliased = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
+						FName(*NewFullName), FName(*C.FunctionName)).GetParameterHandleString();
+					C.OldPinName = OldAliased.ToString();
+					C.NewPinName = NewAliased.ToString();
+
+					// OWNER-AGNOSTIC BY CONSTRUCTION, and this was audited rather than assumed
+					// when the sweep was widened to module-owned callers (gap #132). Every step
+					// of the locate-and-repair path is GRAPH-LOCAL: FindFunctionOverridePin walks
+					// the call node's own parameter-map input pin to its single linked node and
+					// matches a pin NAME (:30640-30659); the repair is OverridePin->PinName = ...;
+					// the invalidation is CallerGraph->NotifyGraphChanged(). None of them reads
+					// the owning ASSET's type, so a UNiagaraScript owner needs no new code path.
+					// The only owner-typed helper in the whole flow is CollectCallerGraphs, and
+					// that is exactly the curated walk the exhaustive pass above now supplements.
+					C.OverridePin = FindFunctionOverridePin(*Call, OldAliased, C.OverrideNode);
+
+					// Safety net that should never fire: a pin for this parameter on the
+					// function-call NODE itself would mean the parameter is exposed as a
+					// UNiagaraNodeInput or a static switch, and those need ReallocatePins,
+					// not a pin rename. Static switches are refused earlier by interlock 1;
+					// report anything else rather than half-repair it.
+					//
+					// ⚠️ This is the branch most likely to fire for a NEWLY-VISIBLE caller: a
+					// script placed as a FUNCTION exposes its inputs as UNiagaraNodeInput pins on
+					// the call node, not as map-get Module.* parameters. Blocking is correct —
+					// half-repairing that shape is exactly what all-or-nothing exists to prevent.
+					if (NodeHasInputPinNamed(Call, FName(*OldFullName)) || NodeHasInputPinNamed(Call, OldAliased))
+					{
+						C.Blocker = FString::Printf(TEXT(
+							"the module node itself carries a pin named '%s', so this parameter is exposed as a node "
+							"input or static switch rather than a map-get module input; that needs a pin "
+							"reallocation, which this action does not do"), *OldFullName);
+					}
+					else if (C.OverridePin != nullptr && NodeHasInputPinNamed(C.OverrideNode, NewAliased))
+					{
+						C.Blocker = FString::Printf(TEXT(
+							"its override node already has a pin named '%s', so renaming '%s' onto it would leave two "
+							"pins sharing one name"), *C.NewPinName, *C.OldPinName);
+					}
+
+					OutCallers.Add(C);
+				}
 			}
 		}
 	}
@@ -30951,17 +31168,73 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 	// untouched, because CancelTransaction discards the undo record and not the changes (#36).
 	TArray<FPlacedCaller> PlacedCallers;
 	TArray<FString> UnreadableCallerAssets;
-	int32 NonNiagaraReferencers = 0;
+	FCallerSweepCoverage CallerCoverage;
 	if (bFixPlacedCallers)
 	{
-		CollectPlacedCallers(Script, ParamName, NewName, PlacedCallers, UnreadableCallerAssets, NonNiagaraReferencers);
+		CollectPlacedCallers(Script, ParamName, NewName, PlacedCallers, UnreadableCallerAssets, CallerCoverage);
+
+		// 🛑 AN ALL-OR-NOTHING CONTRACT IS A COMPLETENESS PROMISE, so it must refuse when the
+		// enumeration it rests on is knowably incomplete. GetReferencers under-reports while the
+		// asset registry is still scanning, and a sweep that finds nothing satisfies "I updated
+		// every caller I found" perfectly — which is the whole shape of gap #132. Refusing here
+		// is loud, cheap to work around, and honest; proceeding would re-create the defect.
+		if (!CallerCoverage.bAssetRegistryReady)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Refusing '%s' -> '%s': the asset registry is STILL SCANNING (IAssetRegistry::IsLoadingAssets), so "
+				     "the referencer list is knowably incomplete and this action's all-or-nothing promise to repair EVERY "
+				     "placed caller cannot be kept. %d package(s) were visible at %s. Wait for the scan to finish and "
+				     "re-run, or pass fix_placed_callers=false to rename anyway and accept the old warn-only behaviour. "
+				     "NOTHING WAS CHANGED."),
+				*ParamName, *NewName, CallerCoverage.PackagesScanned, *CallerCoverage.TakenAt));
+		}
+
+		// Pre-flight EVERY caller package that will actually be written, while the asset is still
+		// untouched — the same gap #26b ordering the script's own save target already gets.
+		//
+		// 🛑 THIS CLOSES THE ONE REMAINING HOLE IN ALL-OR-NOTHING, and widening the sweep is what
+		// made it reachable. The rename is saved first and each repaired caller separately after;
+		// a caller whose package cannot be saved therefore leaves the script renamed ON DISK and
+		// the caller repaired only IN MEMORY, which reverts to the broken state on restart. That
+		// is a genuinely PARTIAL outcome, and it was previously only discovered after the
+		// transaction had closed. Finding it here turns it into a refusal.
+		TSet<FString> PreflightedCallerPackages;
 
 		TArray<FString> Blocked;
 		for (const FPlacedCaller& C : PlacedCallers)
 		{
 			if (!C.Blocker.IsEmpty())
 			{
-				Blocked.Add(FString::Printf(TEXT("%s / module '%s': %s"), *C.AssetPath, *C.FunctionName, *C.Blocker));
+				// Name the graph and the walk that found it, not just the asset. A caller who now
+				// gets a refusal where they used to get success has to be able to see WHICH
+				// caller is new and WHY, or the trade is not acceptable.
+				Blocked.Add(FString::Printf(TEXT("%s / module '%s' (graph %s, found by %s walk): %s"),
+					*C.AssetPath, *C.FunctionName, *C.GraphPath,
+					C.bFoundByCurated ? (C.bFoundByExhaustive ? TEXT("curated+exhaustive") : TEXT("curated"))
+					                  : TEXT("exhaustive-only"),
+					*C.Blocker));
+				continue;
+			}
+
+			// Only callers that will actually be WRITTEN need a save target. A caller with no
+			// override pin is untouched, so an unsaveable package there is not this action's
+			// problem and must not become a spurious refusal.
+			if (C.OverridePin == nullptr || C.OwnerAsset == nullptr) continue;
+			if (C.OwnerAsset->GetOutermost() == Script->GetOutermost()) continue;   // saved with the script
+
+			const FString CallerPkgName = C.OwnerAsset->GetOutermost()->GetName();
+			if (PreflightedCallerPackages.Contains(CallerPkgName)) continue;
+			PreflightedCallerPackages.Add(CallerPkgName);
+
+			UPackage* CallerPkg = nullptr;
+			UObject* CallerSaveAsset = nullptr;
+			bool bCallerEmbedded = false;
+			FString CallerFilename, CallerSaveError;
+			if (!NA_ResolveSaveTarget(C.OwnerAsset, CallerPkg, CallerSaveAsset, bCallerEmbedded, CallerFilename, CallerSaveError))
+			{
+				Blocked.Add(FString::Printf(TEXT(
+					"%s / module '%s' (graph %s): its override pin needs repairing but the package could not be saved — %s"),
+					*C.AssetPath, *C.FunctionName, *C.GraphPath, *CallerSaveError));
 			}
 		}
 		for (const FString& Unreadable : UnreadableCallerAssets)
@@ -30971,13 +31244,31 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		}
 		if (Blocked.Num() > 0)
 		{
+			// Count the exhaustive-only blockers so the message can say plainly whether this
+			// refusal is NEW behaviour — that is the single most useful fact for a caller whose
+			// previously-working rename has just started failing.
+			int32 ExhaustiveOnlyBlockers = 0;
+			for (const FPlacedCaller& C : PlacedCallers)
+			{
+				if (!C.Blocker.IsEmpty() && C.bFoundByExhaustive && !C.bFoundByCurated) ++ExhaustiveOnlyBlockers;
+			}
+
 			return FMonolithActionResult::Error(FString::Printf(
 				TEXT("Refusing '%s' -> '%s': %d placed caller(s) could not be repaired, and this action is all-or-nothing "
-				     "because CancelTransaction discards the undo record rather than the changes. %s. Pass "
-				     "fix_placed_callers=false to rename anyway and get the old warn-only behaviour — but then those "
+				     "because CancelTransaction discards the undo record rather than the changes. %s. %s"
+				     "Your options: repair the listed caller(s) by hand (or remove the offending override) and re-run; or "
+				     "pass fix_placed_callers=false to rename anyway and get the old warn-only behaviour — but then those "
 				     "callers keep an override pin naming a parameter the script no longer declares, which compiles clean "
 				     "in-session and fails on the NEXT LOAD (I-38). NOTHING WAS CHANGED."),
-				*ParamName, *NewName, Blocked.Num(), *FString::Join(Blocked, TEXT("; "))));
+				*ParamName, *NewName, Blocked.Num(), *FString::Join(Blocked, TEXT("; ")),
+				ExhaustiveOnlyBlockers > 0
+					? *FString::Printf(TEXT(
+						"NEWLY VISIBLE: %d of these were INVISIBLE to this action before 2026-08-30 (gap #132): the caller sweep "
+						"walked only Niagara systems and emitters via a curated container list, so a module placed "
+						"inside another MODULE was never looked at. If this exact rename used to succeed, it was not "
+						"succeeding — it was silently leaving those callers with a dead override pin. This refusal "
+						"replaces that silent corruption. "), ExhaustiveOnlyBlockers)
+					: TEXT("")));
 		}
 	}
 
@@ -31024,7 +31315,15 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		{
 			TSharedRef<FJsonObject> Row = MakeShared<FJsonObject>();
 			Row->SetStringField(TEXT("asset"), C.AssetPath);
+			Row->SetStringField(TEXT("graph"), C.GraphPath);
 			Row->SetStringField(TEXT("module"), C.FunctionName);
+			// Which walk found this caller. An exhaustive-only row is a caller this action was
+			// BLIND TO before gap #132 was fixed, so it is the row a validator should check
+			// hardest — and reporting the two sides separately means a reader can tell "the
+			// curated walk found everything" from "the curated walk found nothing", which a
+			// single merged count cannot.
+			Row->SetBoolField(TEXT("found_by_curated_walk"), C.bFoundByCurated);
+			Row->SetBoolField(TEXT("found_by_exhaustive_walk"), C.bFoundByExhaustive);
 
 			if (C.OverridePin == nullptr || C.OverrideNode == nullptr)
 			{
@@ -31171,9 +31470,53 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		R->SetNumberField(TEXT("placed_callers_repaired"), CallersRepaired);
 		R->SetNumberField(TEXT("placed_callers_without_override"), CallersWithNoOverride);
 		R->SetArrayField(TEXT("placed_caller_repairs"), RepairRows);
-		if (NonNiagaraReferencers > 0)
+
+		// `non_niagara_referencing_packages` is GONE, not renamed in place. It was a bare int32,
+		// and a bare count could never have been checked — the identical field on the version
+		// sweep counted a UNiagaraScript (a MODULE that placed the target) and a caller read it
+		// as "a level references this" and moved on. Name every skipped package and the asset
+		// classes found in it, and the claim becomes falsifiable on sight.
 		{
-			R->SetNumberField(TEXT("non_niagara_referencing_packages"), NonNiagaraReferencers);
+			auto ToArr = [](const TArray<FString>& In)
+			{
+				TArray<TSharedPtr<FJsonValue>> Arr;
+				for (const FString& S : In) Arr.Add(MakeShared<FJsonValueString>(S));
+				return Arr;
+			};
+
+			TSharedRef<FJsonObject> Cov = MakeShared<FJsonObject>();
+			Cov->SetNumberField(TEXT("packages_scanned"), CallerCoverage.PackagesScanned);
+			Cov->SetBoolField(TEXT("asset_registry_ready"), CallerCoverage.bAssetRegistryReady);
+			Cov->SetStringField(TEXT("taken_at"), CallerCoverage.TakenAt);
+
+			TArray<TSharedPtr<FJsonValue>> SkippedArr;
+			for (const TPair<FString, FString>& Pair : CallerCoverage.PackagesSkipped)
+			{
+				TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+				E->SetStringField(TEXT("package"), Pair.Key);
+				E->SetStringField(TEXT("asset_classes_found"), Pair.Value);
+				SkippedArr.Add(MakeShared<FJsonValueObject>(E));
+			}
+			Cov->SetNumberField(TEXT("packages_skipped_count"), CallerCoverage.PackagesSkipped.Num());
+			Cov->SetArrayField(TEXT("packages_skipped_no_niagara_graph_asset"), SkippedArr);
+
+			Cov->SetNumberField(TEXT("graphs_curated"), CallerCoverage.GraphsCurated.Num());
+			Cov->SetNumberField(TEXT("graphs_exhaustive"), CallerCoverage.GraphsExhaustive.Num());
+			Cov->SetArrayField(TEXT("graphs_only_found_by_exhaustive"), ToArr(CallerCoverage.GraphsOnlyExhaustive));
+			Cov->SetArrayField(TEXT("graphs_only_found_by_curated"), ToArr(CallerCoverage.GraphsOnlyCurated));
+			Cov->SetStringField(TEXT("scope_note"), FString::Printf(TEXT(
+				"Complete with respect to HARD references in packages the asset registry had scanned at taken_at, and "
+				"exhaustive within each of those packages (every UNiagaraGraph under the package outer, nested objects "
+				"included). Walked asset classes: UNiagaraSystem, UNiagaraEmitter and UNiagaraScript — the last because "
+				"MODULES PLACE MODULES; no other Niagara asset class owns a UNiagaraGraph. %s It cannot see: content "
+				"outside the scanned roots, assets that failed to load (those are BLOCKERS here, not omissions, because "
+				"this action is all-or-nothing), or placements in UNSAVED packages (the enumeration is registry-driven, "
+				"so a system open and dirty in the editor is invisible). packages_skipped_no_niagara_graph_asset names "
+				"every referencing package that was NOT walked, with the asset classes found in it — read it before "
+				"treating this as a census. graphs_only_found_by_exhaustive names the graphs the curated container walk "
+				"is blind to; a UNiagaraScript package appears there BY CONSTRUCTION and that is expected, not a fault."),
+				MonolithNiagaraCallerSweep::DepthNote()));
+			R->SetObjectField(TEXT("caller_sweep_coverage"), Cov);
 		}
 
 		TArray<TSharedPtr<FJsonValue>> SavedArr;
@@ -31205,11 +31548,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleRenameScriptParameter(const
 		}
 		else if (PlacedCallers.Num() == 0)
 		{
-			R->SetStringField(TEXT("placed_callers_note"), TEXT(
+			// A ZERO IS A VALID ANSWER AND IT IS ALSO WHAT A BROKEN SWEEP LOOKS LIKE — which is
+			// exactly how gap #132 stayed invisible. So name the field that discriminates the two
+			// rather than letting the zero speak for itself.
+			R->SetStringField(TEXT("placed_callers_note"), FString::Printf(TEXT(
 				"No placed call of this script was found in any referencing Niagara asset. Unlike the warn-only path this "
-				"is a real traversal (package -> system/emitter -> graph -> function-call node), not an asset-registry "
-				"guess — but it can still only see what the asset registry lists, so an unsaved system open in the editor "
-				"would not appear."));
+				"is a real traversal (package -> system/emitter/SCRIPT asset -> every graph under the package outer -> "
+				"function-call node), not an asset-registry guess. A zero here is a valid answer AND is what a broken "
+				"sweep would look like, so check caller_sweep_coverage before reading it as 'nothing places this': "
+				"%d package(s) scanned, %d skipped without being walked, %d graph(s) reached. It cannot see placements in "
+				"UNSAVED packages — a system open and dirty in the editor is invisible to the registry."),
+				CallerCoverage.PackagesScanned, CallerCoverage.PackagesSkipped.Num(),
+				CallerCoverage.GraphsExhaustive.Num() + CallerCoverage.GraphsOnlyCurated.Num()));
 		}
 	}
 	else
@@ -32219,7 +32569,24 @@ namespace MonolithNiagaraVersionSweep
 	struct FCoverage
 	{
 		int32 PackagesScanned = 0;
-		int32 NonNiagaraReferencers = 0;
+		/**
+		 * Referencing packages that held NO graph-bearing Niagara asset and were therefore never
+		 * walked, recorded as (package name, asset classes actually found) PAIRS rather than as a
+		 * bare count.
+		 *
+		 * 🛑 This replaces a field called `non_niagara_referencers`, which was WRONG in the one way
+		 * that costs a caller real work: the candidate filter accepted only UNiagaraSystem and
+		 * UNiagaraEmitter, so a UNiagaraScript referencer — a shared MODULE that itself places the
+		 * target — was skipped and then TALLIED AS NON-NIAGARA. The caller read "a level references
+		 * this" and moved on; the truth was "a module that places your target was skipped without
+		 * being looked at". Measured on UniFX WorldPositionToCameraUV: ground truth 3 call sites,
+		 * the action reported 2 and the third was hidden inside that count of 1.
+		 * [MEASURED: Docs/staging/2026-08-30-validator-version-actions-test.md §1]
+		 *
+		 * A bare count could never have been checked. Naming the package and its classes means a
+		 * reader can see WHAT was skipped and judge whether the skip was right.
+		 */
+		TArray<TPair<FString, FString>> PackagesSkipped;
 		bool  bAssetRegistryReady = false;
 		FString TakenAt;
 		TArray<FString> PackagesUnreadable;
@@ -32229,28 +32596,11 @@ namespace MonolithNiagaraVersionSweep
 		TArray<FString> GraphsOnlyExhaustive;   // curated walk missed these (expected: embedded scripts)
 	};
 
-	/**
-	 * EXHAUSTIVE by construction: a UNiagaraNodeFunctionCall must live in a UNiagaraGraph, and
-	 * a graph inside a consumer package must be an object under that package's outer. Embedded
-	 * scripts, scratch pads, event and simulation-stage scripts are reached without needing to
-	 * know they exist.
-	 */
-	static void CollectAllGraphsInPackage(UPackage* Pkg, TSet<UNiagaraGraph*>& Out)
-	{
-		if (!Pkg) return;
-		TArray<UObject*> Objects;
-		// EGetObjectsFlags::IncludeNestedObjects, not the bool overload — the bool form is
-		// UE_INCLUDENESTEDOBJECTS_BOOL_DEPRECATED in 5.8 (UObjectHash.h:130) and is documented as
-		// not compiling in the next release.
-		GetObjectsWithOuter(Pkg, Objects, EGetObjectsFlags::IncludeNestedObjects);
-		for (UObject* Obj : Objects)
-		{
-			if (UNiagaraGraph* Graph = Cast<UNiagaraGraph>(Obj))
-			{
-				if (IsValid(Graph)) Out.Add(Graph);
-			}
-		}
-	}
+	// The exhaustive package walk and the candidate-class filter used to be defined HERE, in a
+	// second copy. Both now live once, in MonolithNiagaraCallerSweep (above the IO surgery
+	// block), because the rename surgery needs exactly the same two rules and two copies of one
+	// rule agree by luck rather than by construction.
+	using MonolithNiagaraCallerSweep::CollectAllGraphsInPackage;
 
 	/**
 	 * Read the module's version facts.
@@ -32392,6 +32742,20 @@ namespace MonolithNiagaraVersionSweep
 	 * package is necessarily in the asset-registry reference graph. Its remaining failure modes
 	 * are narrow and nameable — an unscanned registry, and content outside the scanned roots —
 	 * and both are reported rather than assumed away.
+	 *
+	 * ⚠️ DEPTH IS EXACTLY ONE, AND THAT IS A PROOF RATHER THAN A BUDGET. "Modules place modules"
+	 * sounds like it demands a recursive descent; it does not. A PLACEMENT is a hard
+	 * FunctionScript pointer, so every package holding one is a DIRECT referencer of the module
+	 * package and already appears in this flat list. A → B → C needs no traversal: the graph in B
+	 * that calls C is found when sweeping C, because B directly references C.
+	 * Consequences, both worth stating:
+	 *   - There is no recursion, so a module cycle (A places B, B places A) CANNOT hang this walk.
+	 *     Each candidate package is visited once, from a list produced before the loop starts.
+	 *   - This reports PLACEMENTS, not transitive impact. If a consumer embeds its own duplicated
+	 *     copy of a module, that copy is a separate placement in the CONSUMER's package and is
+	 *     listed separately — which is exactly the UniFX shape (one standalone module placement
+	 *     plus two embedded copies). Re-pointing one does not re-point the others, and this action
+	 *     never implies otherwise.
 	 */
 	static void SweepPlacements(UNiagaraScript* Script, TArray<FPlacement>& OutPlacements, FCoverage& Cov)
 	{
@@ -32418,9 +32782,10 @@ namespace MonolithNiagaraVersionSweep
 			AR.GetReferencers(FName(*ModulePkg->GetName()), PackagesToInspect);
 		}
 
-		const FTopLevelAssetPath SystemClassPath  = UNiagaraSystem::StaticClass()->GetClassPathName();
-		const FTopLevelAssetPath EmitterClassPath = UNiagaraEmitter::StaticClass()->GetClassPathName();
-
+		// The three graph-bearing Niagara asset classes, defined ONCE in
+		// MonolithNiagaraCallerSweep::IsGraphBearingNiagaraAsset and shared with the rename
+		// surgery. UNiagaraScript is the one the old filter omitted, and omitting it is not a
+		// marginal miss: MODULES PLACE MODULES.
 		for (const FName& PackageName : PackagesToInspect)
 		{
 			++Cov.PackagesScanned;
@@ -32432,10 +32797,15 @@ namespace MonolithNiagaraVersionSweep
 			TSet<UNiagaraGraph*> Exhaustive;
 			UObject* PrimaryAsset = nullptr;
 			bool bAnyNiagara = false;
+			TArray<FString> ClassesSeen;
 
 			for (const FAssetData& AssetData : Assets)
 			{
-				if (AssetData.AssetClassPath != SystemClassPath && AssetData.AssetClassPath != EmitterClassPath)
+				// Recorded for EVERY asset, matched or not — a skip that cannot name what it skipped
+				// is the defect this sweep is being repaired for.
+				ClassesSeen.AddUnique(AssetData.AssetClassPath.GetAssetName().ToString());
+
+				if (!MonolithNiagaraCallerSweep::IsGraphBearingNiagaraAsset(AssetData))
 				{
 					continue;
 				}
@@ -32450,6 +32820,9 @@ namespace MonolithNiagaraVersionSweep
 				}
 				if (!PrimaryAsset) PrimaryAsset = Asset;
 
+				// CollectCallerGraphs understands UNiagaraSystem and UNiagaraEmitter ONLY
+				// (:30498-30531). For a UNiagaraScript referencer it returns nothing, so such a
+				// package is exhaustive-only BY CONSTRUCTION — not a sign the curated walk failed.
 				TArray<UNiagaraGraph*> CuratedForAsset;
 				MonolithNiagaraIOSurgery::CollectCallerGraphs(Asset, CuratedForAsset);
 				for (UNiagaraGraph* Graph : CuratedForAsset)
@@ -32460,7 +32833,8 @@ namespace MonolithNiagaraVersionSweep
 
 			if (!bAnyNiagara)
 			{
-				++Cov.NonNiagaraReferencers;
+				Cov.PackagesSkipped.Emplace(PackageName.ToString(),
+					ClassesSeen.Num() > 0 ? FString::Join(ClassesSeen, TEXT(", ")) : TEXT("<no asset rows in the registry>"));
 				continue;
 			}
 			if (!PrimaryAsset) continue;   // every Niagara asset in the package was unreadable; already recorded
@@ -32522,7 +32896,22 @@ namespace MonolithNiagaraVersionSweep
 
 		TSharedRef<FJsonObject> C = MakeShared<FJsonObject>();
 		C->SetNumberField(TEXT("packages_scanned"), Cov.PackagesScanned);
-		C->SetNumberField(TEXT("non_niagara_referencers"), Cov.NonNiagaraReferencers);
+
+		// `non_niagara_referencers` is GONE, not renamed-in-place: it was emitted as a bare count
+		// and it counted a UNiagaraScript. The replacement names every skipped package and the
+		// asset classes found in it, so the claim is checkable instead of merely reassuring.
+		{
+			TArray<TSharedPtr<FJsonValue>> SkippedArr;
+			for (const TPair<FString, FString>& Pair : Cov.PackagesSkipped)
+			{
+				TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+				E->SetStringField(TEXT("package"), Pair.Key);
+				E->SetStringField(TEXT("asset_classes_found"), Pair.Value);
+				SkippedArr.Add(MakeShared<FJsonValueObject>(E));
+			}
+			C->SetNumberField(TEXT("packages_skipped_count"), Cov.PackagesSkipped.Num());
+			C->SetArrayField(TEXT("packages_skipped_no_niagara_graph_asset"), SkippedArr);
+		}
 		C->SetBoolField(TEXT("asset_registry_ready"), Cov.bAssetRegistryReady);
 		C->SetStringField(TEXT("taken_at"), Cov.TakenAt);
 		C->SetArrayField(TEXT("packages_unreadable"), ToArr(Cov.PackagesUnreadable));
@@ -32533,11 +32922,52 @@ namespace MonolithNiagaraVersionSweep
 		C->SetStringField(TEXT("scope_note"), TEXT(
 			"Complete with respect to HARD references in packages the asset registry had scanned at taken_at, and "
 			"exhaustive within each of those packages (every UNiagaraGraph under the package outer, nested objects "
-			"included). It cannot see: content outside the scanned roots, packages the registry had not finished "
-			"scanning (see asset_registry_ready), or assets that failed to load (see packages_unreadable). "
+			"included). Walked asset classes: UNiagaraSystem, UNiagaraEmitter and UNiagaraScript — the last because "
+			"MODULES PLACE MODULES; no other Niagara asset class owns a UNiagaraGraph. Referencer depth is ONE and "
+			"that is complete, not a budget: a placement is a hard FunctionScript pointer, so every package holding "
+			"one is a direct referencer. Nothing recurses, so a module cycle cannot hang this. It cannot see: content "
+			"outside the scanned roots, packages the registry had not finished scanning (see asset_registry_ready), "
+			"assets that failed to load (see packages_unreadable), or placements in UNSAVED packages (the enumeration "
+			"is registry-driven). packages_skipped_no_niagara_graph_asset names every referencing package that was "
+			"NOT walked, with the asset classes found in it — read it before treating this as a census. "
 			"graphs_only_found_by_exhaustive names the graphs the curated container walk is blind to — embedded "
-			"script objects live there; a non-empty list is the exhaustive walk proving it fires."));
+			"script objects live there; a non-empty list is the exhaustive walk proving it fires. A UNiagaraScript "
+			"package is exhaustive-only BY CONSTRUCTION (CollectCallerGraphs handles systems and emitters only), so "
+			"its graphs appearing there is expected and is not evidence of a curated-walk fault."));
 		R->SetObjectField(TEXT("coverage"), C);
+	}
+
+	/** Every state ClassifyState can return. One definition, so a filter cannot drift from the classifier. */
+	static const TArray<FString>& KnownStates()
+	{
+		static const TArray<FString> States = {
+			TEXT("unpinned_safe"), TEXT("unpinned_doomed"), TEXT("pinned_current"),
+			TEXT("pinned_stale"), TEXT("pinned_dangling"), TEXT("pinned_on_unversioned")
+		};
+		return States;
+	}
+
+	/**
+	 * ONE definition, called by both handlers. Two copies of a warning drift — and when they drift
+	 * they still both read as authoritative, which is the expensive part.
+	 */
+	static void AppendSkippedPackageWarning(TArray<FString>& Warnings, const FCoverage& Cov)
+	{
+		if (Cov.PackagesSkipped.Num() == 0) return;
+
+		TArray<FString> Lines;
+		for (const TPair<FString, FString>& Pair : Cov.PackagesSkipped)
+		{
+			Lines.Add(FString::Printf(TEXT("%s [%s]"), *Pair.Key, *Pair.Value));
+		}
+		Warnings.Add(FString::Printf(TEXT(
+			"%d referencing package(s) held no graph-bearing Niagara asset and were NOT walked: %s. Only "
+			"UNiagaraSystem / UNiagaraEmitter / UNiagaraScript can own a UNiagaraGraph, so a package listed here "
+			"cannot hold a placement — unless its class is one you expected to walk, in which case this sweep "
+			"under-reports and you have found the next instance of the bug this list replaced. Its predecessor was "
+			"a bare count named 'non_niagara_referencers' which silently tallied a UNiagaraScript, i.e. a MODULE "
+			"that placed the target, and hid a real placement inside a number that read as harmless."),
+			Cov.PackagesSkipped.Num(), *FString::Join(Lines, TEXT(", "))));
 	}
 }
 
@@ -32553,7 +32983,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleReportModuleVersions(const 
 	UNiagaraScript* Script = LoadObject<UNiagaraScript>(nullptr, *ModulePath);
 	if (!Script) return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load script '%s'"), *ModulePath));
 
+	// A MISTYPED FILTER MUST NOT RETURN A CONFIDENT ZERO. `state:"pinned_stail"` would otherwise
+	// print reported_count:0 against a healthy placement_count and read as "nothing to do here" —
+	// the same defect the writer's asset_path/node_guid filters carried.
 	const FString StateFilter = Params->HasField(TEXT("state")) ? Params->GetStringField(TEXT("state")) : FString();
+	if (!StateFilter.IsEmpty() && !KnownStates().ContainsByPredicate(
+		[&StateFilter](const FString& S) { return S.Equals(StateFilter, ESearchCase::IgnoreCase); }))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT(
+			"Unknown state filter '%s'. Valid states: %s. Refusing rather than returning an empty list, which is "
+			"indistinguishable from 'no placement is in that state'."),
+			*StateFilter, *FString::Join(KnownStates(), TEXT(", "))));
+	}
 
 	FModuleVersionFacts Facts;
 	ReadModuleFacts(Script, Facts);
@@ -32665,6 +33106,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleReportModuleVersions(const 
 			"is not an asset without placements."),
 			Cov.PackagesUnreadable.Num(), *FString::Join(Cov.PackagesUnreadable, TEXT(", "))));
 	}
+	AppendSkippedPackageWarning(Warnings, Cov);
 	if (Placements.Num() == 0)
 	{
 		Warnings.Add(TEXT(
@@ -32761,26 +33203,38 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 	FCoverage Cov;
 	SweepPlacements(Script, Placements, Cov);
 
-	auto PathMatches = [](const FString& PlacementPath, const FString& Wanted)
+	// ONE definition of "the package part of a path", shared by the matcher and by the existence
+	// check further down. Two copies of one path rule agree by luck, not by construction — and a
+	// disagreement between a matcher and its own validity check would produce a well-formed answer
+	// that nothing raises on.
+	auto PackagePart = [](const FString& In)
+	{
+		int32 Dot = INDEX_NONE;
+		FString Out = In;
+		if (Out.FindChar(TEXT('.'), Dot)) Out.LeftInline(Dot);
+		return Out;
+	};
+
+	auto PathMatches = [&PackagePart](const FString& PlacementPath, const FString& Wanted)
 	{
 		if (PlacementPath.Equals(Wanted, ESearchCase::IgnoreCase)) return true;
-		auto PackagePart = [](const FString& In)
-		{
-			int32 Dot = INDEX_NONE;
-			FString Out = In;
-			if (Out.FindChar(TEXT('.'), Dot)) Out.LeftInline(Dot);
-			return Out;
-		};
 		return PackagePart(PlacementPath).Equals(PackagePart(Wanted), ESearchCase::IgnoreCase);
 	};
 
 	TArray<TSharedPtr<FJsonValue>> ToChange, AlreadyOnTarget, SkippedUnpinned, Failed;
 	TArray<FPlacement> Selected;
 
+	// Each filter's own hit count, tracked SEPARATELY. A single "0 selected" cannot say which
+	// filter emptied the set, and "which filter" is the whole diagnosis.
+	int32 MatchedAssetFilter = 0;
+	int32 MatchedBothFilters = 0;
+
 	for (const FPlacement& P : Placements)
 	{
 		if (!AssetFilter.IsEmpty() && !PathMatches(P.AssetPath, AssetFilter)) continue;
+		++MatchedAssetFilter;
 		if (!NodeFilter.IsEmpty() && !P.NodeGuid.Equals(NodeFilter, ESearchCase::IgnoreCase)) continue;
+		++MatchedBothFilters;
 
 		const FString State = ClassifyState(Facts, P.PinnedGuid);
 
@@ -32794,11 +33248,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 
 		if (!P.PinnedGuid.IsValid() && !bIncludeUnpinned)
 		{
-			Row->SetStringField(TEXT("reason"), State == TEXT("unpinned_doomed")
-				? TEXT("Empty pin on a VERSIONED module: this placement will be stamped to the oldest version on the next "
-				       "load. Leaving it alone is a silent downgrade; pinning it freezes it. Pass include_unpinned:true "
-				       "WITH this node_guid to decide deliberately.")
-				: TEXT("Empty pin on an UNVERSIONED module: correct as-is, follows the exposed version. Left alone."));
+			// This branch is reachable ONLY as unpinned_doomed: the handler refuses outright when the
+			// module has versioning disabled, so ClassifyState cannot return unpinned_safe by the time
+			// control gets here. A ternary on that was dead code dressed as a considered case.
+			Row->SetStringField(TEXT("reason"), TEXT(
+				"Empty pin on a VERSIONED module: this placement will be stamped to the OLDEST version on the next load. "
+				"Leaving it alone is a silent downgrade; pinning it freezes it. Pass include_unpinned:true WITH this "
+				"node_guid to decide deliberately."));
 			SkippedUnpinned.Add(MakeShared<FJsonValueObject>(Row));
 			continue;
 		}
@@ -32815,6 +33271,76 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 		Row->SetNumberField(TEXT("override_pins_before"), CountOverridePins(*P.Node));
 		ToChange.Add(MakeShared<FJsonValueObject>(Row));
 		Selected.Add(P);
+	}
+
+	// ================================================================================
+	// THE SILENT-ZERO GUARD. A mistyped asset_path or node_guid used to return
+	//   "0 placement(s) would be re-pointed"
+	// which is BYTE-IDENTICAL to the legitimate answer for a system that genuinely does not place
+	// the module. No error, no warning, failed[] empty. Every value that count could take read as
+	// acceptable, so it was never evidence of anything — and it silently degraded the node_guid
+	// interlock, whose entire job is to make an unpinned write a DELIBERATE act, into a no-op that
+	// reported success. [MEASURED: Docs/staging/2026-08-30-validator-version-actions-test.md §5c]
+	//
+	// The discriminator is EXISTENCE, not the count: "the target does not exist" and "the target
+	// exists and holds none of this module's placements" are different answers and must not print
+	// the same. Nothing has been mutated at this point — no transaction is open — so a refusal here
+	// is as clean as the four that already refuse before the sweep.
+	// ================================================================================
+	FString FilterNote;
+	if (!AssetFilter.IsEmpty() && MatchedAssetFilter == 0)
+	{
+		IAssetRegistry& FilterAR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+		TArray<FAssetData> FilterAssets;
+		FilterAR.GetAssetsByPackageName(FName(*PackagePart(AssetFilter)), FilterAssets, /*bIncludeOnlyOnDiskAssets=*/false);
+
+		if (FilterAssets.Num() == 0)
+		{
+			// The path names nothing. This is the typo, and it is a refusal.
+			return FMonolithActionResult::Error(FString::Printf(TEXT(
+				"asset_path '%s' names no asset the asset registry knows about (package '%s'), so it cannot be a filter "
+				"over this module's %d placement(s) — it is a typo, and returning '0 placements to change' for it would be "
+				"indistinguishable from 'that system is already fine'. Registry finished scanning: %s. Run "
+				"report_module_versions and copy an asset_path from the placements list. NOTHING WAS CHANGED."),
+				*AssetFilter, *PackagePart(AssetFilter), Placements.Num(),
+				Cov.bAssetRegistryReady ? TEXT("yes") : TEXT("NO — a path may be missing only because the scan is incomplete")));
+		}
+
+		// The asset is real and simply holds none of this module's placements. That is a legitimate
+		// zero (a caller sweeping many systems will hit it), so it stays a success — but it is said
+		// out loud and in a named field rather than left to be inferred from a count.
+		FilterNote = FString::Printf(TEXT(
+			"asset_path '%s' resolved to a real asset, but it holds NONE of this module's %d placement(s). This is a "
+			"legitimate zero, not a typo — the asset exists and simply does not place '%s'."),
+			*AssetFilter, Placements.Num(), *ModulePath);
+	}
+
+	if (!NodeFilter.IsEmpty() && MatchedBothFilters == 0)
+	{
+		FGuid ParsedNode;
+		const bool bWellFormed = FGuid::Parse(NodeFilter, ParsedNode);
+
+		// Candidate guids, so the refusal is actionable rather than merely correct. Scoped to the
+		// asset filter when one was given, since that is the set the caller was aiming at.
+		TArray<FString> Candidates;
+		for (const FPlacement& P : Placements)
+		{
+			if (!AssetFilter.IsEmpty() && !PathMatches(P.AssetPath, AssetFilter)) continue;
+			Candidates.AddUnique(FString::Printf(TEXT("%s (%s)"), *P.NodeGuid, *P.AssetPath));
+			if (Candidates.Num() >= 20) break;
+		}
+
+		return FMonolithActionResult::Error(FString::Printf(TEXT(
+			"node_guid '%s' %s and matches NO placement of '%s'%s. Refusing instead of reporting a successful zero: "
+			"node_guid is the SAFETY INTERLOCK that forces an unpinned re-point to name one placement deliberately, and a "
+			"mistyped guid would otherwise turn that deliberate act into a no-op that reports success. %d candidate "
+			"node_guid(s) here: %s. NOTHING WAS CHANGED."),
+			*NodeFilter,
+			bWellFormed ? TEXT("is well-formed") : TEXT("is NOT a well-formed guid"),
+			*ModulePath,
+			AssetFilter.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" under asset_path '%s'"), *AssetFilter),
+			Candidates.Num(),
+			Candidates.Num() > 0 ? *FString::Join(Candidates, TEXT(", ")) : TEXT("<none — this module has no placements at all>")));
 	}
 
 	// ---- write ----
@@ -32862,6 +33388,24 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 			Row->SetBoolField(TEXT("refresh_reloaded"), bReloadedThis);
 			Row->SetNumberField(TEXT("override_pins_after"), CountOverridePins(*P.Node));
 
+			if (!bLandedThis)
+			{
+				// THE ONLY per-node failure this action can have, and until now it was reported only
+				// as a run-level warning while failed[] stayed empty — an always-empty list reads as
+				// "nothing went wrong", which is precisely the false reassurance to avoid. The write
+				// was attempted on this node and the guid is NOT the target one.
+				TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+				F->SetStringField(TEXT("asset_path"), P.AssetPath);
+				F->SetStringField(TEXT("node_guid"), P.NodeGuid);
+				F->SetStringField(TEXT("guid_before"), P.PinnedGuid.IsValid() ? P.PinnedGuid.ToString() : TEXT(""));
+				F->SetStringField(TEXT("guid_after"), After.IsValid() ? After.ToString() : TEXT(""));
+				F->SetStringField(TEXT("reason"), TEXT(
+					"ChangeScriptVersion was called and SelectedScriptVersion is NOT the target guid afterwards. The "
+					"function returns void and early-outs silently (NiagaraNodeFunctionCall.cpp:1525-1528), so the "
+					"before/after read is the only evidence available in-process."));
+				Failed.Add(MakeShared<FJsonValueObject>(F));
+			}
+
 			if (!bReloadedThis)
 			{
 				// RefreshFromExternalChanges returns false when the caller's CachedChangeId already
@@ -32897,9 +33441,25 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 	R->SetArrayField(TEXT("already_on_target"), AlreadyOnTarget);
 	R->SetArrayField(TEXT("skipped_unpinned"), SkippedUnpinned);
 	R->SetArrayField(TEXT("failed"), Failed);
+	R->SetNumberField(TEXT("failed_count"), Failed.Num());
 	R->SetNumberField(TEXT("applied_count"), Applied);
 	R->SetNumberField(TEXT("landed_count"), Landed);
 	R->SetNumberField(TEXT("refresh_reloaded_count"), Reloaded);
+	if (!FilterNote.IsEmpty()) R->SetStringField(TEXT("filter_note"), FilterNote);
+	R->SetNumberField(TEXT("matched_asset_filter"), MatchedAssetFilter);
+	R->SetNumberField(TEXT("matched_all_filters"), MatchedBothFilters);
+	// An empty list must not be readable as "nothing went wrong". Say what each one MEANS, and
+	// which are empty by construction in this call, so a reader never has to infer it from a zero.
+	R->SetStringField(TEXT("lists_note"), TEXT(
+		"to_change = placements selected for the re-point (on a non-dry run these carry applied/landed/guid_after). "
+		"already_on_target = selected but skipped because the pin is already the target guid; ChangeScriptVersion "
+		"would early-out silently, so it is reported rather than called. skipped_unpinned = empty pin, left alone; "
+		"reachable only on a BULK call (no node_guid) against a versioned module that still has unpinned placements. "
+		"failed = the write was attempted on this node and the guid did not end up on target; EMPTY BY CONSTRUCTION "
+		"on a dry run, since nothing is attempted. Every whole-call refusal (bad module path, non-version guid, "
+		"versioning-OFF module, include_unpinned without node_guid, and a filter that matches nothing) is returned as "
+		"an ERROR before any node is touched and never appears in failed[]. matched_asset_filter / matched_all_filters "
+		"report each filter's hit count separately — a bare 'selected 0' cannot say which filter emptied the set."));
 	{
 		TArray<TSharedPtr<FJsonValue>> DirtyArr;
 		for (const FString& S : DirtyUnsaved) DirtyArr.Add(MakeShared<FJsonValueString>(S));
@@ -32908,6 +33468,12 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 	CoverageToJson(R, Cov);
 
 	TArray<FString> Warnings;
+	if (!FilterNote.IsEmpty())
+	{
+		// Promoted to a WARNING, not left as a quiet field: this is the case that used to be
+		// indistinguishable from a typo, and the count alone still cannot tell them apart.
+		Warnings.Add(FilterNote);
+	}
 	if (bDryRun)
 	{
 		Warnings.Add(FString::Printf(TEXT(
@@ -32966,6 +33532,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleVersion(const TSha
 			"%d referencing Niagara asset(s) could not be loaded and were NOT inspected: %s."),
 			Cov.PackagesUnreadable.Num(), *FString::Join(Cov.PackagesUnreadable, TEXT(", "))));
 	}
+	AppendSkippedPackageWarning(Warnings, Cov);
 	if (!bSkipPython)
 	{
 		Warnings.Add(TEXT(
