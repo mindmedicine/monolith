@@ -66,6 +66,22 @@ git clone https://github.com/tumourlove/monolith.git Monolith
 
 The native C++ proxy keeps your AI session alive when the editor restarts. For **Cursor/Cline**, **macOS/Linux**, or the **Python fallback**, see the [Installation wiki page](https://github.com/tumourlove/monolith/wiki/Installation).
 
+**Optional: add web search.** Monolith answers questions about *your* project and engine source; it does not search the web. If you want your AI to also look up current UE docs, forum threads, or release notes, add the [Exa MCP](https://docs.exa.ai/reference/exa-mcp) server alongside it (both `Templates/.mcp.json*.example` files already include it):
+
+```json
+{
+  "mcpServers": {
+    "monolith": { "command": "Plugins/Monolith/Binaries/monolith_proxy.exe", "args": [] },
+    "exa": {
+      "type": "http",
+      "url": "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
+    }
+  }
+}
+```
+
+Or, for Claude Code only, from the terminal: `claude mcp add --transport http exa https://mcp.exa.ai/mcp`. Exa authenticates with OAuth — no API key in the file; your client opens a browser to sign in on first connection. Drop the `?tools=` suffix to keep Exa's default tool set (search + fetch), or restart your client if the tools don't appear.
+
 **3. Open the editor.** Wait 30-60 seconds for the first-launch index. When you see `Monolith MCP server listening on port 9316` in the Output Log (filter `LogMonolith`), connect your AI client and ask *"what Monolith tools do you have?"* to verify.
 
 Project-instructions files (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc.) vary per assistant — just paste the namespace list into your AI and ask it to generate the right format for your toolchain. Full install variants, troubleshooting, and post-install setup live on the [Installation wiki](https://github.com/tumourlove/monolith/wiki/Installation).

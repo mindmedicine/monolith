@@ -369,8 +369,8 @@ Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers i
 
 | File | Purpose |
 |------|---------|
-| `Templates/.mcp.json.example` | Minimal MCP config. Transport type varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline. URL: `http://localhost:9316/mcp` |
-| `Templates/.mcp.json.proxy.example` | MCP config variant for clients that need the stdio↔HTTP proxy bridge (Cursor / Cline / Continue). Spawns `Scripts/monolith_proxy.py`. |
+| `Templates/.mcp.json.example` | Minimal MCP config. Transport type varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline. URL: `http://localhost:9316/mcp`. Also registers the optional remote Exa MCP server (`https://mcp.exa.ai/mcp`, OAuth, web search + fetch); remove that entry if unwanted. |
+| `Templates/.mcp.json.proxy.example` | MCP config variant for clients that need the stdio↔HTTP proxy bridge (Cursor / Cline / Continue). Spawns `Scripts/monolith_proxy.py`. Carries the same optional Exa entry. |
 
 **Note on AI project-instructions files:** As of v0.14.7 we no longer ship a `CLAUDE.md.example` template. Conventions across AI assistants (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, etc.) drift faster than a static template can track — installers are pointed at their own assistant for the right shape. See README §Step 5.
 
