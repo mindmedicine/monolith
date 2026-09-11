@@ -276,6 +276,8 @@ Configure your `.mcp.json` (see `Templates/.mcp.json.example`):
 
 Then use Claude Code or any MCP-compatible client to interact with the tools.
 
+The repo root also carries a `.mcp.json` that registers the [Exa MCP](https://docs.exa.ai/reference/exa-mcp) server (remote web search / page fetch, OAuth — no key to configure). Claude Code picks it up automatically when you open this checkout, so an assistant working on the plugin can pull current UE docs and forum threads. It has nothing to do with the Monolith server itself; delete or ignore it if you don't want it.
+
 ### What to Verify
 
 - Your action appears in `monolith_discover` output

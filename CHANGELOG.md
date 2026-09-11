@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Exa MCP web search alongside Monolith.** Both `Templates/.mcp.json*.example` files now register the remote [Exa MCP](https://docs.exa.ai/reference/exa-mcp) server (`https://mcp.exa.ai/mcp`, HTTP transport, OAuth sign-in on first connect, no key in the file) next to the Monolith entry, with `web_search_exa`, `web_fetch_exa` and `web_search_advanced_exa` enabled via the `?tools=` query. Monolith indexes your project and engine source but cannot look anything up online; the Exa entry gives the AI a way to check current UE docs, forum threads and release notes without a second config step. The repo root gains a `.mcp.json` carrying only the Exa entry so Claude Code sessions opened on this checkout get it too. README, CONTRIBUTING and `SPEC_CORE.md` document the entry and how to drop it.
+
 ## [0.22.0] - 2026-08-01
 
 ### Internal
